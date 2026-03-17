@@ -1,0 +1,16 @@
+[package]
+name = "pcp_rust"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+hidapi = "2"
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+dirs = "6"
+libc = "0.2"
+libpulse-binding = "2"
+log = "0.4"
+env_logger = "0.11"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
