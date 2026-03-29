@@ -246,7 +246,8 @@ impl AudioController {
         Ok(())
     }
 
-    pub fn set_app_volume(&self, app_name: &str, value: u8) -> Result<()> {
+    /// Returns true if any matching app was found.
+    pub fn set_app_volume(&self, app_name: &str, value: u8) -> Result<bool> {
         let volume = volume_from_u8(value);
         let target = app_name.to_lowercase();
         let entries = self.collect_sink_inputs()?;
@@ -265,7 +266,7 @@ impl AudioController {
             debug!("app not found: {app_name}");
         }
 
-        Ok(())
+        Ok(!matched.is_empty())
     }
 
     /// Returns the new mute state (true = muted).
@@ -318,12 +319,17 @@ impl AudioController {
         Ok(new_mute)
     }
 
-    /// Returns the new mute state (true = muted).
-    pub fn toggle_app_mute(&self, app_name: &str) -> Result<bool> {
+    /// Returns the new mute state, or None if the app wasn't found.
+    pub fn toggle_app_mute(&self, app_name: &str) -> Result<Option<bool>> {
         let target = app_name.to_lowercase();
         let entries = self.collect_sink_inputs()?;
 
         let matched: Vec<_> = entries.iter().filter(|e| e.matches(&target)).collect();
+
+        if matched.is_empty() {
+            debug!("app not found for mute toggle: {app_name}");
+            return Ok(None);
+        }
 
         let mut introspect = self.context.borrow().introspect();
         for entry in &matched {
@@ -331,13 +337,7 @@ impl AudioController {
         }
         self.drain();
 
-        let new_mute = matched.first().map(|e| !e.muted).unwrap_or(false);
-
-        if matched.is_empty() {
-            debug!("app not found for mute toggle: {app_name}");
-        }
-
-        Ok(new_mute)
+        Ok(Some(!matched.first().unwrap().muted))
     }
 }
 

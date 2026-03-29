@@ -1,14 +1,18 @@
 mod audio;
 mod config;
 mod device;
+mod icons;
 mod led;
+mod osd;
+mod service;
 mod udev;
 
 use std::path::PathBuf;
+use std::sync::mpsc;
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
-use log::info;
+use log::{info, warn};
 
 use config::{Action, ControlId, RainbowStyle, RgbMode};
 use device::{Control, Event, PcPanelPro};
@@ -32,6 +36,14 @@ struct Cli {
     /// Print volume changes to stdout
     #[arg(long, short)]
     verbose: bool,
+
+    /// Install systemd user service for running in the background
+    #[arg(long)]
+    install_service: bool,
+
+    /// Remove systemd user service
+    #[arg(long)]
+    remove_service: bool,
 }
 
 fn main() -> Result<()> {
@@ -41,6 +53,14 @@ fn main() -> Result<()> {
 
     if cli.create_udev_rules {
         return udev::create_udev_rules();
+    }
+
+    if cli.install_service {
+        return service::install();
+    }
+
+    if cli.remove_service {
+        return service::remove();
     }
 
     if cli.list_apps {
@@ -90,6 +110,48 @@ fn list_apps() -> Result<()> {
     println!("Use these names in your config file as the \"app\" value.");
 
     Ok(())
+}
+
+fn spawn_resume_monitor() -> mpsc::Receiver<()> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        use std::process::{Command, Stdio};
+
+        let mut child = match Command::new("gdbus")
+            .args([
+                "monitor",
+                "--system",
+                "--dest",
+                "org.freedesktop.login1",
+                "--object-path",
+                "/org/freedesktop/login1",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                warn!("failed to start resume monitor: {e}");
+                return;
+            }
+        };
+
+        let stdout = child.stdout.take().unwrap();
+        let reader = std::io::BufReader::new(stdout);
+        for line in reader.lines() {
+            let Ok(line) = line else { break };
+            // PrepareForSleep(false) means the system just woke up
+            if line.contains("PrepareForSleep") && line.contains("false") {
+                info!("detected system resume");
+                if tx.send(()).is_err() {
+                    break; // main thread gone
+                }
+            }
+        }
+    });
+    rx
 }
 
 fn apply_rgb(panel: &PcPanelPro, mode: RgbMode) -> Result<()> {
@@ -153,8 +215,21 @@ fn run(cli: Cli) -> Result<()> {
         apply_rgb(&panel, rgb_mode)?;
     }
 
+    // Monitor for system resume to re-apply LED state
+    let resume_rx = spawn_resume_monitor();
+
     info!("listening for events (Ctrl+C to quit)...");
     loop {
+        // Check for resume signal
+        if resume_rx.try_recv().is_ok() {
+            info!("system resumed from sleep, re-applying LED config");
+            if let Some(rgb_mode) = config.rgb {
+                if let Err(e) = apply_rgb(&panel, rgb_mode) {
+                    warn!("failed to re-apply RGB after resume: {e}");
+                }
+            }
+        }
+
         let event = match panel.read_event()? {
             Some(e) => e,
             None => continue,
@@ -168,37 +243,52 @@ fn run(cli: Cli) -> Result<()> {
                     Control::Button(_) => unreachable!(),
                 };
 
-                if let Some(Action::Volume { apps }) = config.mappings.get(&control_id) {
+                if let Some(Action::Volume { apps, icon }) = config.mappings.get(&control_id) {
+                    let pct = (value as f32 / 255.0 * 100.0) as u8;
+                    let mut any_matched = false;
                     for app in apps {
+                        if Action::is_system(app) {
+                            audio.set_system_volume(value)?;
+                            any_matched = true;
+                        } else if audio.set_app_volume(app, value)? {
+                            any_matched = true;
+                        }
                         if cli.verbose {
-                            let pct = (value as f32 / 255.0 * 100.0) as u8;
                             if Action::is_system(app) {
                                 println!("System volume: {pct}%");
                             } else {
                                 println!("{app} volume: {pct}%");
                             }
                         }
-                        if Action::is_system(app) {
-                            audio.set_system_volume(value)?;
+                    }
+                    // Show OSD once per control event, only if something matched
+                    if any_matched {
+                        if apps.iter().any(|a| Action::is_system(a)) {
+                            osd::volume_changed(pct as i32);
                         } else {
-                            audio.set_app_volume(app, value)?;
+                            let label = apps.join("\n");
+                            let icon_name = icons::resolve(icon.as_deref(), apps);
+                            osd::media_player_volume_changed(pct as i32, &label, &icon_name);
                         }
                     }
                 }
             }
             Event::ButtonPress { index } => {
                 let control_id = ControlId::Button(index);
-                if let Some(Action::ToggleMute { apps }) = config.mappings.get(&control_id) {
+                if let Some(Action::ToggleMute { apps, icon }) = config.mappings.get(&control_id) {
                     for app in apps {
                         if Action::is_system(app) {
                             let muted = audio.toggle_system_mute()?;
                             println!("System mute: {}", if muted { "on" } else { "off" });
+                            osd::show_mute("System", muted);
                         } else if Action::is_mic(app) {
                             let muted = audio.toggle_mic_mute()?;
                             println!("Mic mute: {}", if muted { "on" } else { "off" });
-                        } else {
-                            let muted = audio.toggle_app_mute(app)?;
+                            osd::show_mic_mute(muted);
+                        } else if let Some(muted) = audio.toggle_app_mute(app)? {
                             println!("{app} mute: {}", if muted { "on" } else { "off" });
+                            let icon_name = icons::resolve_mute(icon.as_deref(), apps, muted);
+                            osd::show_text(&icon_name, &format!("{app}: {}", if muted { "Muted" } else { "Unmuted" }));
                         }
                     }
                 }

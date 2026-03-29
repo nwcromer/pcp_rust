@@ -9,8 +9,8 @@ const MIC_APP: &str = "mic";
 
 #[derive(Debug)]
 pub enum Action {
-    Volume { apps: Vec<String> },
-    ToggleMute { apps: Vec<String> },
+    Volume { apps: Vec<String>, icon: Option<String> },
+    ToggleMute { apps: Vec<String>, icon: Option<String> },
 }
 
 impl Action {
@@ -158,10 +158,11 @@ fn parse_action(key: &str, table: &toml::value::Table) -> Result<Action> {
         .with_context(|| format!("[{key}] missing \"action\" field"))?;
 
     let apps = parse_apps(key, table)?;
+    let icon = table.get("icon").and_then(|v| v.as_str()).map(String::from);
 
     match action {
-        "volume" => Ok(Action::Volume { apps }),
-        "toggle-mute" => Ok(Action::ToggleMute { apps }),
+        "volume" => Ok(Action::Volume { apps, icon }),
+        "toggle-mute" => Ok(Action::ToggleMute { apps, icon }),
         _ => bail!("[{key}] unknown action: \"{action}\""),
     }
 }
@@ -256,7 +257,7 @@ mod tests {
         .unwrap();
 
         match config.mappings.get(&ControlId::Slider(0)) {
-            Some(Action::Volume { apps }) => {
+            Some(Action::Volume { apps, .. }) => {
                 assert_eq!(apps, &["firefox", "Dota 2"]);
             }
             other => panic!("expected Volume, got {other:?}"),
