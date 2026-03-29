@@ -51,6 +51,7 @@ pub struct AudioController {
     context: Rc<RefCell<context::Context>>,
 }
 
+#[derive(Clone)]
 pub struct AppInfo {
     pub name: String,
     pub binary: Option<String>,
@@ -106,18 +107,25 @@ impl AudioController {
     }
 
     fn wait_for(&self, done: &RefCell<bool>) {
-        while !*done.borrow() {
+        const MAX_ITERATIONS: usize = 1000;
+        for _ in 0..MAX_ITERATIONS {
+            if *done.borrow() {
+                return;
+            }
             match self.mainloop.borrow_mut().iterate(true) {
                 IterateResult::Success(_) => {}
                 _ => break,
             }
         }
+        if !*done.borrow() {
+            log::warn!("PulseAudio operation timed out");
+        }
     }
 
     fn drain(&self) {
-        // Process pending operations
-        for _ in 0..50 {
+        loop {
             match self.mainloop.borrow_mut().iterate(false) {
+                IterateResult::Success(0) => break, // no more pending events
                 IterateResult::Success(_) => {}
                 _ => break,
             }
@@ -228,9 +236,7 @@ impl AudioController {
             if let ListResult::Item(sink) = result {
                 *channels_clone.borrow_mut() = sink.volume.len() as u8;
             }
-            if matches!(result, ListResult::End | ListResult::Error | ListResult::Item(_)) {
-                *done_clone.borrow_mut() = true;
-            }
+            *done_clone.borrow_mut() = true;
         });
 
         self.wait_for(&done);
@@ -347,16 +353,6 @@ impl Drop for AudioController {
     }
 }
 
-impl Clone for AppInfo {
-    fn clone(&self) -> Self {
-        Self {
-            name: self.name.clone(),
-            binary: self.binary.clone(),
-            pid: self.pid.clone(),
-            sink_input_index: self.sink_input_index,
-        }
-    }
-}
 
 fn volume_from_u8(value: u8) -> Volume {
     // Map 0-255 to 0-100% (PA_VOLUME_NORM)

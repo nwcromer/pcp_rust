@@ -138,7 +138,10 @@ fn spawn_resume_monitor() -> mpsc::Receiver<()> {
             }
         };
 
-        let stdout = child.stdout.take().unwrap();
+        let Some(stdout) = child.stdout.take() else {
+            warn!("resume monitor: failed to capture stdout");
+            return;
+        };
         let reader = std::io::BufReader::new(stdout);
         for line in reader.lines() {
             let Ok(line) = line else { break };
@@ -279,14 +282,20 @@ fn run(cli: Cli) -> Result<()> {
                     for app in apps {
                         if Action::is_system(app) {
                             let muted = audio.toggle_system_mute()?;
-                            println!("System mute: {}", if muted { "on" } else { "off" });
+                            if cli.verbose {
+                                println!("System mute: {}", if muted { "on" } else { "off" });
+                            }
                             osd::show_mute("System", muted);
                         } else if Action::is_mic(app) {
                             let muted = audio.toggle_mic_mute()?;
-                            println!("Mic mute: {}", if muted { "on" } else { "off" });
+                            if cli.verbose {
+                                println!("Mic mute: {}", if muted { "on" } else { "off" });
+                            }
                             osd::show_mic_mute(muted);
                         } else if let Some(muted) = audio.toggle_app_mute(app)? {
-                            println!("{app} mute: {}", if muted { "on" } else { "off" });
+                            if cli.verbose {
+                                println!("{app} mute: {}", if muted { "on" } else { "off" });
+                            }
                             let icon_name = icons::resolve_mute(icon.as_deref(), apps, muted);
                             osd::show_text(&icon_name, &format!("{app}: {}", if muted { "Muted" } else { "Unmuted" }));
                         }

@@ -98,13 +98,3 @@ pub fn set_rainbow(device: &PcPanelPro, rainbow_type: u8, brightness: u8, speed:
     ];
     device.set_led(&packet)
 }
-
-pub fn all_off(device: &PcPanelPro) -> Result<()> {
-    let off_knob = LedMode::Static(Rgb::BLACK);
-    let off_slider = LedMode::Static(Rgb::BLACK);
-    set_knob_colors(device, &[off_knob; 5])?;
-    set_slider_colors(device, &[off_slider; 4])?;
-    set_slider_label_colors(device, &[off_slider; 4])?;
-    set_logo(device, LogoMode::Static(Rgb::BLACK))?;
-    Ok(())
-}

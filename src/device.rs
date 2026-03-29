@@ -7,6 +7,16 @@ const PRODUCT_ID: u16 = 0xA3C5;
 const PACKET_SIZE: usize = 64;
 const CALIBRATION_READS: usize = 20;
 
+// Control index ranges in HID reports
+const KNOB_FIRST: u8 = 0;
+const KNOB_LAST: u8 = 4;
+const SLIDER_FIRST: u8 = 5;
+const SLIDER_LAST: u8 = 8;
+
+// Message types
+const MSG_ANALOG: u8 = 0x01;
+const MSG_BUTTON: u8 = 0x02;
+
 pub struct PcPanelPro {
     device: hidapi::HidDevice,
 }
@@ -79,10 +89,10 @@ impl PcPanelPro {
         let value = buf[2];
 
         match msg_type {
-            0x01 => {
+            MSG_ANALOG => {
                 let control = match index {
-                    0..=4 => Control::Knob(index),
-                    5..=8 => Control::Slider(index - 5),
+                    KNOB_FIRST..=KNOB_LAST => Control::Knob(index - KNOB_FIRST),
+                    SLIDER_FIRST..=SLIDER_LAST => Control::Slider(index - SLIDER_FIRST),
                     _ => {
                         warn!("unknown analog index: {}", index);
                         return Ok(None);
@@ -90,7 +100,7 @@ impl PcPanelPro {
                 };
                 Ok(Some(Event::AnalogChange { control, value }))
             }
-            0x02 => match value {
+            MSG_BUTTON => match value {
                 0x01 => Ok(Some(Event::ButtonPress { index })),
                 0x00 => Ok(Some(Event::ButtonRelease { index })),
                 _ => {

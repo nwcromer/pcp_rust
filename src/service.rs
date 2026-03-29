@@ -34,7 +34,7 @@ After=graphical-session.target
 Wants=graphical-session.target
 
 [Service]
-ExecStart={bin_path}
+ExecStart=\"{bin_path}\"
 Restart=on-failure
 RestartSec=5
 

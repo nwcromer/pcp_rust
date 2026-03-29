@@ -8,59 +8,43 @@ const DESKTOP_DIRS: &[&str] = &[
 
 const DEFAULT_ICON: &str = "audio-volume-high";
 
-/// Resolve an icon name for an app.
-/// Priority: config icon > .desktop file lookup > app name > default.
-pub fn resolve(config_icon: Option<&str>, app_names: &[String]) -> String {
-    // 1. Explicit config icon
+/// Try to find an icon for the given apps.
+/// Priority: config icon > .desktop file lookup > app name > None.
+fn find_app_icon(config_icon: Option<&str>, app_names: &[String]) -> Option<String> {
     if let Some(icon) = config_icon {
-        return icon.to_string();
+        return Some(icon.to_string());
     }
 
-    // 2. Search .desktop files for a matching app
     for app in app_names {
         if let Some(icon) = find_icon_in_desktop_files(app) {
-            return icon;
+            return Some(icon);
         }
     }
 
-    // 3. Try the first app name directly as an icon name
-    // (works for apps like firefox, chromium, etc.)
     if let Some(first) = app_names.first() {
         let candidate = first.to_lowercase();
         if icon_exists(&candidate) {
-            return candidate;
+            return Some(candidate);
         }
     }
 
-    // 4. Fallback
-    DEFAULT_ICON.to_string()
+    None
 }
 
-/// Resolve an icon for mute toggle. Uses app icon if found, otherwise mute/unmute icons.
+/// Resolve an icon name for volume display.
+pub fn resolve(config_icon: Option<&str>, app_names: &[String]) -> String {
+    find_app_icon(config_icon, app_names).unwrap_or_else(|| DEFAULT_ICON.to_string())
+}
+
+/// Resolve an icon for mute toggle. Falls back to mute/unmute icons.
 pub fn resolve_mute(config_icon: Option<&str>, app_names: &[String], muted: bool) -> String {
-    if let Some(icon) = config_icon {
-        return icon.to_string();
-    }
-
-    // Try to find an app icon
-    for app in app_names {
-        if let Some(icon) = find_icon_in_desktop_files(app) {
-            return icon;
+    find_app_icon(config_icon, app_names).unwrap_or_else(|| {
+        if muted {
+            "audio-volume-muted".to_string()
+        } else {
+            "audio-volume-high".to_string()
         }
-    }
-    if let Some(first) = app_names.first() {
-        let candidate = first.to_lowercase();
-        if icon_exists(&candidate) {
-            return candidate;
-        }
-    }
-
-    // Fallback to standard mute/unmute icons
-    if muted {
-        "audio-volume-muted".to_string()
-    } else {
-        "audio-volume-high".to_string()
-    }
+    })
 }
 
 /// Search .desktop files for an app and return its Icon= value.
