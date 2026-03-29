@@ -192,7 +192,6 @@ Remove the service:
 
 ## Protocol references
 
-- [PCPanel reverse engineering](https://github.com/arnarg/wiki/blob/master/pcpanel-reverse-engineering.md)
 - [PCPanel (Java)](https://github.com/nvdweem/PCPanel)
 - [PyPCPanelPro](https://github.com/Thebugger51/PyPCPanelPro)
 - [PCPanel_Linux](https://github.com/taotien/PCPanel_Linux)
