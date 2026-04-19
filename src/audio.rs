@@ -1,16 +1,15 @@
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::ops::Deref;
 use std::rc::Rc;
 
 use anyhow::{bail, Context, Result};
 use libpulse_binding as pulse;
-use log::{debug, info};
+use log::{debug, info, warn};
 use pulse::callbacks::ListResult;
-use pulse::context::subscribe::{Facility, InterestMaskSet, Operation as SubOperation};
+use pulse::context::ext_stream_restore::Info as SrInfo;
 use pulse::context::{self, FlagSet};
 use pulse::mainloop::standard::{IterateResult, Mainloop};
-use pulse::proplist::Proplist;
+use pulse::proplist::{Proplist, UpdateMode};
 use pulse::volume::{ChannelVolumes, Volume};
 
 /// Info collected from a sink input for matching and display.
@@ -52,10 +51,6 @@ impl SinkInputEntry {
 pub struct AudioController {
     mainloop: Rc<RefCell<Mainloop>>,
     context: Rc<RefCell<context::Context>>,
-    /// Tracks last-set volume (0-255) per app name, for re-applying on new streams.
-    tracked_volumes: HashMap<String, u8>,
-    /// Flag set by subscription callback when a new sink input appears.
-    new_stream_pending: Rc<RefCell<bool>>,
 }
 
 #[derive(Clone)]
@@ -111,47 +106,17 @@ impl AudioController {
 
         info!("connected to PulseAudio");
 
-        let new_stream_pending = Rc::new(RefCell::new(false));
-
-        // Subscribe to new sink input events
-        let pending_clone = new_stream_pending.clone();
-        context.borrow_mut().set_subscribe_callback(Some(Box::new(
-            move |facility, operation, _index| {
-                if facility == Some(Facility::SinkInput)
-                    && operation == Some(SubOperation::New)
-                {
-                    *pending_clone.borrow_mut() = true;
-                }
-            },
-        )));
-        let done = Rc::new(RefCell::new(false));
-        let done_clone = done.clone();
-        context.borrow_mut().subscribe(
-            InterestMaskSet::SINK_INPUT,
-            move |success| {
-                if !success {
-                    log::warn!("failed to subscribe to sink input events");
-                }
-                *done_clone.borrow_mut() = true;
-            },
-        );
-
-        // Wait for subscription to complete
-        let controller = Self {
-            mainloop,
-            context,
-            tracked_volumes: HashMap::new(),
-            new_stream_pending,
-        };
-        controller.wait_for(&done);
-
-        Ok(controller)
+        Ok(Self { mainloop, context })
     }
 
     fn wait_for(&self, done: &RefCell<bool>) {
+        self.wait_until(|| *done.borrow());
+    }
+
+    fn wait_until<F: Fn() -> bool>(&self, is_done: F) {
         const MAX_ITERATIONS: usize = 1000;
         for _ in 0..MAX_ITERATIONS {
-            if *done.borrow() {
+            if is_done() {
                 return;
             }
             match self.mainloop.borrow_mut().iterate(true) {
@@ -159,7 +124,7 @@ impl AudioController {
                 _ => break,
             }
         }
-        if !*done.borrow() {
+        if !is_done() {
             log::warn!("PulseAudio operation timed out");
         }
     }
@@ -310,14 +275,81 @@ impl AudioController {
         }
         self.drain();
 
-        // Track the volume so we can re-apply it to new streams
-        self.tracked_volumes.insert(target, value);
+        // Persist the volume to the stream-restore database so that new streams
+        // for this app pick up the new value automatically.
+        if let Err(e) = self.update_stream_restore(&target, volume) {
+            warn!("failed to update stream-restore for {app_name}: {e}");
+        }
 
         if matched.is_empty() {
             debug!("app not found: {app_name}");
         }
 
         Ok(!matched.is_empty())
+    }
+
+    /// Updates module-stream-restore database entries whose name contains `target`
+    /// (case-insensitive) so that new streams for this app use `volume`.
+    fn update_stream_restore(&self, target: &str, volume: Volume) -> Result<()> {
+        let entries: Rc<RefCell<Vec<SrInfo<'static>>>> = Rc::new(RefCell::new(Vec::new()));
+        let done = Rc::new(RefCell::new(false));
+
+        let entries_clone = entries.clone();
+        let done_clone = done.clone();
+
+        let mut sr = self.context.borrow().stream_restore();
+        let _op = sr.read(move |result| match result {
+            ListResult::Item(info) => {
+                entries_clone.borrow_mut().push(info.to_owned());
+            }
+            ListResult::End | ListResult::Error => {
+                *done_clone.borrow_mut() = true;
+            }
+        });
+        self.wait_for(&done);
+
+        let mut updated: Vec<SrInfo<'static>> = Vec::new();
+        for entry in entries.borrow().iter() {
+            let name_matches = entry
+                .name
+                .as_ref()
+                .map(|n| n.to_lowercase().contains(target))
+                .unwrap_or(false);
+            if !name_matches {
+                continue;
+            }
+            let channels = entry.volume.len();
+            let mut cv = ChannelVolumes::default();
+            cv.set(channels, volume);
+            updated.push(SrInfo {
+                name: entry.name.clone(),
+                channel_map: entry.channel_map,
+                volume: cv,
+                device: entry.device.clone(),
+                mute: entry.mute,
+            });
+        }
+
+        if updated.is_empty() {
+            return Ok(());
+        }
+
+        let refs: Vec<&SrInfo> = updated.iter().collect();
+        let result: Rc<RefCell<Option<bool>>> = Rc::new(RefCell::new(None));
+        let result_clone = result.clone();
+        let _op = sr.write(UpdateMode::Replace, &refs, false, move |success| {
+            *result_clone.borrow_mut() = Some(success);
+        });
+        self.wait_until(|| result.borrow().is_some());
+
+        match *result.borrow() {
+            None => bail!("stream-restore write did not complete"),
+            Some(false) => bail!("stream-restore write rejected by server"),
+            Some(true) => {}
+        }
+
+        debug!("updated {} stream-restore entries for {target}", updated.len());
+        Ok(())
     }
 
     /// Returns the new mute state (true = muted).
@@ -400,37 +432,6 @@ impl AudioController {
         Ok(Some(new_mute))
     }
 
-    /// Process any pending new-stream events and re-apply tracked volumes.
-    /// Call this periodically from the main event loop.
-    pub fn apply_tracked_volumes(&mut self) -> Result<()> {
-        // Process any pending PA events (non-blocking) to trigger subscription callbacks
-        let _ = self.mainloop.borrow_mut().iterate(false);
-
-        if !*self.new_stream_pending.borrow() {
-            return Ok(());
-        }
-        *self.new_stream_pending.borrow_mut() = false;
-
-        if self.tracked_volumes.is_empty() {
-            return Ok(());
-        }
-
-        let entries = self.collect_sink_inputs()?;
-
-        let mut introspect = self.context.borrow().introspect();
-        for (app_name, &value) in &self.tracked_volumes {
-            let volume = volume_from_u8(value);
-            for entry in entries.iter().filter(|e| e.matches(app_name)) {
-                let mut cv = ChannelVolumes::default();
-                cv.set(entry.channels.into(), volume);
-                let _op = introspect.set_sink_input_volume(entry.index, &cv, None);
-                debug!("re-applied volume for {} (new stream {})", app_name, entry.index);
-            }
-        }
-        self.drain();
-
-        Ok(())
-    }
 }
 
 impl Drop for AudioController {
@@ -438,7 +439,6 @@ impl Drop for AudioController {
         self.context.borrow_mut().disconnect();
     }
 }
-
 
 fn volume_from_u8(value: u8) -> Volume {
     // Map 0-255 to 0-100% (PA_VOLUME_NORM)
