@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::ops::Deref;
 use std::rc::Rc;
 
@@ -6,6 +7,7 @@ use anyhow::{bail, Context, Result};
 use libpulse_binding as pulse;
 use log::{debug, info};
 use pulse::callbacks::ListResult;
+use pulse::context::subscribe::{Facility, InterestMaskSet, Operation as SubOperation};
 use pulse::context::{self, FlagSet};
 use pulse::mainloop::standard::{IterateResult, Mainloop};
 use pulse::proplist::Proplist;
@@ -36,7 +38,8 @@ impl SinkInputEntry {
             }
         }
         if let Some(ref pid) = self.pid {
-            if let Ok(comm) = std::fs::read_to_string(format!("/proc/{pid}/comm")) {
+            if pid.chars().all(|c| c.is_ascii_digit())
+            && let Ok(comm) = std::fs::read_to_string(format!("/proc/{pid}/comm")) {
                 if comm.trim().to_lowercase().contains(target) {
                     return true;
                 }
@@ -49,6 +52,10 @@ impl SinkInputEntry {
 pub struct AudioController {
     mainloop: Rc<RefCell<Mainloop>>,
     context: Rc<RefCell<context::Context>>,
+    /// Tracks last-set volume (0-255) per app name, for re-applying on new streams.
+    tracked_volumes: HashMap<String, u8>,
+    /// Flag set by subscription callback when a new sink input appears.
+    new_stream_pending: Rc<RefCell<bool>>,
 }
 
 #[derive(Clone)]
@@ -103,7 +110,42 @@ impl AudioController {
         }
 
         info!("connected to PulseAudio");
-        Ok(Self { mainloop, context })
+
+        let new_stream_pending = Rc::new(RefCell::new(false));
+
+        // Subscribe to new sink input events
+        let pending_clone = new_stream_pending.clone();
+        context.borrow_mut().set_subscribe_callback(Some(Box::new(
+            move |facility, operation, _index| {
+                if facility == Some(Facility::SinkInput)
+                    && operation == Some(SubOperation::New)
+                {
+                    *pending_clone.borrow_mut() = true;
+                }
+            },
+        )));
+        let done = Rc::new(RefCell::new(false));
+        let done_clone = done.clone();
+        context.borrow_mut().subscribe(
+            InterestMaskSet::SINK_INPUT,
+            move |success| {
+                if !success {
+                    log::warn!("failed to subscribe to sink input events");
+                }
+                *done_clone.borrow_mut() = true;
+            },
+        );
+
+        // Wait for subscription to complete
+        let controller = Self {
+            mainloop,
+            context,
+            tracked_volumes: HashMap::new(),
+            new_stream_pending,
+        };
+        controller.wait_for(&done);
+
+        Ok(controller)
     }
 
     fn wait_for(&self, done: &RefCell<bool>) {
@@ -253,7 +295,7 @@ impl AudioController {
     }
 
     /// Returns true if any matching app was found.
-    pub fn set_app_volume(&self, app_name: &str, value: u8) -> Result<bool> {
+    pub fn set_app_volume(&mut self, app_name: &str, value: u8) -> Result<bool> {
         let volume = volume_from_u8(value);
         let target = app_name.to_lowercase();
         let entries = self.collect_sink_inputs()?;
@@ -267,6 +309,9 @@ impl AudioController {
             let _op = introspect.set_sink_input_volume(entry.index, &cv, None);
         }
         self.drain();
+
+        // Track the volume so we can re-apply it to new streams
+        self.tracked_volumes.insert(target, value);
 
         if matched.is_empty() {
             debug!("app not found: {app_name}");
@@ -286,6 +331,8 @@ impl AudioController {
         let _op = introspect.get_sink_info_by_name("@DEFAULT_SINK@", move |result| {
             if let ListResult::Item(sink) = result {
                 *mute_clone.borrow_mut() = sink.mute;
+            }
+            if matches!(result, ListResult::Item(_) | ListResult::End | ListResult::Error) {
                 *done_clone.borrow_mut() = true;
             }
         });
@@ -311,6 +358,8 @@ impl AudioController {
         let _op = introspect.get_source_info_by_name("@DEFAULT_SOURCE@", move |result| {
             if let ListResult::Item(source) = result {
                 *mute_clone.borrow_mut() = source.mute;
+            }
+            if matches!(result, ListResult::Item(_) | ListResult::End | ListResult::Error) {
                 *done_clone.borrow_mut() = true;
             }
         });
@@ -326,6 +375,7 @@ impl AudioController {
     }
 
     /// Returns the new mute state, or None if the app wasn't found.
+    /// If any matched streams are unmuted, mutes all. If all are muted, unmutes all.
     pub fn toggle_app_mute(&self, app_name: &str) -> Result<Option<bool>> {
         let target = app_name.to_lowercase();
         let entries = self.collect_sink_inputs()?;
@@ -337,13 +387,49 @@ impl AudioController {
             return Ok(None);
         }
 
+        // If any are unmuted, mute all. If all are muted, unmute all.
+        let any_unmuted = matched.iter().any(|e| !e.muted);
+        let new_mute = any_unmuted;
+
         let mut introspect = self.context.borrow().introspect();
         for entry in &matched {
-            let _op = introspect.set_sink_input_mute(entry.index, !entry.muted, None);
+            let _op = introspect.set_sink_input_mute(entry.index, new_mute, None);
         }
         self.drain();
 
-        Ok(Some(!matched.first().unwrap().muted))
+        Ok(Some(new_mute))
+    }
+
+    /// Process any pending new-stream events and re-apply tracked volumes.
+    /// Call this periodically from the main event loop.
+    pub fn apply_tracked_volumes(&mut self) -> Result<()> {
+        // Process any pending PA events (non-blocking) to trigger subscription callbacks
+        let _ = self.mainloop.borrow_mut().iterate(false);
+
+        if !*self.new_stream_pending.borrow() {
+            return Ok(());
+        }
+        *self.new_stream_pending.borrow_mut() = false;
+
+        if self.tracked_volumes.is_empty() {
+            return Ok(());
+        }
+
+        let entries = self.collect_sink_inputs()?;
+
+        let mut introspect = self.context.borrow().introspect();
+        for (app_name, &value) in &self.tracked_volumes {
+            let volume = volume_from_u8(value);
+            for entry in entries.iter().filter(|e| e.matches(app_name)) {
+                let mut cv = ChannelVolumes::default();
+                cv.set(entry.channels.into(), volume);
+                let _op = introspect.set_sink_input_volume(entry.index, &cv, None);
+                debug!("re-applied volume for {} (new stream {})", app_name, entry.index);
+            }
+        }
+        self.drain();
+
+        Ok(())
     }
 }
 
@@ -357,6 +443,6 @@ impl Drop for AudioController {
 fn volume_from_u8(value: u8) -> Volume {
     // Map 0-255 to 0-100% (PA_VOLUME_NORM)
     let fraction = value as f64 / 255.0;
-    let raw = (fraction * f64::from(Volume::NORMAL.0)) as u32;
+    let raw = (fraction * f64::from(Volume::NORMAL.0) + 0.5) as u32;
     Volume(raw)
 }

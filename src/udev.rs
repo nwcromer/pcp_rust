@@ -7,9 +7,9 @@ use anyhow::{bail, Result};
 const RULES_PATH: &str = "/etc/udev/rules.d/99-pcpanel.rules";
 
 const RULES_CONTENT: &str = "\
-# PCPanel Pro
-SUBSYSTEM==\"usb\", ATTR{idVendor}==\"0483\", ATTR{idProduct}==\"a3c5\", MODE=\"0666\"
-SUBSYSTEM==\"hidraw\", ATTRS{idVendor}==\"0483\", ATTRS{idProduct}==\"a3c5\", MODE=\"0666\"
+# PCPanel Pro — grant access to the physically logged-in user
+SUBSYSTEM==\"usb\", ATTR{idVendor}==\"0483\", ATTR{idProduct}==\"a3c5\", TAG+=\"uaccess\"
+SUBSYSTEM==\"hidraw\", ATTRS{idVendor}==\"0483\", ATTRS{idProduct}==\"a3c5\", TAG+=\"uaccess\"
 ";
 
 pub fn create_udev_rules() -> Result<()> {

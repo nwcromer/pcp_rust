@@ -3,6 +3,11 @@ use anyhow::Result;
 use crate::device::PcPanelPro;
 
 const PRO_PREFIX: u8 = 0x05;
+const CMD_SLIDERS: u8 = 0x00;
+const CMD_SLIDER_LABELS: u8 = 0x01;
+const CMD_KNOBS: u8 = 0x02;
+const CMD_LOGO: u8 = 0x03;
+const CMD_GLOBAL_ANIMATION: u8 = 0x04;
 
 #[derive(Debug, Clone, Copy)]
 pub struct Rgb {
@@ -48,7 +53,7 @@ pub enum LogoMode {
 }
 
 pub fn set_knob_colors(device: &PcPanelPro, knobs: &[LedMode; 5]) -> Result<()> {
-    let mut packet = vec![PRO_PREFIX, 0x02];
+    let mut packet = vec![PRO_PREFIX, CMD_KNOBS];
     for mode in knobs {
         packet.extend_from_slice(&mode.to_bytes());
     }
@@ -56,7 +61,7 @@ pub fn set_knob_colors(device: &PcPanelPro, knobs: &[LedMode; 5]) -> Result<()> 
 }
 
 pub fn set_slider_colors(device: &PcPanelPro, sliders: &[LedMode; 4]) -> Result<()> {
-    let mut packet = vec![PRO_PREFIX, 0x00];
+    let mut packet = vec![PRO_PREFIX, CMD_SLIDERS];
     for mode in sliders {
         packet.extend_from_slice(&mode.to_bytes());
     }
@@ -64,7 +69,7 @@ pub fn set_slider_colors(device: &PcPanelPro, sliders: &[LedMode; 4]) -> Result<
 }
 
 pub fn set_slider_label_colors(device: &PcPanelPro, labels: &[LedMode; 4]) -> Result<()> {
-    let mut packet = vec![PRO_PREFIX, 0x01];
+    let mut packet = vec![PRO_PREFIX, CMD_SLIDER_LABELS];
     for mode in labels {
         packet.extend_from_slice(&mode.to_bytes());
     }
@@ -73,15 +78,15 @@ pub fn set_slider_label_colors(device: &PcPanelPro, labels: &[LedMode; 4]) -> Re
 
 pub fn set_logo(device: &PcPanelPro, mode: LogoMode) -> Result<()> {
     let packet = match mode {
-        LogoMode::Static(c) => vec![PRO_PREFIX, 0x03, 0x01, c.r, c.g, c.b],
+        LogoMode::Static(c) => vec![PRO_PREFIX, CMD_LOGO, 0x01, c.r, c.g, c.b],
         LogoMode::Rainbow { brightness, speed } => {
-            vec![PRO_PREFIX, 0x03, 0x02, 0xFF, brightness, speed]
+            vec![PRO_PREFIX, CMD_LOGO, 0x02, 0xFF, brightness, speed]
         }
         LogoMode::Breath {
             hue,
             brightness,
             speed,
-        } => vec![PRO_PREFIX, 0x03, 0x03, hue, brightness, speed],
+        } => vec![PRO_PREFIX, CMD_LOGO, 0x03, hue, brightness, speed],
     };
     device.set_led(&packet)
 }
@@ -89,7 +94,7 @@ pub fn set_logo(device: &PcPanelPro, mode: LogoMode) -> Result<()> {
 /// Rainbow animation type: 0x01 = horizontal, 0x02 = vertical
 pub fn set_rainbow(device: &PcPanelPro, rainbow_type: u8, brightness: u8, speed: u8) -> Result<()> {
     let packet = vec![
-        PRO_PREFIX, 0x04, rainbow_type,
+        PRO_PREFIX, CMD_GLOBAL_ANIMATION, rainbow_type,
         0x00,        // phase
         0xFF,        // placeholder
         brightness,

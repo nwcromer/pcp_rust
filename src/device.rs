@@ -13,6 +13,9 @@ const KNOB_LAST: u8 = 4;
 const SLIDER_FIRST: u8 = 5;
 const SLIDER_LAST: u8 = 8;
 
+const BUTTON_FIRST: u8 = 0;
+const BUTTON_LAST: u8 = 4;
+
 // Message types
 const MSG_ANALOG: u8 = 0x01;
 const MSG_BUTTON: u8 = 0x02;
@@ -100,14 +103,20 @@ impl PcPanelPro {
                 };
                 Ok(Some(Event::AnalogChange { control, value }))
             }
-            MSG_BUTTON => match value {
-                0x01 => Ok(Some(Event::ButtonPress { index })),
-                0x00 => Ok(Some(Event::ButtonRelease { index })),
-                _ => {
-                    warn!("unknown button value: {:#04x}", value);
-                    Ok(None)
+            MSG_BUTTON => {
+                if !(BUTTON_FIRST..=BUTTON_LAST).contains(&index) {
+                    warn!("unknown button index: {}", index);
+                    return Ok(None);
                 }
-            },
+                match value {
+                    0x01 => Ok(Some(Event::ButtonPress { index })),
+                    0x00 => Ok(Some(Event::ButtonRelease { index })),
+                    _ => {
+                        warn!("unknown button value: {:#04x}", value);
+                        Ok(None)
+                    }
+                }
+            }
             _ => {
                 debug!("unknown message type: {:#04x}", msg_type);
                 Ok(None)
@@ -116,9 +125,14 @@ impl PcPanelPro {
     }
 
     pub fn set_led(&self, packet: &[u8]) -> Result<()> {
+        anyhow::ensure!(
+            packet.len() <= PACKET_SIZE,
+            "LED packet too large: {} bytes > {}",
+            packet.len(),
+            PACKET_SIZE
+        );
         let mut buf = [0u8; PACKET_SIZE];
-        let len = packet.len().min(PACKET_SIZE);
-        buf[..len].copy_from_slice(&packet[..len]);
+        buf[..packet.len()].copy_from_slice(packet);
         self.device
             .write(&buf)
             .context("failed to write LED command")?;

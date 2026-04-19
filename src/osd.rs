@@ -6,6 +6,8 @@ const DEST: &str = "org.kde.plasmashell";
 const PATH: &str = "/org/kde/osdService";
 const IFACE: &str = "org.kde.osdService";
 
+/// Failures are intentionally swallowed — OSD is non-critical and should
+/// never prevent volume/mute operations from completing.
 fn call(method: &str, args: &[&str]) {
     let mut cmd = Command::new("gdbus");
     cmd.arg("call")

@@ -55,7 +55,9 @@ fn find_icon_in_desktop_files(app_name: &str) -> Option<String> {
         if !dir_path.is_dir() {
             continue;
         }
-        let entries = fs::read_dir(dir_path).ok()?;
+        let Ok(entries) = fs::read_dir(dir_path) else {
+            continue;
+        };
         for entry in entries.flatten() {
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) != Some("desktop") {

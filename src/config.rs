@@ -91,7 +91,7 @@ fn parse_control_id(key: &str) -> Result<ControlId> {
 
 fn parse_hex_color(s: &str) -> Result<(u8, u8, u8)> {
     let s = s.strip_prefix('#').unwrap_or(s);
-    if s.len() != 6 {
+    if s.len() != 6 || !s.is_ascii() {
         bail!("invalid color: expected 6 hex digits, got \"{s}\"");
     }
     let r = u8::from_str_radix(&s[0..2], 16).context("invalid red component")?;

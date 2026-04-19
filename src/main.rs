@@ -92,6 +92,7 @@ fn list_apps() -> Result<()> {
             .or_else(|| {
                 app.pid
                     .as_deref()
+                    .filter(|p| p.chars().all(|c| c.is_ascii_digit()))
                     .and_then(|p| std::fs::read_to_string(format!("/proc/{p}/comm")).ok())
                     .map(|s| s.trim().to_string())
                     .filter(|c| !c.eq_ignore_ascii_case(&app.name))
@@ -140,6 +141,7 @@ fn spawn_resume_monitor() -> mpsc::Receiver<()> {
 
         let Some(stdout) = child.stdout.take() else {
             warn!("resume monitor: failed to capture stdout");
+            let _ = child.kill();
             return;
         };
         let reader = std::io::BufReader::new(stdout);
@@ -153,6 +155,8 @@ fn spawn_resume_monitor() -> mpsc::Receiver<()> {
                 }
             }
         }
+        let _ = child.kill();
+        let _ = child.wait();
     });
     rx
 }
@@ -172,7 +176,9 @@ fn apply_rgb(panel: &PcPanelPro, mode: RgbMode) -> Result<()> {
                 RainbowStyle::Horizontal => 0x01,
                 RainbowStyle::Vertical => 0x02,
             };
-            led::set_rainbow(panel, rainbow_type, 200, 64)?;
+            const DEFAULT_BRIGHTNESS: u8 = 200;
+            const DEFAULT_SPEED: u8 = 64;
+            led::set_rainbow(panel, rainbow_type, DEFAULT_BRIGHTNESS, DEFAULT_SPEED)?;
         }
     }
     Ok(())
@@ -196,7 +202,7 @@ fn run(cli: Cli) -> Result<()> {
     info!("loaded config from {}", config_path.display());
     info!("{} control(s) mapped", config.mappings.len());
 
-    let audio = audio::AudioController::connect()?;
+    let mut audio = audio::AudioController::connect()?;
 
     info!("connecting to PCPanel Pro...");
     let panel = PcPanelPro::open()?;
@@ -233,6 +239,11 @@ fn run(cli: Cli) -> Result<()> {
             }
         }
 
+        // Re-apply tracked volumes to any new audio streams
+        if let Err(e) = audio.apply_tracked_volumes() {
+            warn!("failed to apply tracked volumes: {e}");
+        }
+
         let event = match panel.read_event()? {
             Some(e) => e,
             None => continue,
@@ -243,7 +254,7 @@ fn run(cli: Cli) -> Result<()> {
                 let control_id = match control {
                     Control::Knob(i) => ControlId::Knob(i),
                     Control::Slider(i) => ControlId::Slider(i),
-                    Control::Button(_) => unreachable!(),
+                    Control::Button(_) => continue,
                 };
 
                 if let Some(Action::Volume { apps, icon }) = config.mappings.get(&control_id) {
