@@ -15,3 +15,12 @@ log = "0.4"
 env_logger = "0.11"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
+
+# Local override: uses a sibling checkout of pulse-binding-rust which fixes
+# the ext_stream_restore write() transmute bug. Submitted upstream as PR #66.
+# Requires cloning https://github.com/nwcromer/pulse-binding-rust (branch
+# fix-ext-stream-restore-write) as a sibling directory to this repo.
+# Remove this patch block once the PR merges and crates.io is updated.
+[patch.crates-io]
+libpulse-binding = { path = "../pulse-binding-rust/pulse-binding" }
+libpulse-sys = { path = "../pulse-binding-rust/pulse-sys" }

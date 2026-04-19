@@ -239,11 +239,6 @@ fn run(cli: Cli) -> Result<()> {
             }
         }
 
-        // Re-apply tracked volumes to any new audio streams
-        if let Err(e) = audio.apply_tracked_volumes() {
-            warn!("failed to apply tracked volumes: {e}");
-        }
-
         let event = match panel.read_event()? {
             Some(e) => e,
             None => continue,
