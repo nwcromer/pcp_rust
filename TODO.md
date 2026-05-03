@@ -13,7 +13,7 @@ Things planned for future work on pcp_rust.
 ## Cleanup
 
 - **Clean up dead-code warnings** flagged by rustc. Only remove items that won't be needed for upcoming features — evaluate each before deleting. Currently flagged: `AppInfo.sink_input_index`, `Control::Button`, `Rgb` color constants, `LedMode::Gradient`/`VolumeGradient`, `LogoMode::Rainbow`/`Breath`, `osd::microphone_volume_changed`.
-- **Review udev rule portability** — is the current rule specific to this system or would it work on other distros/setups?
+- **Review udev rule portability** — confirm it works across mainstream Linux distros.
 - **Switch back to crates.io for libpulse-binding** — if [pulse-binding-rust PR #66](https://github.com/jnqnfe/pulse-binding-rust/pull/66) merges and a fixed version is released, remove the `[patch.crates-io]` block in `Cargo.toml` and use the published crate version instead.
 
 ## Invariants
