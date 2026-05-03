@@ -306,6 +306,7 @@ checksum = "b5b646652bf6661599e1da8901b3b9522896f01e736bad5f723fe7a3a27f899d"
 [[package]]
 name = "libpulse-binding"
 version = "2.30.1"
+source = "git+https://github.com/nwcromer/pulse-binding-rust?branch=fix-ext-stream-restore-write#fd20d3248637c9472fcc667d4846401182b5c711"
 dependencies = [
  "bitflags",
  "libc",
@@ -318,6 +319,7 @@ dependencies = [
 [[package]]
 name = "libpulse-sys"
 version = "1.23.0"
+source = "git+https://github.com/nwcromer/pulse-binding-rust?branch=fix-ext-stream-restore-write#fd20d3248637c9472fcc667d4846401182b5c711"
 dependencies = [
  "libc",
  "num-derive",
