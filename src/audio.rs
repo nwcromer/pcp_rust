@@ -58,7 +58,6 @@ pub struct AppInfo {
     pub name: String,
     pub binary: Option<String>,
     pub pid: Option<String>,
-    pub sink_input_index: u32,
 }
 
 impl AudioController {
@@ -223,7 +222,6 @@ impl AudioController {
                 name: e.name,
                 binary: e.binary,
                 pid: e.pid,
-                sink_input_index: e.index,
             })
             .collect();
         Ok(apps)

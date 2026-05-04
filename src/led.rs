@@ -20,15 +20,13 @@ impl Rgb {
     pub const fn new(r: u8, g: u8, b: u8) -> Self {
         Self { r, g, b }
     }
-
-    pub const BLACK: Self = Self::new(0, 0, 0);
-    pub const WHITE: Self = Self::new(255, 255, 255);
-    pub const RED: Self = Self::new(255, 0, 0);
-    pub const GREEN: Self = Self::new(0, 255, 0);
-    pub const BLUE: Self = Self::new(0, 0, 255);
 }
 
+// Gradient/VolumeGradient are unused but kept as protocol documentation:
+// VolumeGradient (byte 0x03) is the device's "show volume level via LED color"
+// mode for sliders, a likely future feature.
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
 pub enum LedMode {
     Static(Rgb),
     Gradient(Rgb, Rgb),
@@ -45,7 +43,10 @@ impl LedMode {
     }
 }
 
+// Rainbow/Breath are unused but kept as protocol documentation: bytes 0x02
+// and 0x03 are the device's animated logo modes, likely future config options.
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
 pub enum LogoMode {
     Static(Rgb),
     Rainbow { brightness: u8, speed: u8 },

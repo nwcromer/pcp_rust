@@ -249,7 +249,6 @@ fn run(cli: Cli) -> Result<()> {
                 let control_id = match control {
                     Control::Knob(i) => ControlId::Knob(i),
                     Control::Slider(i) => ControlId::Slider(i),
-                    Control::Button(_) => continue,
                 };
 
                 if let Some(Action::Volume { apps, icon }) = config.mappings.get(&control_id) {

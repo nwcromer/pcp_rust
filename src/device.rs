@@ -28,7 +28,6 @@ pub struct PcPanelPro {
 pub enum Control {
     Knob(u8),   // 0-4
     Slider(u8), // 0-3
-    Button(u8), // 0-4
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
