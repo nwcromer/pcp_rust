@@ -275,16 +275,19 @@ fn run(cli: Cli) -> Result<()> {
 
                 if let Some(Action::Volume { apps, icon }) = config.mappings.get(&control_id) {
                     let pct = (value as f32 / 255.0 * 100.0) as u8;
-                    let mut any_matched = false;
+                    let mut matched_apps: Vec<String> = Vec::new();
                     for app in apps {
-                        if Action::is_system(app) {
+                        let matched = if Action::is_system(app) {
                             audio.set_system_volume(value)?;
-                            any_matched = true;
+                            true
                         } else if Action::is_mic(app) {
                             audio.set_mic_volume(value)?;
-                            any_matched = true;
-                        } else if audio.set_app_volume(app, value)? {
-                            any_matched = true;
+                            true
+                        } else {
+                            audio.set_app_volume(app, value)?
+                        };
+                        if matched {
+                            matched_apps.push(app.clone());
                         }
                         if cli.verbose {
                             if Action::is_system(app) {
@@ -297,14 +300,14 @@ fn run(cli: Cli) -> Result<()> {
                         }
                     }
                     // Show OSD once per control event, only if something matched
-                    if any_matched {
-                        if apps.iter().any(|a| Action::is_system(a)) {
+                    if !matched_apps.is_empty() {
+                        if matched_apps.iter().any(|a| Action::is_system(a)) {
                             osd::volume_changed(pct as i32);
-                        } else if apps.iter().any(|a| Action::is_mic(a)) {
+                        } else if matched_apps.iter().any(|a| Action::is_mic(a)) {
                             osd::microphone_volume_changed(pct as i32);
                         } else {
-                            let label = apps.join("\n");
-                            let icon_name = icons::resolve(icon.as_deref(), apps);
+                            let label = matched_apps.join("\n");
+                            let icon_name = icons::resolve(icon.as_deref(), &matched_apps);
                             osd::media_player_volume_changed(pct as i32, &label, &icon_name);
                         }
                     }
