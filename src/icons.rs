@@ -6,7 +6,10 @@ const DESKTOP_DIRS: &[&str] = &[
     "/usr/local/share/applications",
 ];
 
-const DEFAULT_ICON: &str = "audio-volume-high";
+// Passing an empty icon name to KDE's mediaPlayerVolumeChanged renders the
+// OSD with no icon, which is what we want when no app icon resolves —
+// the standard speaker icon would imply the system volume is changing.
+const DEFAULT_ICON: &str = "";
 
 /// Try to find an icon for the given apps.
 /// Priority: config icon > .desktop file lookup > app name > None.
