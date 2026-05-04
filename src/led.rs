@@ -22,11 +22,7 @@ impl Rgb {
     }
 }
 
-// Gradient/VolumeGradient are unused but kept as protocol documentation:
-// VolumeGradient (byte 0x03) is the device's "show volume level via LED color"
-// mode for sliders, a likely future feature.
 #[derive(Debug, Clone, Copy)]
-#[allow(dead_code)]
 pub enum LedMode {
     Static(Rgb),
     Gradient(Rgb, Rgb),
@@ -43,8 +39,9 @@ impl LedMode {
     }
 }
 
-// Rainbow/Breath are unused but kept as protocol documentation: bytes 0x02
-// and 0x03 are the device's animated logo modes, likely future config options.
+// Rainbow and Breath are intentionally not exposed in config — pcp_rust
+// keeps the config logo-agnostic. Kept as protocol documentation for
+// anyone wanting to use them programmatically.
 #[derive(Debug, Clone, Copy)]
 #[allow(dead_code)]
 pub enum LogoMode {
@@ -101,6 +98,37 @@ pub fn set_rainbow(device: &PcPanelPro, rainbow_type: u8, brightness: u8, speed:
         brightness,
         speed,
         0x00,        // no reverse
+    ];
+    device.set_led(&packet)
+}
+
+pub fn set_wave(
+    device: &PcPanelPro,
+    hue: u8,
+    brightness: u8,
+    speed: u8,
+    reverse: bool,
+    bounce: bool,
+) -> Result<()> {
+    let packet = vec![
+        PRO_PREFIX, CMD_GLOBAL_ANIMATION, 0x03, // wave
+        hue,
+        0xFF, // placeholder
+        brightness,
+        speed,
+        if reverse { 1 } else { 0 },
+        if bounce { 1 } else { 0 },
+    ];
+    device.set_led(&packet)
+}
+
+pub fn set_breath(device: &PcPanelPro, hue: u8, brightness: u8, speed: u8) -> Result<()> {
+    let packet = vec![
+        PRO_PREFIX, CMD_GLOBAL_ANIMATION, 0x04, // breath
+        hue,
+        0xFF, // placeholder
+        brightness,
+        speed,
     ];
     device.set_led(&packet)
 }

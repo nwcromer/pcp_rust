@@ -127,6 +127,8 @@ app = ["dota2", "Risk of Rain 2.exe"]
 
 #### RGB modes
 
+The device speaks two color "languages" depending on the effect. Static effects (solid, gradient, volume-gradient) take full RGB hex colors. Animated effects (wave, breath) take a single `hue` byte (0–255) and animate the brightness/cycle internally.
+
 **Solid color:**
 ```toml
 [rgb]
@@ -138,7 +140,43 @@ color = "#E0FFFF"
 ```toml
 [rgb]
 mode = "rainbow"
-style = "horizontal"
+style = "horizontal"   # or "vertical" (may not work on all hardware revisions)
+```
+
+**Gradient** — two-color static gradient across knobs/sliders/labels:
+```toml
+[rgb]
+mode = "gradient"
+color1 = "#FF0000"
+color2 = "#0000FF"
+```
+
+**Volume gradient** — sliders show their volume position via the gradient (LED color reflects current value); knobs and labels fall back to solid `color1`:
+```toml
+[rgb]
+mode = "volume-gradient"
+color1 = "#00FF00"
+color2 = "#FF0000"
+```
+
+**Wave** — animated wave; `hue` selects a position on the color wheel (0=red, ~85=yellow/green, ~170=blue):
+```toml
+[rgb]
+mode = "wave"
+hue = 200              # required, 0-255
+brightness = 200       # optional, default 200
+speed = 64             # optional, default 64
+reverse = false        # optional, default false
+bounce = false         # optional, default false
+```
+
+**Breath** — breathing pulse:
+```toml
+[rgb]
+mode = "breath"
+hue = 200              # required, 0-255
+brightness = 200       # optional, default 200
+speed = 64             # optional, default 64
 ```
 
 #### Icons (optional)

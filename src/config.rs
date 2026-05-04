@@ -43,9 +43,20 @@ pub enum RainbowStyle {
 }
 
 #[derive(Debug, Clone, Copy)]
+pub struct RgbColor {
+    pub r: u8,
+    pub g: u8,
+    pub b: u8,
+}
+
+#[derive(Debug, Clone, Copy)]
 pub enum RgbMode {
     Solid { r: u8, g: u8, b: u8 },
     Rainbow { style: RainbowStyle },
+    Gradient { color1: RgbColor, color2: RgbColor },
+    VolumeGradient { color1: RgbColor, color2: RgbColor },
+    Wave { hue: u8, brightness: u8, speed: u8, reverse: bool, bounce: bool },
+    Breath { hue: u8, brightness: u8, speed: u8 },
 }
 
 #[derive(Debug)]
@@ -123,7 +134,92 @@ fn parse_rgb_section(table: &toml::value::Table) -> Result<RgbMode> {
             };
             Ok(RgbMode::Rainbow { style })
         }
+        "gradient" => {
+            let (color1, color2) = parse_two_colors(table, "gradient")?;
+            Ok(RgbMode::Gradient { color1, color2 })
+        }
+        "volume-gradient" => {
+            let (color1, color2) = parse_two_colors(table, "volume-gradient")?;
+            Ok(RgbMode::VolumeGradient { color1, color2 })
+        }
+        "wave" => {
+            let hue = parse_hue(table, "wave")?;
+            let brightness = parse_u8_with_default(table, "brightness", DEFAULT_BRIGHTNESS)?;
+            let speed = parse_u8_with_default(table, "speed", DEFAULT_SPEED)?;
+            let reverse = parse_bool_with_default(table, "reverse", false)?;
+            let bounce = parse_bool_with_default(table, "bounce", false)?;
+            Ok(RgbMode::Wave { hue, brightness, speed, reverse, bounce })
+        }
+        "breath" => {
+            let hue = parse_hue(table, "breath")?;
+            let brightness = parse_u8_with_default(table, "brightness", DEFAULT_BRIGHTNESS)?;
+            let speed = parse_u8_with_default(table, "speed", DEFAULT_SPEED)?;
+            Ok(RgbMode::Breath { hue, brightness, speed })
+        }
         _ => bail!("[rgb] unknown mode: \"{mode}\""),
+    }
+}
+
+const DEFAULT_BRIGHTNESS: u8 = 200;
+const DEFAULT_SPEED: u8 = 64;
+
+fn parse_two_colors(table: &toml::value::Table, mode_name: &str) -> Result<(RgbColor, RgbColor)> {
+    let color1_str = table
+        .get("color1")
+        .and_then(|v| v.as_str())
+        .with_context(|| format!("[rgb] {mode_name} mode requires \"color1\" field"))?;
+    let color2_str = table
+        .get("color2")
+        .and_then(|v| v.as_str())
+        .with_context(|| format!("[rgb] {mode_name} mode requires \"color2\" field"))?;
+    let (r1, g1, b1) = parse_hex_color(color1_str)?;
+    let (r2, g2, b2) = parse_hex_color(color2_str)?;
+    Ok((
+        RgbColor { r: r1, g: g1, b: b1 },
+        RgbColor { r: r2, g: g2, b: b2 },
+    ))
+}
+
+fn parse_hue(table: &toml::value::Table, mode_name: &str) -> Result<u8> {
+    let n = table
+        .get("hue")
+        .and_then(|v| v.as_integer())
+        .with_context(|| format!("[rgb] {mode_name} mode requires \"hue\" field (0-255)"))?;
+    if !(0..=255).contains(&n) {
+        bail!("[rgb] hue must be in 0-255, got {n}");
+    }
+    Ok(n as u8)
+}
+
+fn parse_u8_with_default(
+    table: &toml::value::Table,
+    field: &str,
+    default: u8,
+) -> Result<u8> {
+    match table.get(field) {
+        None => Ok(default),
+        Some(v) => {
+            let n = v
+                .as_integer()
+                .with_context(|| format!("[rgb] \"{field}\" must be an integer (0-255)"))?;
+            if !(0..=255).contains(&n) {
+                bail!("[rgb] \"{field}\" must be in 0-255, got {n}");
+            }
+            Ok(n as u8)
+        }
+    }
+}
+
+fn parse_bool_with_default(
+    table: &toml::value::Table,
+    field: &str,
+    default: bool,
+) -> Result<bool> {
+    match table.get(field) {
+        None => Ok(default),
+        Some(v) => v
+            .as_bool()
+            .with_context(|| format!("[rgb] \"{field}\" must be a boolean")),
     }
 }
 

@@ -180,6 +180,30 @@ fn apply_rgb(panel: &PcPanelPro, mode: RgbMode) -> Result<()> {
             const DEFAULT_SPEED: u8 = 64;
             led::set_rainbow(panel, rainbow_type, DEFAULT_BRIGHTNESS, DEFAULT_SPEED)?;
         }
+        RgbMode::Gradient { color1, color2 } => {
+            let c1 = Rgb::new(color1.r, color1.g, color1.b);
+            let c2 = Rgb::new(color2.r, color2.g, color2.b);
+            let led = LedMode::Gradient(c1, c2);
+            led::set_knob_colors(panel, &[led; 5])?;
+            led::set_slider_colors(panel, &[led; 4])?;
+            led::set_slider_label_colors(panel, &[led; 4])?;
+            led::set_logo(panel, LogoMode::Static(c1))?;
+        }
+        RgbMode::VolumeGradient { color1, color2 } => {
+            let c1 = Rgb::new(color1.r, color1.g, color1.b);
+            let c2 = Rgb::new(color2.r, color2.g, color2.b);
+            let static_c1 = LedMode::Static(c1);
+            led::set_knob_colors(panel, &[static_c1; 5])?;
+            led::set_slider_colors(panel, &[LedMode::VolumeGradient(c1, c2); 4])?;
+            led::set_slider_label_colors(panel, &[static_c1; 4])?;
+            led::set_logo(panel, LogoMode::Static(c1))?;
+        }
+        RgbMode::Wave { hue, brightness, speed, reverse, bounce } => {
+            led::set_wave(panel, hue, brightness, speed, reverse, bounce)?;
+        }
+        RgbMode::Breath { hue, brightness, speed } => {
+            led::set_breath(panel, hue, brightness, speed)?;
+        }
     }
     Ok(())
 }
@@ -219,6 +243,24 @@ fn run(cli: Cli) -> Result<()> {
                     RainbowStyle::Vertical => "vertical",
                 };
                 info!("RGB mode: rainbow ({style_name})");
+            }
+            RgbMode::Gradient { color1, color2 } => {
+                info!(
+                    "RGB mode: gradient (#{:02X}{:02X}{:02X} -> #{:02X}{:02X}{:02X})",
+                    color1.r, color1.g, color1.b, color2.r, color2.g, color2.b
+                );
+            }
+            RgbMode::VolumeGradient { color1, color2 } => {
+                info!(
+                    "RGB mode: volume-gradient (#{:02X}{:02X}{:02X} -> #{:02X}{:02X}{:02X})",
+                    color1.r, color1.g, color1.b, color2.r, color2.g, color2.b
+                );
+            }
+            RgbMode::Wave { hue, .. } => {
+                info!("RGB mode: wave (hue={hue})");
+            }
+            RgbMode::Breath { hue, .. } => {
+                info!("RGB mode: breath (hue={hue})");
             }
         }
         apply_rgb(&panel, rgb_mode)?;
