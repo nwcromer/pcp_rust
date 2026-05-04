@@ -259,6 +259,36 @@ impl AudioController {
         Ok(())
     }
 
+    pub fn set_mic_volume(&self, value: u8) -> Result<()> {
+        let volume = volume_from_u8(value);
+
+        // Query default source to get its channel count
+        let channels = Rc::new(RefCell::new(1u8));
+        let done = Rc::new(RefCell::new(false));
+
+        let channels_clone = channels.clone();
+        let done_clone = done.clone();
+        let introspect = self.context.borrow().introspect();
+        let _op = introspect.get_source_info_by_name("@DEFAULT_SOURCE@", move |result| {
+            if let ListResult::Item(source) = result {
+                *channels_clone.borrow_mut() = source.volume.len() as u8;
+            }
+            *done_clone.borrow_mut() = true;
+        });
+
+        self.wait_for(&done);
+
+        let ch = *channels.borrow();
+        let mut cv = ChannelVolumes::default();
+        cv.set(ch.into(), volume);
+        let mut introspect = self.context.borrow().introspect();
+        let _op = introspect.set_source_volume_by_name("@DEFAULT_SOURCE@", &cv, None);
+        self.drain();
+
+        debug!("set mic volume: {} ({}%)", value, value as f32 / 255.0 * 100.0);
+        Ok(())
+    }
+
     /// Returns true if any matching app was found.
     pub fn set_app_volume(&mut self, app_name: &str, value: u8) -> Result<bool> {
         let volume = volume_from_u8(value);

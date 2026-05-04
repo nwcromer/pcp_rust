@@ -259,12 +259,17 @@ fn run(cli: Cli) -> Result<()> {
                         if Action::is_system(app) {
                             audio.set_system_volume(value)?;
                             any_matched = true;
+                        } else if Action::is_mic(app) {
+                            audio.set_mic_volume(value)?;
+                            any_matched = true;
                         } else if audio.set_app_volume(app, value)? {
                             any_matched = true;
                         }
                         if cli.verbose {
                             if Action::is_system(app) {
                                 println!("System volume: {pct}%");
+                            } else if Action::is_mic(app) {
+                                println!("Mic volume: {pct}%");
                             } else {
                                 println!("{app} volume: {pct}%");
                             }
@@ -274,6 +279,8 @@ fn run(cli: Cli) -> Result<()> {
                     if any_matched {
                         if apps.iter().any(|a| Action::is_system(a)) {
                             osd::volume_changed(pct as i32);
+                        } else if apps.iter().any(|a| Action::is_mic(a)) {
+                            osd::microphone_volume_changed(pct as i32);
                         } else {
                             let label = apps.join("\n");
                             let icon_name = icons::resolve(icon.as_deref(), apps);
