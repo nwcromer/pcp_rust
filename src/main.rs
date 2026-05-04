@@ -164,6 +164,7 @@ fn spawn_resume_monitor() -> mpsc::Receiver<()> {
 fn apply_rgb(panel: &PcPanelPro, mode: RgbMode) -> Result<()> {
     match mode {
         RgbMode::Solid { r, g, b } => {
+            info!("RGB mode: solid (#{:02X}{:02X}{:02X})", r, g, b);
             let color = Rgb::new(r, g, b);
             let led = LedMode::Static(color);
             led::set_knob_colors(panel, &[led; 5])?;
@@ -172,15 +173,18 @@ fn apply_rgb(panel: &PcPanelPro, mode: RgbMode) -> Result<()> {
             led::set_logo(panel, LogoMode::Static(color))?;
         }
         RgbMode::Rainbow { style } => {
-            let rainbow_type = match style {
-                RainbowStyle::Horizontal => 0x01,
-                RainbowStyle::Vertical => 0x02,
+            let (rainbow_type, style_name) = match style {
+                RainbowStyle::Horizontal => (led::ANIM_RAINBOW_HORIZONTAL, "horizontal"),
+                RainbowStyle::Vertical => (led::ANIM_RAINBOW_VERTICAL, "vertical"),
             };
-            const DEFAULT_BRIGHTNESS: u8 = 200;
-            const DEFAULT_SPEED: u8 = 64;
-            led::set_rainbow(panel, rainbow_type, DEFAULT_BRIGHTNESS, DEFAULT_SPEED)?;
+            info!("RGB mode: rainbow ({style_name})");
+            led::set_rainbow(panel, rainbow_type, config::DEFAULT_BRIGHTNESS, config::DEFAULT_SPEED)?;
         }
         RgbMode::Gradient { color1, color2 } => {
+            info!(
+                "RGB mode: gradient (#{:02X}{:02X}{:02X} -> #{:02X}{:02X}{:02X})",
+                color1.r, color1.g, color1.b, color2.r, color2.g, color2.b
+            );
             let c1 = Rgb::new(color1.r, color1.g, color1.b);
             let c2 = Rgb::new(color2.r, color2.g, color2.b);
             let led = LedMode::Gradient(c1, c2);
@@ -190,18 +194,24 @@ fn apply_rgb(panel: &PcPanelPro, mode: RgbMode) -> Result<()> {
             led::set_logo(panel, LogoMode::Static(c1))?;
         }
         RgbMode::VolumeGradient { color1, color2 } => {
+            info!(
+                "RGB mode: volume-gradient (#{:02X}{:02X}{:02X} -> #{:02X}{:02X}{:02X})",
+                color1.r, color1.g, color1.b, color2.r, color2.g, color2.b
+            );
             let c1 = Rgb::new(color1.r, color1.g, color1.b);
             let c2 = Rgb::new(color2.r, color2.g, color2.b);
-            let static_c1 = LedMode::Static(c1);
-            led::set_knob_colors(panel, &[static_c1; 5])?;
+            let static_mode = LedMode::Static(c1);
+            led::set_knob_colors(panel, &[static_mode; 5])?;
             led::set_slider_colors(panel, &[LedMode::VolumeGradient(c1, c2); 4])?;
-            led::set_slider_label_colors(panel, &[static_c1; 4])?;
+            led::set_slider_label_colors(panel, &[static_mode; 4])?;
             led::set_logo(panel, LogoMode::Static(c1))?;
         }
         RgbMode::Wave { hue, brightness, speed, reverse, bounce } => {
+            info!("RGB mode: wave (hue={hue})");
             led::set_wave(panel, hue, brightness, speed, reverse, bounce)?;
         }
         RgbMode::Breath { hue, brightness, speed } => {
+            info!("RGB mode: breath (hue={hue})");
             led::set_breath(panel, hue, brightness, speed)?;
         }
     }
@@ -233,36 +243,6 @@ fn run(cli: Cli) -> Result<()> {
 
     // Apply RGB config
     if let Some(rgb_mode) = config.rgb {
-        match rgb_mode {
-            RgbMode::Solid { r, g, b } => {
-                info!("RGB mode: solid (#{:02X}{:02X}{:02X})", r, g, b);
-            }
-            RgbMode::Rainbow { style } => {
-                let style_name = match style {
-                    RainbowStyle::Horizontal => "horizontal",
-                    RainbowStyle::Vertical => "vertical",
-                };
-                info!("RGB mode: rainbow ({style_name})");
-            }
-            RgbMode::Gradient { color1, color2 } => {
-                info!(
-                    "RGB mode: gradient (#{:02X}{:02X}{:02X} -> #{:02X}{:02X}{:02X})",
-                    color1.r, color1.g, color1.b, color2.r, color2.g, color2.b
-                );
-            }
-            RgbMode::VolumeGradient { color1, color2 } => {
-                info!(
-                    "RGB mode: volume-gradient (#{:02X}{:02X}{:02X} -> #{:02X}{:02X}{:02X})",
-                    color1.r, color1.g, color1.b, color2.r, color2.g, color2.b
-                );
-            }
-            RgbMode::Wave { hue, .. } => {
-                info!("RGB mode: wave (hue={hue})");
-            }
-            RgbMode::Breath { hue, .. } => {
-                info!("RGB mode: breath (hue={hue})");
-            }
-        }
         apply_rgb(&panel, rgb_mode)?;
     }
 

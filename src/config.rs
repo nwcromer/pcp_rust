@@ -143,7 +143,7 @@ fn parse_rgb_section(table: &toml::value::Table) -> Result<RgbMode> {
             Ok(RgbMode::VolumeGradient { color1, color2 })
         }
         "wave" => {
-            let hue = parse_hue(table, "wave")?;
+            let hue = parse_u8_required(table, "hue", "wave")?;
             let brightness = parse_u8_with_default(table, "brightness", DEFAULT_BRIGHTNESS)?;
             let speed = parse_u8_with_default(table, "speed", DEFAULT_SPEED)?;
             let reverse = parse_bool_with_default(table, "reverse", false)?;
@@ -151,7 +151,7 @@ fn parse_rgb_section(table: &toml::value::Table) -> Result<RgbMode> {
             Ok(RgbMode::Wave { hue, brightness, speed, reverse, bounce })
         }
         "breath" => {
-            let hue = parse_hue(table, "breath")?;
+            let hue = parse_u8_required(table, "hue", "breath")?;
             let brightness = parse_u8_with_default(table, "brightness", DEFAULT_BRIGHTNESS)?;
             let speed = parse_u8_with_default(table, "speed", DEFAULT_SPEED)?;
             Ok(RgbMode::Breath { hue, brightness, speed })
@@ -160,8 +160,8 @@ fn parse_rgb_section(table: &toml::value::Table) -> Result<RgbMode> {
     }
 }
 
-const DEFAULT_BRIGHTNESS: u8 = 200;
-const DEFAULT_SPEED: u8 = 64;
+pub const DEFAULT_BRIGHTNESS: u8 = 200;
+pub const DEFAULT_SPEED: u8 = 64;
 
 fn parse_two_colors(table: &toml::value::Table, mode_name: &str) -> Result<(RgbColor, RgbColor)> {
     let color1_str = table
@@ -180,15 +180,12 @@ fn parse_two_colors(table: &toml::value::Table, mode_name: &str) -> Result<(RgbC
     ))
 }
 
-fn parse_hue(table: &toml::value::Table, mode_name: &str) -> Result<u8> {
+fn parse_u8_required(table: &toml::value::Table, field: &str, mode_name: &str) -> Result<u8> {
     let n = table
-        .get("hue")
+        .get(field)
         .and_then(|v| v.as_integer())
-        .with_context(|| format!("[rgb] {mode_name} mode requires \"hue\" field (0-255)"))?;
-    if !(0..=255).contains(&n) {
-        bail!("[rgb] hue must be in 0-255, got {n}");
-    }
-    Ok(n as u8)
+        .with_context(|| format!("[rgb] {mode_name} mode requires \"{field}\" field (0-255)"))?;
+    range_check_u8(n, field)
 }
 
 fn parse_u8_with_default(
@@ -202,12 +199,16 @@ fn parse_u8_with_default(
             let n = v
                 .as_integer()
                 .with_context(|| format!("[rgb] \"{field}\" must be an integer (0-255)"))?;
-            if !(0..=255).contains(&n) {
-                bail!("[rgb] \"{field}\" must be in 0-255, got {n}");
-            }
-            Ok(n as u8)
+            range_check_u8(n, field)
         }
     }
+}
+
+fn range_check_u8(n: i64, field: &str) -> Result<u8> {
+    if !(0..=255).contains(&n) {
+        bail!("[rgb] \"{field}\" must be in 0-255, got {n}");
+    }
+    Ok(n as u8)
 }
 
 fn parse_bool_with_default(
@@ -384,5 +385,138 @@ mod tests {
         );
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("volume"));
+    }
+
+    #[test]
+    fn test_gradient() {
+        let config = parse_config(
+            r##"
+            [rgb]
+            mode = "gradient"
+            color1 = "#FF0000"
+            color2 = "#0000FF"
+            "##,
+        )
+        .unwrap();
+        match config.rgb {
+            Some(RgbMode::Gradient { color1, color2 }) => {
+                assert_eq!((color1.r, color1.g, color1.b), (0xFF, 0x00, 0x00));
+                assert_eq!((color2.r, color2.g, color2.b), (0x00, 0x00, 0xFF));
+            }
+            other => panic!("expected Gradient, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_volume_gradient() {
+        let config = parse_config(
+            r##"
+            [rgb]
+            mode = "volume-gradient"
+            color1 = "#00FF00"
+            color2 = "#FF0000"
+            "##,
+        )
+        .unwrap();
+        match config.rgb {
+            Some(RgbMode::VolumeGradient { color1, color2 }) => {
+                assert_eq!((color1.r, color1.g, color1.b), (0x00, 0xFF, 0x00));
+                assert_eq!((color2.r, color2.g, color2.b), (0xFF, 0x00, 0x00));
+            }
+            other => panic!("expected VolumeGradient, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_wave_full() {
+        let config = parse_config(
+            r#"
+            [rgb]
+            mode = "wave"
+            hue = 200
+            brightness = 150
+            speed = 32
+            reverse = true
+            bounce = true
+            "#,
+        )
+        .unwrap();
+        match config.rgb {
+            Some(RgbMode::Wave { hue, brightness, speed, reverse, bounce }) => {
+                assert_eq!(hue, 200);
+                assert_eq!(brightness, 150);
+                assert_eq!(speed, 32);
+                assert!(reverse);
+                assert!(bounce);
+            }
+            other => panic!("expected Wave, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_wave_defaults() {
+        let config = parse_config(
+            r#"
+            [rgb]
+            mode = "wave"
+            hue = 100
+            "#,
+        )
+        .unwrap();
+        match config.rgb {
+            Some(RgbMode::Wave { hue, brightness, speed, reverse, bounce }) => {
+                assert_eq!(hue, 100);
+                assert_eq!(brightness, DEFAULT_BRIGHTNESS);
+                assert_eq!(speed, DEFAULT_SPEED);
+                assert!(!reverse);
+                assert!(!bounce);
+            }
+            other => panic!("expected Wave, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_breath() {
+        let config = parse_config(
+            r#"
+            [rgb]
+            mode = "breath"
+            hue = 50
+            "#,
+        )
+        .unwrap();
+        match config.rgb {
+            Some(RgbMode::Breath { hue, brightness, speed }) => {
+                assert_eq!(hue, 50);
+                assert_eq!(brightness, DEFAULT_BRIGHTNESS);
+                assert_eq!(speed, DEFAULT_SPEED);
+            }
+            other => panic!("expected Breath, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_hue_out_of_range() {
+        let result = parse_config(
+            r#"
+            [rgb]
+            mode = "wave"
+            hue = 300
+            "#,
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("0-255"));
+    }
+
+    #[test]
+    fn test_wave_missing_hue() {
+        let result = parse_config(
+            r#"
+            [rgb]
+            mode = "wave"
+            "#,
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("hue"));
     }
 }

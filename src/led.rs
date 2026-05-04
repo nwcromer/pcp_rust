@@ -9,6 +9,12 @@ const CMD_KNOBS: u8 = 0x02;
 const CMD_LOGO: u8 = 0x03;
 const CMD_GLOBAL_ANIMATION: u8 = 0x04;
 
+// Animation types for CMD_GLOBAL_ANIMATION (per nvdweem/PCPanel reference).
+pub const ANIM_RAINBOW_HORIZONTAL: u8 = 0x01;
+pub const ANIM_RAINBOW_VERTICAL: u8 = 0x02;
+const ANIM_WAVE: u8 = 0x03;
+const ANIM_BREATH: u8 = 0x04;
+
 #[derive(Debug, Clone, Copy)]
 pub struct Rgb {
     pub r: u8,
@@ -111,20 +117,20 @@ pub fn set_wave(
     bounce: bool,
 ) -> Result<()> {
     let packet = vec![
-        PRO_PREFIX, CMD_GLOBAL_ANIMATION, 0x03, // wave
+        PRO_PREFIX, CMD_GLOBAL_ANIMATION, ANIM_WAVE,
         hue,
         0xFF, // placeholder
         brightness,
         speed,
-        if reverse { 1 } else { 0 },
-        if bounce { 1 } else { 0 },
+        u8::from(reverse),
+        u8::from(bounce),
     ];
     device.set_led(&packet)
 }
 
 pub fn set_breath(device: &PcPanelPro, hue: u8, brightness: u8, speed: u8) -> Result<()> {
     let packet = vec![
-        PRO_PREFIX, CMD_GLOBAL_ANIMATION, 0x04, // breath
+        PRO_PREFIX, CMD_GLOBAL_ANIMATION, ANIM_BREATH,
         hue,
         0xFF, // placeholder
         brightness,
