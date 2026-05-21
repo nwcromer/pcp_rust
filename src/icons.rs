@@ -50,11 +50,22 @@ fn find_app_icon(config_icon: Option<&str>, app_names: &[String]) -> Option<Stri
 fn freedesktop_icon_resolves(name: &str) -> bool {
     static CACHE: LazyLock<Mutex<HashMap<String, bool>>> =
         LazyLock::new(|| Mutex::new(HashMap::new()));
-    if let Some(&cached) = CACHE.lock().unwrap().get(name) {
+    // `unwrap_or_else(... e.into_inner())` recovers from lock poisoning —
+    // the cache's invariants are simple enough that even if a prior
+    // panic-while-locked left it in an "inconsistent" state, treating the
+    // current contents as authoritative is fine.
+    if let Some(&cached) = CACHE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(name)
+    {
         return cached;
     }
     let found = freedesktop_icons::lookup(name).find().is_some();
-    CACHE.lock().unwrap().insert(name.to_string(), found);
+    CACHE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(name.to_string(), found);
     found
 }
 

@@ -100,11 +100,28 @@ pub fn spawn_obs_thread(config: ObsConfig) -> Option<ObsHandle> {
 const BACKOFF_INITIAL_SECS: u64 = 2;
 const BACKOFF_MAX_SECS: u64 = 30;
 
+/// Best-effort check for whether the configured OBS host is on the local
+/// machine. obs-websocket is unencrypted plain ws://, so a non-localhost
+/// host means we send the configured password over the network in
+/// cleartext. We warn once at startup rather than refuse — the user may
+/// have a secure tunnel (SSH, VPN, etc.) the program can't see.
+fn host_is_local(host: &str) -> bool {
+    matches!(host, "localhost" | "127.0.0.1" | "::1" | "[::1]")
+}
+
 async fn obs_main_loop(
     config: ObsConfig,
     mut cmd_rx: UnboundedReceiver<ObsCommand>,
     event_tx: UnboundedSender<ObsEvent>,
 ) {
+    if !host_is_local(&config.host) && config.password.is_some() {
+        warn!(
+            "OBS: host {:?} is not localhost — the obs-websocket protocol is \
+             plain ws:// (no TLS), so your password will be sent over the \
+             network in cleartext. Tunnel through SSH/VPN if this matters.",
+            config.host
+        );
+    }
     debug!("OBS: connecting to {}:{}", config.host, config.port);
     let mut backoff = BACKOFF_INITIAL_SECS;
 

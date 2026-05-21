@@ -59,7 +59,7 @@ pub enum LedMode {
 }
 
 impl LedMode {
-    fn to_bytes(&self) -> [u8; 7] {
+    fn to_bytes(self) -> [u8; 7] {
         match self {
             LedMode::Static(c) => [0x01, c.r, c.g, c.b, 0x00, 0x00, 0x00],
             LedMode::Gradient(a, b) => [0x02, a.r, a.g, a.b, b.r, b.g, b.b],

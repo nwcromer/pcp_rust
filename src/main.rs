@@ -116,50 +116,58 @@ fn list_apps() -> Result<()> {
     Ok(())
 }
 
+/// Subscribe to logind's `PrepareForSleep` signal on the system bus and
+/// send `()` through the returned channel whenever the system resumes
+/// from sleep. Uses zbus directly instead of forking `gdbus monitor` —
+/// no subprocess, no text parsing, robust to gdbus binary not being on PATH.
 fn spawn_resume_monitor() -> mpsc::Receiver<()> {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
-        use std::io::BufRead;
-        use std::process::{Command, Stdio};
+        use zbus::MatchRule;
+        use zbus::blocking::{Connection, MessageIterator};
 
-        let mut child = match Command::new("gdbus")
-            .args([
-                "monitor",
-                "--system",
-                "--dest",
-                "org.freedesktop.login1",
-                "--object-path",
-                "/org/freedesktop/login1",
-            ])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-        {
+        let conn = match Connection::system() {
             Ok(c) => c,
             Err(e) => {
-                warn!("failed to start resume monitor: {e}");
+                warn!("resume monitor: failed to connect to system bus: {e}");
                 return;
             }
         };
 
-        let Some(stdout) = child.stdout.take() else {
-            warn!("resume monitor: failed to capture stdout");
-            let _ = child.kill();
-            return;
-        };
-        let reader = std::io::BufReader::new(stdout);
-        for line in reader.lines() {
-            let Ok(line) = line else { break };
-            // PrepareForSleep(false) means the system just woke up
-            if line.contains("PrepareForSleep") && line.contains("false") {
-                info!("detected system resume");
-                if tx.send(()).is_err() {
-                    break; // main thread gone
-                }
+        let rule = match MatchRule::builder()
+            .msg_type(zbus::message::Type::Signal)
+            .interface("org.freedesktop.login1.Manager")
+            .and_then(|b| b.member("PrepareForSleep"))
+            .map(|b| b.build())
+        {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("resume monitor: failed to build match rule: {e}");
+                return;
             }
+        };
+
+        let iter = match MessageIterator::for_match_rule(rule, &conn, None) {
+            Ok(i) => i,
+            Err(e) => {
+                warn!("resume monitor: failed to subscribe to PrepareForSleep: {e}");
+                return;
+            }
+        };
+
+        for msg in iter {
+            let Ok(msg) = msg else { continue };
+            // The signal body is a single bool: true = about to sleep,
+            // false = just woke up. We only care about resume.
+            let body = msg.body();
+            if let Ok(going_to_sleep) = body.deserialize::<bool>()
+                && !going_to_sleep {
+                    info!("detected system resume");
+                    if tx.send(()).is_err() {
+                        break; // main thread gone
+                    }
+                }
         }
-        let _ = child.kill();
-        let _ = child.wait();
     });
     rx
 }
@@ -278,7 +286,7 @@ impl Flash {
         };
         let elapsed_ms = now.saturating_duration_since(blink.started_at).as_millis();
         let half_ms = (blink.cycle.as_millis() / 2).max(1);
-        if (elapsed_ms / half_ms) % 2 == 0 {
+        if (elapsed_ms / half_ms).is_multiple_of(2) {
             self.color
         } else {
             RgbColor { r: 0, g: 0, b: 0 }
@@ -558,6 +566,7 @@ fn paint_leds(panel: &PcPanelPro, obs: &ObsRuntime, idle_rgb: Option<RgbMode>) -
 ///     brightness ramp — washed-out appearance.
 ///   - `Gradient(c, c)` renders the strip as a level meter: only LEDs
 ///     below the physical slider position are lit, with uniform color.
+///
 /// Gradient looks more deliberate (it reads as "your slider is at X")
 /// than Static's brightness ramp, so we use it.
 fn paint_panel_solid(panel: &PcPanelPro, c: RgbColor) -> Result<()> {
@@ -668,12 +677,48 @@ fn run(cli: Cli) -> Result<()> {
         // region writes inside paint_leds fails, the remaining ones are
         // skipped for this iteration but will be retried on the next dirty
         // repaint.
-        if led_dirty {
-            if let Err(e) = paint_leds(&panel, &obs, config.rgb) {
+        if led_dirty
+            && let Err(e) = paint_leds(&panel, &obs, config.rgb) {
                 warn!("failed to repaint LEDs: {e}");
             }
-        }
     }
+}
+
+/// Apply a volume slider/knob change to one configured app. Dispatches to
+/// the right audio API based on whether the app is the system output,
+/// the mic, or a regular app. Returns `true` if the change matched
+/// something (always true for system/mic, only true for apps when at
+/// least one sink-input matched). PA failures are logged and treated as
+/// no-match — they never propagate out of the main loop.
+fn apply_volume_to(audio: &mut audio::AudioController, app: &str, value: u8) -> bool {
+    let result = if Action::is_system(app) {
+        audio.set_system_volume(value).map(|()| true)
+    } else if Action::is_mic(app) {
+        audio.set_mic_volume(value).map(|()| true)
+    } else {
+        audio.set_app_volume(app, value)
+    };
+    result.unwrap_or_else(|e| {
+        warn!("audio: set volume for {app} failed: {e}");
+        false
+    })
+}
+
+/// Toggle mute for one configured app. Returns the new mute state, or
+/// `None` if the app wasn't running (for app targets) or PA failed. PA
+/// failures are logged and treated as no-match — never propagated.
+fn toggle_mute_for(audio: &mut audio::AudioController, app: &str) -> Option<bool> {
+    let result = if Action::is_system(app) {
+        audio.toggle_system_mute().map(Some)
+    } else if Action::is_mic(app) {
+        audio.toggle_mic_mute().map(Some)
+    } else {
+        audio.toggle_app_mute(app)
+    };
+    result.unwrap_or_else(|e| {
+        warn!("audio: toggle mute for {app} failed: {e}");
+        None
+    })
 }
 
 fn handle_panel_event(
@@ -695,46 +740,18 @@ fn handle_panel_event(
                 let pct = (value as f32 / 255.0 * 100.0) as u8;
                 let mut matched_apps: Vec<String> = Vec::new();
                 for app in apps {
-                    // PulseAudio errors here are logged and skipped, never
-                    // propagated. A transient PA hiccup (sleep/resume,
-                    // server reload) shouldn't kill the daemon and force
-                    // a systemd restart that loses OBS state + LED config.
-                    let matched = if Action::is_system(app) {
-                        match audio.set_system_volume(value) {
-                            Ok(()) => true,
-                            Err(e) => {
-                                warn!("audio: set system volume failed: {e}");
-                                false
-                            }
-                        }
-                    } else if Action::is_mic(app) {
-                        match audio.set_mic_volume(value) {
-                            Ok(()) => true,
-                            Err(e) => {
-                                warn!("audio: set mic volume failed: {e}");
-                                false
-                            }
-                        }
-                    } else {
-                        match audio.set_app_volume(app, value) {
-                            Ok(m) => m,
-                            Err(e) => {
-                                warn!("audio: set volume for {app} failed: {e}");
-                                false
-                            }
-                        }
-                    };
-                    if matched {
+                    if apply_volume_to(audio, app, value) {
                         matched_apps.push(app.clone());
                     }
                     if cli.verbose {
-                        if Action::is_system(app) {
-                            println!("System volume: {pct}%");
+                        let label = if Action::is_system(app) {
+                            "System"
                         } else if Action::is_mic(app) {
-                            println!("Mic volume: {pct}%");
+                            "Mic"
                         } else {
-                            println!("{app} volume: {pct}%");
-                        }
+                            app.as_str()
+                        };
+                        println!("{label} volume: {pct}%");
                     }
                 }
                 // Show OSD once per control event, only if something matched
@@ -756,39 +773,27 @@ fn handle_panel_event(
             match config.mappings.get(&control_id) {
                 Some(Action::ToggleMute { apps, icon }) => {
                     for app in apps {
-                        // Same policy as the volume branch: PA errors log
-                        // and are skipped, never propagated.
-                        if Action::is_system(app) {
-                            match audio.toggle_system_mute() {
-                                Ok(muted) => {
-                                    if cli.verbose {
-                                        println!("System mute: {}", if muted { "on" } else { "off" });
-                                    }
-                                    osd::show_mute("System", muted);
-                                }
-                                Err(e) => warn!("audio: toggle system mute failed: {e}"),
+                        if let Some(muted) = toggle_mute_for(audio, app) {
+                            if cli.verbose {
+                                let label = if Action::is_system(app) {
+                                    "System"
+                                } else if Action::is_mic(app) {
+                                    "Mic"
+                                } else {
+                                    app.as_str()
+                                };
+                                println!("{label} mute: {}", if muted { "on" } else { "off" });
                             }
-                        } else if Action::is_mic(app) {
-                            match audio.toggle_mic_mute() {
-                                Ok(muted) => {
-                                    if cli.verbose {
-                                        println!("Mic mute: {}", if muted { "on" } else { "off" });
-                                    }
-                                    osd::show_mic_mute(muted);
-                                }
-                                Err(e) => warn!("audio: toggle mic mute failed: {e}"),
-                            }
-                        } else {
-                            match audio.toggle_app_mute(app) {
-                                Ok(Some(muted)) => {
-                                    if cli.verbose {
-                                        println!("{app} mute: {}", if muted { "on" } else { "off" });
-                                    }
-                                    let icon_name = icons::resolve_mute(icon.as_deref(), apps, muted);
-                                    osd::show_text(&icon_name, &format!("{app}: {}", if muted { "Muted" } else { "Unmuted" }));
-                                }
-                                Ok(None) => {} // app not running, skip silently
-                                Err(e) => warn!("audio: toggle mute for {app} failed: {e}"),
+                            if Action::is_system(app) {
+                                osd::show_mute("System", muted);
+                            } else if Action::is_mic(app) {
+                                osd::show_mic_mute(muted);
+                            } else {
+                                let icon_name = icons::resolve_mute(icon.as_deref(), apps, muted);
+                                osd::show_text(
+                                    &icon_name,
+                                    &format!("{app}: {}", if muted { "Muted" } else { "Unmuted" }),
+                                );
                             }
                         }
                     }

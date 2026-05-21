@@ -23,13 +23,17 @@ fn binary_path() -> Result<String> {
         .to_str()
         .map(String::from)
         .context("binary path is not valid UTF-8")?;
-    // We embed the path inside double-quotes in the systemd unit file; a
-    // literal `"` in the path would break the unit. Reject rather than
-    // attempt to escape (no real-world Linux install puts `"` in PATH).
-    if path.contains('"') {
+    // We embed the path inside double-quotes in the systemd unit file.
+    // Reject characters that have special meaning inside systemd's
+    // double-quoted values rather than attempting to escape them; no
+    // real-world Linux install puts these in a binary path.
+    //   "  closes the quoted string
+    //   \  is the escape character
+    //   $  triggers variable expansion
+    if let Some(bad) = path.chars().find(|c| matches!(c, '"' | '\\' | '$')) {
         bail!(
-            "binary path contains a double-quote character ({path:?}); \
-             move or rename the binary to a path without `\"`"
+            "binary path contains the special character `{bad}` ({path:?}); \
+             move or rename the binary to a path without `\"`, `\\`, or `$`"
         );
     }
     Ok(path)

@@ -25,6 +25,40 @@ struct PendingPersist {
     last_update: Instant,
 }
 
+/// Distinguishes the two "default audio device" targets we drive — system
+/// output (sink) and mic input (source). Used to deduplicate the
+/// per-system/per-mic methods which were near-identical except for which
+/// PA API they called.
+#[derive(Clone, Copy)]
+enum Target {
+    DefaultSink,
+    DefaultSource,
+}
+
+impl Target {
+    fn pa_name(self) -> &'static str {
+        match self {
+            Self::DefaultSink => "@DEFAULT_SINK@",
+            Self::DefaultSource => "@DEFAULT_SOURCE@",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::DefaultSink => "system",
+            Self::DefaultSource => "mic",
+        }
+    }
+
+    /// Default channel count to assume if the PA query fails to populate one.
+    fn default_channels(self) -> u8 {
+        match self {
+            Self::DefaultSink => 2,
+            Self::DefaultSource => 1,
+        }
+    }
+}
+
 /// Info collected from a sink input for matching and display.
 #[derive(Clone)]
 struct SinkInputEntry {
@@ -49,16 +83,14 @@ impl SinkInputEntry {
         if self.name.to_lowercase().contains(target) {
             return true;
         }
-        if let Some(ref binary) = self.binary {
-            if binary.to_lowercase().contains(target) {
+        if let Some(ref binary) = self.binary
+            && binary.to_lowercase().contains(target) {
                 return true;
             }
-        }
-        if let Some(ref comm) = self.comm {
-            if comm.contains(target) {
+        if let Some(ref comm) = self.comm
+            && comm.contains(target) {
                 return true;
             }
-        }
         false
     }
 }
@@ -181,44 +213,172 @@ impl AudioController {
         }
     }
 
+    /// Run a PA call that fills a single value. The `register` closure
+    /// receives a (value, done) pair: it should invoke the PA introspect
+    /// method whose callback writes to `value` and sets `done` on completion.
+    fn pa_query<T, R>(&self, default: T, register: R) -> Result<T>
+    where
+        T: Clone + 'static,
+        R: FnOnce(Rc<RefCell<T>>, Rc<RefCell<bool>>),
+    {
+        let value: Rc<RefCell<T>> = Rc::new(RefCell::new(default));
+        let done = Rc::new(RefCell::new(false));
+        register(value.clone(), done.clone());
+        self.wait_for(&done)?;
+        Ok(value.borrow().clone())
+    }
+
+    /// Run a PA list call. The `register` closure registers the PA method
+    /// whose callback pushes items into the provided Vec and sets `done`
+    /// on `End`/`Error`.
+    fn pa_collect<T, R>(&self, register: R) -> Result<Vec<T>>
+    where
+        T: 'static,
+        R: FnOnce(Rc<RefCell<Vec<T>>>, Rc<RefCell<bool>>),
+    {
+        let items: Rc<RefCell<Vec<T>>> = Rc::new(RefCell::new(Vec::new()));
+        let done = Rc::new(RefCell::new(false));
+        register(items.clone(), done.clone());
+        self.wait_for(&done)?;
+        // Take ownership of the inner Vec (avoids requiring T: Clone for
+        // types like SrInfo that don't implement Clone).
+        Ok(std::mem::take(&mut *items.borrow_mut()))
+    }
+
+    /// Run a PA write that reports success/failure via a bool callback
+    /// (e.g., `sr.write`). Returns the reported success state or an error
+    /// if the operation didn't complete.
+    fn pa_write_with_result<R>(&self, register: R) -> Result<bool>
+    where
+        R: FnOnce(Rc<RefCell<Option<bool>>>),
+    {
+        let result: Rc<RefCell<Option<bool>>> = Rc::new(RefCell::new(None));
+        register(result.clone());
+        self.wait_until(|| result.borrow().is_some())?;
+        result
+            .borrow()
+            .ok_or_else(|| anyhow::anyhow!("PA write did not complete"))
+    }
+
+    /// Channel count of the named default sink/source.
+    fn query_default_channels(&self, target: Target) -> Result<u8> {
+        let name = target.pa_name();
+        self.pa_query(target.default_channels(), |channels, done| {
+            let introspect = self.context.borrow().introspect();
+            match target {
+                Target::DefaultSink => {
+                    let _op = introspect.get_sink_info_by_name(name, move |result| {
+                        if let ListResult::Item(sink) = result {
+                            *channels.borrow_mut() = sink.volume.len();
+                        }
+                        *done.borrow_mut() = true;
+                    });
+                }
+                Target::DefaultSource => {
+                    let _op = introspect.get_source_info_by_name(name, move |result| {
+                        if let ListResult::Item(source) = result {
+                            *channels.borrow_mut() = source.volume.len();
+                        }
+                        *done.borrow_mut() = true;
+                    });
+                }
+            }
+        })
+    }
+
+    /// Current mute state of the named default sink/source.
+    fn query_default_mute(&self, target: Target) -> Result<bool> {
+        let name = target.pa_name();
+        self.pa_query(false, |mute, done| {
+            let introspect = self.context.borrow().introspect();
+            match target {
+                Target::DefaultSink => {
+                    let _op = introspect.get_sink_info_by_name(name, move |result| {
+                        if let ListResult::Item(sink) = result {
+                            *mute.borrow_mut() = sink.mute;
+                        }
+                        *done.borrow_mut() = true;
+                    });
+                }
+                Target::DefaultSource => {
+                    let _op = introspect.get_source_info_by_name(name, move |result| {
+                        if let ListResult::Item(source) = result {
+                            *mute.borrow_mut() = source.mute;
+                        }
+                        *done.borrow_mut() = true;
+                    });
+                }
+            }
+        })
+    }
+
+    fn set_default_volume(&self, target: Target, value: u8) -> Result<()> {
+        let volume = volume_from_u8(value);
+        let channels = self.query_default_channels(target)?;
+        let mut cv = ChannelVolumes::default();
+        cv.set(channels, volume);
+
+        let mut introspect = self.context.borrow().introspect();
+        match target {
+            Target::DefaultSink => {
+                let _op = introspect.set_sink_volume_by_name(target.pa_name(), &cv, None);
+            }
+            Target::DefaultSource => {
+                let _op = introspect.set_source_volume_by_name(target.pa_name(), &cv, None);
+            }
+        }
+        self.drain();
+        debug!("set {} volume: {} ({}%)", target.label(), value, value as f32 / 255.0 * 100.0);
+        Ok(())
+    }
+
+    fn toggle_default_mute(&self, target: Target) -> Result<bool> {
+        let new_mute = !self.query_default_mute(target)?;
+        let mut introspect = self.context.borrow().introspect();
+        match target {
+            Target::DefaultSink => {
+                let _op = introspect.set_sink_mute_by_name(target.pa_name(), new_mute, None);
+            }
+            Target::DefaultSource => {
+                let _op = introspect.set_source_mute_by_name(target.pa_name(), new_mute, None);
+            }
+        }
+        self.drain();
+        Ok(new_mute)
+    }
+
     /// Collect all sink inputs with their properties.
     fn collect_sink_inputs(&self) -> Result<Vec<SinkInputEntry>> {
-        let entries: Rc<RefCell<Vec<SinkInputEntry>>> = Rc::new(RefCell::new(Vec::new()));
-        let done = Rc::new(RefCell::new(false));
-
-        let entries_clone = entries.clone();
-        let done_clone = done.clone();
-        let introspect = self.context.borrow().introspect();
-        let _op = introspect.get_sink_input_info_list(move |result| match result {
-            ListResult::Item(info) => {
-                let name = info
-                    .proplist
-                    .get_str(pulse::proplist::properties::APPLICATION_NAME)
-                    .unwrap_or_else(|| info.name.as_deref().unwrap_or("unknown").to_string());
-                let binary = info
-                    .proplist
-                    .get_str(pulse::proplist::properties::APPLICATION_PROCESS_BINARY);
-                let pid = info
-                    .proplist
-                    .get_str(pulse::proplist::properties::APPLICATION_PROCESS_ID);
-                entries_clone.borrow_mut().push(SinkInputEntry {
-                    index: info.index,
-                    name,
-                    binary,
-                    pid,
-                    comm: None, // populated after PID resolution below
-                    client_index: info.client.unwrap_or(u32::MAX),
-                    channels: info.volume.len() as u8,
-                    muted: info.mute,
-                });
-            }
-            ListResult::End | ListResult::Error => {
-                *done_clone.borrow_mut() = true;
-            }
-        });
-
-        self.wait_for(&done)?;
-        let mut result = entries.borrow().clone();
+        let mut result: Vec<SinkInputEntry> = self.pa_collect(|entries, done| {
+            let introspect = self.context.borrow().introspect();
+            let _op = introspect.get_sink_input_info_list(move |result| match result {
+                ListResult::Item(info) => {
+                    let name = info
+                        .proplist
+                        .get_str(pulse::proplist::properties::APPLICATION_NAME)
+                        .unwrap_or_else(|| info.name.as_deref().unwrap_or("unknown").to_string());
+                    let binary = info
+                        .proplist
+                        .get_str(pulse::proplist::properties::APPLICATION_PROCESS_BINARY);
+                    let pid = info
+                        .proplist
+                        .get_str(pulse::proplist::properties::APPLICATION_PROCESS_ID);
+                    entries.borrow_mut().push(SinkInputEntry {
+                        index: info.index,
+                        name,
+                        binary,
+                        pid,
+                        comm: None, // populated after PID resolution below
+                        client_index: info.client.unwrap_or(u32::MAX),
+                        channels: info.volume.len(),
+                        muted: info.mute,
+                    });
+                }
+                ListResult::End | ListResult::Error => {
+                    *done.borrow_mut() = true;
+                }
+            });
+        })?;
 
         // Resolve PIDs via client lookup for entries missing a PID
         for entry in &mut result {
@@ -230,13 +390,12 @@ impl AudioController {
         // Cache /proc/<pid>/comm (lower-cased) so matches() doesn't read it
         // per match attempt.
         for entry in &mut result {
-            if let Some(ref pid) = entry.pid {
-                if pid.chars().all(|c| c.is_ascii_digit())
+            if let Some(ref pid) = entry.pid
+                && pid.chars().all(|c| c.is_ascii_digit())
                     && let Ok(raw) = std::fs::read_to_string(format!("/proc/{pid}/comm"))
                 {
                     entry.comm = Some(raw.trim().to_lowercase());
                 }
-            }
         }
 
         Ok(result)
@@ -244,30 +403,24 @@ impl AudioController {
 
     /// Look up a client's PID via pipewire.sec.pid property.
     fn get_client_pid(&self, client_index: u32) -> Result<Option<String>> {
-        let pid: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
-        let done = Rc::new(RefCell::new(false));
-
-        let pid_clone = pid.clone();
-        let done_clone = done.clone();
-        let introspect = self.context.borrow().introspect();
-        let _op = introspect.get_client_info(client_index, move |result| {
-            if let ListResult::Item(client) = result {
-                // Try pipewire.sec.pid first, then application.process.id
-                let p = client
-                    .proplist
-                    .get_str("pipewire.sec.pid")
-                    .or_else(|| {
-                        client
-                            .proplist
-                            .get_str(pulse::proplist::properties::APPLICATION_PROCESS_ID)
-                    });
-                *pid_clone.borrow_mut() = p;
-            }
-            *done_clone.borrow_mut() = true;
-        });
-
-        self.wait_for(&done)?;
-        Ok(pid.borrow().clone())
+        self.pa_query::<Option<String>, _>(None, |pid, done| {
+            let introspect = self.context.borrow().introspect();
+            let _op = introspect.get_client_info(client_index, move |result| {
+                if let ListResult::Item(client) = result {
+                    // Try pipewire.sec.pid first, then application.process.id
+                    let p = client
+                        .proplist
+                        .get_str("pipewire.sec.pid")
+                        .or_else(|| {
+                            client
+                                .proplist
+                                .get_str(pulse::proplist::properties::APPLICATION_PROCESS_ID)
+                        });
+                    *pid.borrow_mut() = p;
+                }
+                *done.borrow_mut() = true;
+            });
+        })
     }
 
     pub fn list_apps(&self) -> Result<Vec<AppInfo>> {
@@ -284,63 +437,11 @@ impl AudioController {
     }
 
     pub fn set_system_volume(&self, value: u8) -> Result<()> {
-        let volume = volume_from_u8(value);
-
-        // Query default sink to get its channel count
-        let channels = Rc::new(RefCell::new(2u8));
-        let done = Rc::new(RefCell::new(false));
-
-        let channels_clone = channels.clone();
-        let done_clone = done.clone();
-        let introspect = self.context.borrow().introspect();
-        let _op = introspect.get_sink_info_by_name("@DEFAULT_SINK@", move |result| {
-            if let ListResult::Item(sink) = result {
-                *channels_clone.borrow_mut() = sink.volume.len() as u8;
-            }
-            *done_clone.borrow_mut() = true;
-        });
-
-        self.wait_for(&done)?;
-
-        let ch = *channels.borrow();
-        let mut cv = ChannelVolumes::default();
-        cv.set(ch.into(), volume);
-        let mut introspect = self.context.borrow().introspect();
-        let _op = introspect.set_sink_volume_by_name("@DEFAULT_SINK@", &cv, None);
-        self.drain();
-
-        debug!("set system volume: {} ({}%)", value, value as f32 / 255.0 * 100.0);
-        Ok(())
+        self.set_default_volume(Target::DefaultSink, value)
     }
 
     pub fn set_mic_volume(&self, value: u8) -> Result<()> {
-        let volume = volume_from_u8(value);
-
-        // Query default source to get its channel count
-        let channels = Rc::new(RefCell::new(1u8));
-        let done = Rc::new(RefCell::new(false));
-
-        let channels_clone = channels.clone();
-        let done_clone = done.clone();
-        let introspect = self.context.borrow().introspect();
-        let _op = introspect.get_source_info_by_name("@DEFAULT_SOURCE@", move |result| {
-            if let ListResult::Item(source) = result {
-                *channels_clone.borrow_mut() = source.volume.len() as u8;
-            }
-            *done_clone.borrow_mut() = true;
-        });
-
-        self.wait_for(&done)?;
-
-        let ch = *channels.borrow();
-        let mut cv = ChannelVolumes::default();
-        cv.set(ch.into(), volume);
-        let mut introspect = self.context.borrow().introspect();
-        let _op = introspect.set_source_volume_by_name("@DEFAULT_SOURCE@", &cv, None);
-        self.drain();
-
-        debug!("set mic volume: {} ({}%)", value, value as f32 / 255.0 * 100.0);
-        Ok(())
+        self.set_default_volume(Target::DefaultSource, value)
     }
 
     /// Returns true if any matching app was found.
@@ -354,7 +455,7 @@ impl AudioController {
         let mut introspect = self.context.borrow().introspect();
         for entry in &matched {
             let mut cv = ChannelVolumes::default();
-            cv.set(entry.channels.into(), volume);
+            cv.set(entry.channels, volume);
             let _op = introspect.set_sink_input_volume(entry.index, &cv, None);
         }
         self.drain();
@@ -414,25 +515,20 @@ impl AudioController {
     where
         F: FnMut(&SrInfo<'static>) -> SrInfo<'static>,
     {
-        let entries: Rc<RefCell<Vec<SrInfo<'static>>>> = Rc::new(RefCell::new(Vec::new()));
-        let done = Rc::new(RefCell::new(false));
-
-        let entries_clone = entries.clone();
-        let done_clone = done.clone();
-
-        let mut sr = self.context.borrow().stream_restore();
-        let _op = sr.read(move |result| match result {
-            ListResult::Item(info) => {
-                entries_clone.borrow_mut().push(info.to_owned());
-            }
-            ListResult::End | ListResult::Error => {
-                *done_clone.borrow_mut() = true;
-            }
-        });
-        self.wait_for(&done)?;
+        let entries: Vec<SrInfo<'static>> = self.pa_collect(|entries, done| {
+            let mut sr = self.context.borrow().stream_restore();
+            let _op = sr.read(move |result| match result {
+                ListResult::Item(info) => {
+                    entries.borrow_mut().push(info.to_owned());
+                }
+                ListResult::End | ListResult::Error => {
+                    *done.borrow_mut() = true;
+                }
+            });
+        })?;
 
         let mut updated: Vec<SrInfo<'static>> = Vec::new();
-        for entry in entries.borrow().iter() {
+        for entry in entries.iter() {
             let name_matches = entry
                 .name
                 .as_ref()
@@ -449,17 +545,14 @@ impl AudioController {
         }
 
         let refs: Vec<&SrInfo> = updated.iter().collect();
-        let result: Rc<RefCell<Option<bool>>> = Rc::new(RefCell::new(None));
-        let result_clone = result.clone();
-        let _op = sr.write(UpdateMode::Replace, &refs, false, move |success| {
-            *result_clone.borrow_mut() = Some(success);
-        });
-        self.wait_until(|| result.borrow().is_some())?;
-
-        match *result.borrow() {
-            None => bail!("stream-restore write did not complete"),
-            Some(false) => bail!("stream-restore write rejected by server"),
-            Some(true) => {}
+        let success = self.pa_write_with_result(|result| {
+            let mut sr = self.context.borrow().stream_restore();
+            let _op = sr.write(UpdateMode::Replace, &refs, false, move |success| {
+                *result.borrow_mut() = Some(success);
+            });
+        })?;
+        if !success {
+            bail!("stream-restore write rejected by server");
         }
 
         debug!("updated {} stream-restore entries for {target}", updated.len());
@@ -468,56 +561,12 @@ impl AudioController {
 
     /// Returns the new mute state (true = muted).
     pub fn toggle_system_mute(&self) -> Result<bool> {
-        let current_mute = Rc::new(RefCell::new(false));
-        let done = Rc::new(RefCell::new(false));
-
-        let mute_clone = current_mute.clone();
-        let done_clone = done.clone();
-        let introspect = self.context.borrow().introspect();
-        let _op = introspect.get_sink_info_by_name("@DEFAULT_SINK@", move |result| {
-            if let ListResult::Item(sink) = result {
-                *mute_clone.borrow_mut() = sink.mute;
-            }
-            if matches!(result, ListResult::Item(_) | ListResult::End | ListResult::Error) {
-                *done_clone.borrow_mut() = true;
-            }
-        });
-
-        self.wait_for(&done)?;
-
-        let new_mute = !*current_mute.borrow();
-        let mut introspect = self.context.borrow().introspect();
-        let _op = introspect.set_sink_mute_by_name("@DEFAULT_SINK@", new_mute, None);
-        self.drain();
-
-        Ok(new_mute)
+        self.toggle_default_mute(Target::DefaultSink)
     }
 
     /// Returns the new mute state (true = muted).
     pub fn toggle_mic_mute(&self) -> Result<bool> {
-        let current_mute = Rc::new(RefCell::new(false));
-        let done = Rc::new(RefCell::new(false));
-
-        let mute_clone = current_mute.clone();
-        let done_clone = done.clone();
-        let introspect = self.context.borrow().introspect();
-        let _op = introspect.get_source_info_by_name("@DEFAULT_SOURCE@", move |result| {
-            if let ListResult::Item(source) = result {
-                *mute_clone.borrow_mut() = source.mute;
-            }
-            if matches!(result, ListResult::Item(_) | ListResult::End | ListResult::Error) {
-                *done_clone.borrow_mut() = true;
-            }
-        });
-
-        self.wait_for(&done)?;
-
-        let new_mute = !*current_mute.borrow();
-        let mut introspect = self.context.borrow().introspect();
-        let _op = introspect.set_source_mute_by_name("@DEFAULT_SOURCE@", new_mute, None);
-        self.drain();
-
-        Ok(new_mute)
+        self.toggle_default_mute(Target::DefaultSource)
     }
 
     /// Returns the new mute state, or None if the app wasn't found.

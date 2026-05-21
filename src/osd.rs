@@ -23,7 +23,10 @@ fn call<T>(method: &str, body: &T)
 where
     T: serde::Serialize + DynamicType,
 {
-    let mut session = SESSION.lock().unwrap();
+    // Lock poisoning recovery: if a previous holder panicked, the cached
+    // connection is still usable (or `None`), so treat the inner value as
+    // authoritative rather than propagating a panic.
+    let mut session = SESSION.lock().unwrap_or_else(|e| e.into_inner());
 
     // Connect lazily on first call, or after a previous failure invalidated
     // the cached connection.
