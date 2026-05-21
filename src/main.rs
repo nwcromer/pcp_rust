@@ -168,12 +168,7 @@ fn apply_rgb(panel: &PcPanelPro, mode: RgbMode) -> Result<()> {
     match mode {
         RgbMode::Solid { r, g, b } => {
             info!("RGB mode: solid (#{:02X}{:02X}{:02X})", r, g, b);
-            let color = Rgb::new(r, g, b);
-            let led = LedMode::Static(color);
-            led::set_knob_colors(panel, &[led; 5])?;
-            led::set_slider_colors(panel, &[led; 4])?;
-            led::set_slider_label_colors(panel, &[led; 4])?;
-            led::set_logo(panel, LogoMode::Static(color))?;
+            set_all_solid(panel, RgbColor { r, g, b })?;
         }
         RgbMode::Rainbow { style } => {
             let (rainbow_type, style_name) = match style {
@@ -228,23 +223,74 @@ enum ObsState {
     RecordingPaused,
 }
 
+/// Total on+off period for blinking flashes. Half is "on", half is "off".
+const BLINK_CYCLE: Duration = Duration::from_millis(200);
+
 #[derive(Debug, Clone, Copy)]
 struct Flash {
     color: RgbColor,
     expires_at: Instant,
+    /// If `Some`, the flash blinks between `color` and off using this cycle.
+    blink: Option<BlinkConfig>,
 }
 
-fn start_flash(color: RgbColor, duration_ms: u64) -> Flash {
-    Flash {
-        color,
-        expires_at: Instant::now() + Duration::from_millis(duration_ms),
+#[derive(Debug, Clone, Copy)]
+struct BlinkConfig {
+    started_at: Instant,
+    /// Total on+off cycle length. Half is "on", half is "off".
+    cycle: Duration,
+}
+
+impl Flash {
+    fn new_solid(color: RgbColor, duration_ms: u64) -> Self {
+        Self {
+            color,
+            expires_at: Instant::now() + Duration::from_millis(duration_ms),
+            blink: None,
+        }
+    }
+
+    fn new_blink(color: RgbColor, duration_ms: u64) -> Self {
+        let now = Instant::now();
+        Self {
+            color,
+            expires_at: now + Duration::from_millis(duration_ms),
+            blink: Some(BlinkConfig {
+                started_at: now,
+                cycle: BLINK_CYCLE,
+            }),
+        }
+    }
+
+    /// The color to display right now. For solid flashes this just returns
+    /// `self.color`. For blinking flashes it reads `Instant::now()` and
+    /// returns either `self.color` or black depending on the current phase
+    /// of the blink cycle — so the return value is *not* pure: two calls
+    /// across a phase boundary will yield different results.
+    fn current_color(&self) -> RgbColor {
+        self.current_color_at(Instant::now())
+    }
+
+    /// `current_color` factored out so tests can pass a deterministic time.
+    fn current_color_at(&self, now: Instant) -> RgbColor {
+        let Some(blink) = self.blink else {
+            return self.color;
+        };
+        let elapsed_ms = now.saturating_duration_since(blink.started_at).as_millis();
+        let half_ms = (blink.cycle.as_millis() / 2).max(1);
+        if (elapsed_ms / half_ms) % 2 == 0 {
+            self.color
+        } else {
+            RgbColor { r: 0, g: 0, b: 0 }
+        }
     }
 }
 
 /// All OBS-related state owned by the main thread: the handle to the OBS
 /// thread, the connection flag, the current recording state, the configured
-/// colors, and any active flash overlay. Bundling them avoids threading a
-/// long parameter list through `dispatch_obs` and `handle_panel_event`.
+/// colors, and any active flash overlay. Bundling them keeps the main loop
+/// and `handle_panel_event` from threading a long parameter list, and lets
+/// `dispatch`/`drain_events` operate over a single self.
 struct ObsRuntime {
     handle: Option<ObsHandle>,
     connected: bool,
@@ -314,13 +360,13 @@ impl ObsRuntime {
                 if visibly_changes_state {
                     false
                 } else {
-                    self.set_flash(self.colors.success_flash);
+                    self.set_success_flash();
                     true
                 }
             }
             ObsEvent::CommandFailed(cmd, msg) => {
                 warn!("OBS command failed ({}): {msg}", cmd.label());
-                self.set_flash(self.colors.error_flash);
+                self.set_error_flash();
                 true
             }
         }
@@ -337,19 +383,34 @@ impl ObsRuntime {
         }
     }
 
-    /// Set the current flash overlay using the configured duration.
-    fn set_flash(&mut self, color: RgbColor) {
-        self.flash = Some(start_flash(color, self.colors.flash_duration_ms));
+    /// Set a solid success flash using the configured duration.
+    fn set_success_flash(&mut self) {
+        self.flash = Some(Flash::new_solid(
+            self.colors.success_flash,
+            self.colors.flash_duration_ms,
+        ));
     }
 
-    /// Clear any expired flash. Returns `true` if a flash just expired and
-    /// the LEDs need a repaint.
+    /// Set an error flash. Blinks between the error color and off to make
+    /// failures more visually obvious than a steady color change.
+    fn set_error_flash(&mut self) {
+        self.flash = Some(Flash::new_blink(
+            self.colors.error_flash,
+            self.colors.flash_duration_ms,
+        ));
+    }
+
+    /// Clear any expired flash. Returns `true` if a flash just expired OR
+    /// if a blinking flash is active (in which case we keep repainting so
+    /// the on/off phases render — the simplest implementation, costs an
+    /// extra LED write per main-loop iteration for the flash duration).
     fn expire_flash(&mut self) -> bool {
         match self.flash {
             Some(f) if Instant::now() >= f.expires_at => {
                 self.flash = None;
                 true
             }
+            Some(f) if f.blink.is_some() => true,
             _ => false,
         }
     }
@@ -367,7 +428,7 @@ impl ObsRuntime {
                 // actions when [obs] is absent, so this is normally only
                 // hit when OBS is disconnected) or the thread is gone.
                 warn!("OBS not connected — {} skipped", cmd.label());
-                self.set_flash(self.colors.error_flash);
+                self.set_error_flash();
                 return true;
             }
         };
@@ -376,7 +437,7 @@ impl ObsRuntime {
             // cmd_rx for its entire lifetime, so this branch only fires if
             // the runtime itself collapsed. Treated the same as disconnected.
             warn!("OBS thread unreachable — {} skipped", cmd.label());
-            self.set_flash(self.colors.error_flash);
+            self.set_error_flash();
             return true;
         }
         false
@@ -384,12 +445,19 @@ impl ObsRuntime {
 }
 
 /// Set every LED region (knobs, sliders, slider labels, logo) to one solid color.
+///
+/// The slider strips render `LedMode::Static` with a desaturation gradient
+/// toward the top — they look whiter the higher you go. Sending a uniform
+/// `Gradient(c, c)` (two identical colors) bypasses that firmware behavior
+/// and forces an even color across the whole strip. Knobs, slider labels,
+/// and the logo render `Static` correctly.
 fn set_all_solid(panel: &PcPanelPro, c: RgbColor) -> Result<()> {
     let rgb = Rgb::new(c.r, c.g, c.b);
-    let led = LedMode::Static(rgb);
-    led::set_knob_colors(panel, &[led; 5])?;
-    led::set_slider_colors(panel, &[led; 4])?;
-    led::set_slider_label_colors(panel, &[led; 4])?;
+    let static_mode = LedMode::Static(rgb);
+    let uniform_slider = LedMode::Gradient(rgb, rgb);
+    led::set_knob_colors(panel, &[static_mode; 5])?;
+    led::set_slider_colors(panel, &[uniform_slider; 4])?;
+    led::set_slider_label_colors(panel, &[static_mode; 4])?;
     led::set_logo(panel, LogoMode::Static(rgb))?;
     Ok(())
 }
@@ -398,7 +466,7 @@ fn set_all_solid(panel: &PcPanelPro, c: RgbColor) -> Result<()> {
 /// Flash takes precedence over state.
 fn paint_leds(panel: &PcPanelPro, obs: &ObsRuntime, idle_rgb: Option<RgbMode>) -> Result<()> {
     if let Some(f) = obs.flash {
-        return set_all_solid(panel, f.color);
+        return set_all_solid(panel, f.current_color());
     }
     match obs.state {
         ObsState::Idle => match idle_rgb {
@@ -602,4 +670,68 @@ fn handle_panel_event(
         Event::ButtonRelease { .. } => {}
     }
     Ok(led_dirty)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const RED: RgbColor = RgbColor { r: 0xFF, g: 0, b: 0 };
+    const BLACK: RgbColor = RgbColor { r: 0, g: 0, b: 0 };
+
+    fn solid(started: Instant) -> Flash {
+        Flash {
+            color: RED,
+            expires_at: started + Duration::from_secs(60),
+            blink: None,
+        }
+    }
+
+    fn blink(started: Instant) -> Flash {
+        Flash {
+            color: RED,
+            expires_at: started + Duration::from_secs(60),
+            blink: Some(BlinkConfig {
+                started_at: started,
+                cycle: BLINK_CYCLE,
+            }),
+        }
+    }
+
+    #[test]
+    fn solid_flash_is_time_invariant() {
+        let t0 = Instant::now();
+        let f = solid(t0);
+        assert_eq!(f.current_color_at(t0), RED);
+        assert_eq!(f.current_color_at(t0 + Duration::from_millis(50)), RED);
+        assert_eq!(f.current_color_at(t0 + Duration::from_secs(10)), RED);
+    }
+
+    #[test]
+    fn blink_flash_phases() {
+        // BLINK_CYCLE = 200ms, so half = 100ms.
+        // [0..100) → on, [100..200) → off, [200..300) → on, ...
+        let t0 = Instant::now();
+        let f = blink(t0);
+        let at = |offset_ms| f.current_color_at(t0 + Duration::from_millis(offset_ms));
+        assert_eq!(at(0), RED);
+        assert_eq!(at(50), RED);
+        assert_eq!(at(99), RED);
+        assert_eq!(at(100), BLACK);
+        assert_eq!(at(150), BLACK);
+        assert_eq!(at(199), BLACK);
+        assert_eq!(at(200), RED);
+        assert_eq!(at(299), RED);
+        assert_eq!(at(300), BLACK);
+        assert_eq!(at(400), RED);
+    }
+
+    #[test]
+    fn blink_flash_before_started_clamps_to_on() {
+        // saturating_duration_since means a `now` before `started_at` clamps to 0,
+        // which puts us at the start of the on phase.
+        let t0 = Instant::now();
+        let f = blink(t0);
+        assert_eq!(f.current_color_at(t0 - Duration::from_millis(50)), RED);
+    }
 }

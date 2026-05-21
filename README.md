@@ -208,9 +208,16 @@ The OBS integration is opt-in. If you don't add an `[obs]` section to your confi
 
 ```toml
 [obs]
-host = "localhost"   # optional, default "localhost"
-port = 4455          # optional, default 4455
-password = "secret"  # optional; omit or leave empty if OBS auth is disabled
+host = "localhost"            # optional, default "localhost"
+port = 4455                   # optional, default 4455
+password = "secret"           # optional; omit or leave empty if OBS auth is disabled
+start_replay_buffer = false   # optional, default false; if true, pcp_rust starts
+                              # OBS's replay buffer on every successful connection
+                              # (including reconnects after OBS restarts or
+                              # network blips). Does nothing if it's already
+                              # running. Does not monitor or re-enable the buffer
+                              # during a live session — if you stop it via OBS,
+                              # it stays stopped until pcp_rust reconnects.
 ```
 
 pcp_rust connects on startup and reconnects automatically (with exponential backoff, max ~30s) when OBS isn't running, restarts, or crashes. While disconnected, OBS action buttons produce an error flash.

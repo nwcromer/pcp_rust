@@ -56,7 +56,7 @@ pub enum RainbowStyle {
     Vertical,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RgbColor {
     pub r: u8,
     pub g: u8,
@@ -85,6 +85,10 @@ pub struct ObsConfig {
     pub host: String,
     pub port: u16,
     pub password: Option<String>,
+    /// If true, pcp_rust will start OBS's replay buffer on every successful
+    /// connection (skipping if it's already running). Off by default — the
+    /// user normally manages replay buffer state in OBS directly.
+    pub start_replay_buffer: bool,
     pub colors: ObsColors,
 }
 
@@ -100,7 +104,10 @@ pub struct ObsColors {
 impl Default for ObsColors {
     fn default() -> Self {
         Self {
-            recording: RgbColor { r: 0xFF, g: 0x00, b: 0x00 },
+            // PCPanel Pro red is gamma-compressed at the high end — values
+            // from 0x80 to 0xFF all read as roughly "full red". 0x50 is
+            // visibly dimmer while still clearly red.
+            recording: RgbColor { r: 0x50, g: 0x00, b: 0x00 },
             paused: RgbColor { r: 0xFF, g: 0xC0, b: 0x00 },
             success_flash: RgbColor { r: 0x00, g: 0xFF, b: 0x00 },
             error_flash: RgbColor { r: 0xFF, g: 0x00, b: 0xFF },
@@ -341,13 +348,20 @@ fn parse_obs_section(table: &toml::value::Table) -> Result<ObsConfig> {
         .filter(|s| !s.is_empty())
         .map(String::from);
 
+    let start_replay_buffer = match table.get("start_replay_buffer") {
+        None => false,
+        Some(v) => v
+            .as_bool()
+            .context("[obs] \"start_replay_buffer\" must be a boolean")?,
+    };
+
     let colors = match table.get("colors") {
         None => ObsColors::default(),
         Some(toml::Value::Table(t)) => parse_obs_colors(t)?,
         Some(_) => bail!("[obs.colors] must be a table"),
     };
 
-    Ok(ObsConfig { host, port, password, colors })
+    Ok(ObsConfig { host, port, password, start_replay_buffer, colors })
 }
 
 fn parse_obs_colors(table: &toml::value::Table) -> Result<ObsColors> {
@@ -824,6 +838,39 @@ mod tests {
             config.mappings.get(&ControlId::Button(1)),
             Some(Action::ObsToggleRecording)
         ));
+    }
+
+    #[test]
+    fn test_obs_start_replay_buffer() {
+        let config = parse_config(
+            r#"
+            [obs]
+            start_replay_buffer = true
+            "#,
+        )
+        .unwrap();
+        assert!(config.obs.unwrap().start_replay_buffer);
+
+        // Default is false when the field is absent.
+        let config = parse_config(
+            r#"
+            [obs]
+            "#,
+        )
+        .unwrap();
+        assert!(!config.obs.unwrap().start_replay_buffer);
+    }
+
+    #[test]
+    fn test_obs_start_replay_buffer_must_be_bool() {
+        let result = parse_config(
+            r#"
+            [obs]
+            start_replay_buffer = "yes"
+            "#,
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("boolean"));
     }
 
     #[test]

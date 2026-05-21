@@ -117,7 +117,7 @@ async fn obs_main_loop(
 
                 // Run the session until the connection drops or the main
                 // thread closes the command channel.
-                if let Err(e) = run_session(&client, &mut cmd_rx, &event_tx).await {
+                if let Err(e) = run_session(&client, &config, &mut cmd_rx, &event_tx).await {
                     warn!("OBS: session ended: {e}");
                 }
 
@@ -151,6 +151,7 @@ async fn try_connect(config: &ObsConfig) -> Result<obws::Client> {
 
 async fn run_session(
     client: &obws::Client,
+    config: &ObsConfig,
     cmd_rx: &mut UnboundedReceiver<ObsCommand>,
     event_tx: &UnboundedSender<ObsEvent>,
 ) -> Result<()> {
@@ -168,7 +169,27 @@ async fn run_session(
         }
     }
 
-    // Subscribe to the OBS event stream.
+    // Optionally start the replay buffer if the user asked for it via config.
+    // This runs on EVERY successful connect — including reconnects after OBS
+    // restarts or network blips. During an active session we don't monitor or
+    // re-enable the buffer; if the user stops it via OBS, it stays stopped
+    // until the next reconnect.
+    if config.start_replay_buffer {
+        match client.replay_buffer().status().await {
+            Ok(true) => info!("OBS: replay buffer already running"),
+            Ok(false) => match client.replay_buffer().start().await {
+                Ok(()) => info!("OBS: started replay buffer"),
+                Err(e) => warn!("OBS: failed to start replay buffer: {e}"),
+            },
+            Err(e) => warn!("OBS: failed to query replay buffer status: {e}"),
+        }
+    }
+
+    // Subscribe to the OBS event stream. Note: this happens *after* the
+    // replay-buffer start above, so a `ReplayBufferStateChanged` event fired
+    // by OBS between our `start()` returning and this `events()` call would
+    // be missed. Doesn't matter today because we don't handle that event,
+    // but if we ever do, subscribe before sending replay-buffer commands.
     let events = client.events()?;
     tokio::pin!(events);
 
