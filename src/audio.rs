@@ -1,6 +1,8 @@
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::ops::Deref;
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use libpulse_binding as pulse;
@@ -12,6 +14,17 @@ use pulse::mainloop::standard::{IterateResult, Mainloop};
 use pulse::proplist::{Proplist, UpdateMode};
 use pulse::volume::{ChannelVolumes, Volume};
 
+/// How long an app's volume must be stable before we persist it to the
+/// stream-restore database. Coalesces bursts of slider events into a
+/// single DB write after the user stops moving the slider.
+const PERSIST_IDLE: Duration = Duration::from_millis(200);
+
+#[derive(Clone, Copy)]
+struct PendingPersist {
+    volume: Volume,
+    last_update: Instant,
+}
+
 /// Info collected from a sink input for matching and display.
 #[derive(Clone)]
 struct SinkInputEntry {
@@ -19,6 +32,11 @@ struct SinkInputEntry {
     name: String,
     binary: Option<String>,
     pid: Option<String>,
+    /// Cached lower-cased `/proc/<pid>/comm`. Populated once during
+    /// `collect_sink_inputs` so `matches()` is pure RAM comparison —
+    /// avoids re-reading /proc on every match attempt (especially for
+    /// sliders with multiple configured apps).
+    comm: Option<String>,
     client_index: u32,
     channels: u8,
     muted: bool,
@@ -26,7 +44,7 @@ struct SinkInputEntry {
 
 impl SinkInputEntry {
     /// Check if this entry matches a target app name (case-insensitive substring).
-    /// Checks PA app name, then binary, then /proc/<pid>/comm.
+    /// Checks PA app name, then binary, then cached /proc/<pid>/comm.
     fn matches(&self, target: &str) -> bool {
         if self.name.to_lowercase().contains(target) {
             return true;
@@ -36,12 +54,9 @@ impl SinkInputEntry {
                 return true;
             }
         }
-        if let Some(ref pid) = self.pid {
-            if pid.chars().all(|c| c.is_ascii_digit())
-            && let Ok(comm) = std::fs::read_to_string(format!("/proc/{pid}/comm")) {
-                if comm.trim().to_lowercase().contains(target) {
-                    return true;
-                }
+        if let Some(ref comm) = self.comm {
+            if comm.contains(target) {
+                return true;
             }
         }
         false
@@ -51,6 +66,11 @@ impl SinkInputEntry {
 pub struct AudioController {
     mainloop: Rc<RefCell<Mainloop>>,
     context: Rc<RefCell<context::Context>>,
+    /// Per-app deferred stream-restore writes. `set_app_volume` updates
+    /// the entry on every tick; `flush_persist_writes` (called from the
+    /// main loop) actually writes to PA once the entry has been idle for
+    /// `PERSIST_IDLE`.
+    pending_persist: HashMap<String, PendingPersist>,
 }
 
 #[derive(Clone)]
@@ -105,27 +125,50 @@ impl AudioController {
 
         info!("connected to PulseAudio");
 
-        Ok(Self { mainloop, context })
+        Ok(Self { mainloop, context, pending_persist: HashMap::new() })
     }
 
-    fn wait_for(&self, done: &RefCell<bool>) {
-        self.wait_until(|| *done.borrow());
+    fn wait_for(&self, done: &RefCell<bool>) -> Result<()> {
+        self.wait_until(|| *done.borrow())
     }
 
-    fn wait_until<F: Fn() -> bool>(&self, is_done: F) {
+    /// Drive the PulseAudio mainloop until `is_done` returns true, or fail
+    /// with an error if the PA context disconnects, the mainloop quits, or
+    /// the operation exceeds the wall-clock deadline / iteration cap.
+    ///
+    /// Surfacing a real error rather than silently breaking out is the
+    /// "practical fallback" for the absent reconnect path: callers now see
+    /// the failure and propagate it; the user gets a visible error in the
+    /// journal instead of stale defaults from an apparently-successful call.
+    fn wait_until<F: Fn() -> bool>(&self, is_done: F) -> Result<()> {
         const MAX_ITERATIONS: usize = 1000;
+        const DEADLINE: std::time::Duration = std::time::Duration::from_millis(250);
+        let started = std::time::Instant::now();
         for _ in 0..MAX_ITERATIONS {
             if is_done() {
-                return;
+                return Ok(());
+            }
+            if started.elapsed() >= DEADLINE {
+                bail!("PulseAudio call exceeded {:?} deadline", DEADLINE);
             }
             match self.mainloop.borrow_mut().iterate(true) {
                 IterateResult::Success(_) => {}
-                _ => break,
+                IterateResult::Err(e) => bail!("PulseAudio mainloop error: {e}"),
+                IterateResult::Quit(_) => bail!("PulseAudio mainloop quit"),
+            }
+            // PA context can transition out of Ready (server restart, etc.)
+            // mid-operation; iterate() returns Success while the context
+            // becomes unusable. Check explicitly so subsequent calls don't
+            // silently use stale data.
+            match self.context.borrow().get_state() {
+                context::State::Ready => {}
+                other => bail!("PulseAudio context not ready: {other:?}"),
             }
         }
         if !is_done() {
-            log::warn!("PulseAudio operation timed out");
+            bail!("PulseAudio call exceeded {MAX_ITERATIONS} iterations");
         }
+        Ok(())
     }
 
     fn drain(&self) {
@@ -163,6 +206,7 @@ impl AudioController {
                     name,
                     binary,
                     pid,
+                    comm: None, // populated after PID resolution below
                     client_index: info.client.unwrap_or(u32::MAX),
                     channels: info.volume.len() as u8,
                     muted: info.mute,
@@ -173,13 +217,25 @@ impl AudioController {
             }
         });
 
-        self.wait_for(&done);
+        self.wait_for(&done)?;
         let mut result = entries.borrow().clone();
 
         // Resolve PIDs via client lookup for entries missing a PID
         for entry in &mut result {
             if entry.pid.is_none() && entry.client_index != u32::MAX {
                 entry.pid = self.get_client_pid(entry.client_index)?;
+            }
+        }
+
+        // Cache /proc/<pid>/comm (lower-cased) so matches() doesn't read it
+        // per match attempt.
+        for entry in &mut result {
+            if let Some(ref pid) = entry.pid {
+                if pid.chars().all(|c| c.is_ascii_digit())
+                    && let Ok(raw) = std::fs::read_to_string(format!("/proc/{pid}/comm"))
+                {
+                    entry.comm = Some(raw.trim().to_lowercase());
+                }
             }
         }
 
@@ -210,7 +266,7 @@ impl AudioController {
             *done_clone.borrow_mut() = true;
         });
 
-        self.wait_for(&done);
+        self.wait_for(&done)?;
         Ok(pid.borrow().clone())
     }
 
@@ -244,7 +300,7 @@ impl AudioController {
             *done_clone.borrow_mut() = true;
         });
 
-        self.wait_for(&done);
+        self.wait_for(&done)?;
 
         let ch = *channels.borrow();
         let mut cv = ChannelVolumes::default();
@@ -274,7 +330,7 @@ impl AudioController {
             *done_clone.borrow_mut() = true;
         });
 
-        self.wait_for(&done);
+        self.wait_for(&done)?;
 
         let ch = *channels.borrow();
         let mut cv = ChannelVolumes::default();
@@ -303,22 +359,61 @@ impl AudioController {
         }
         self.drain();
 
-        // Persist the volume to the stream-restore database so that new streams
-        // for this app pick up the new value automatically.
-        if let Err(e) = self.update_stream_restore(&target, volume) {
-            warn!("failed to update stream-restore for {app_name}: {e}");
-        }
-
         if matched.is_empty() {
             debug!("app not found: {app_name}");
+        } else {
+            // Stash the new volume for deferred stream-restore persistence —
+            // a burst of slider ticks coalesces to a single DB write once
+            // the user stops moving the slider for `PERSIST_IDLE`. The
+            // actual playback volume above is set on every tick.
+            self.pending_persist.insert(
+                target,
+                PendingPersist { volume, last_update: Instant::now() },
+            );
         }
 
         Ok(!matched.is_empty())
     }
 
-    /// Updates module-stream-restore database entries whose name contains `target`
-    /// (case-insensitive) so that new streams for this app use `volume`.
-    fn update_stream_restore(&self, target: &str, volume: Volume) -> Result<()> {
+    /// Flush any per-app volume persistence writes that have been idle for
+    /// `PERSIST_IDLE`. Should be called from the main loop. PA write
+    /// failures are logged and the entry is dropped (no infinite retry).
+    pub fn flush_persist_writes(&mut self) {
+        let now = Instant::now();
+        let ready: Vec<(String, Volume)> = self
+            .pending_persist
+            .iter()
+            .filter(|(_, p)| now.duration_since(p.last_update) >= PERSIST_IDLE)
+            .map(|(k, p)| (k.clone(), p.volume))
+            .collect();
+        for (target, volume) in ready {
+            self.pending_persist.remove(&target);
+            let result = self.update_stream_restore(&target, |entry| {
+                let channels = entry.volume.len();
+                let mut cv = ChannelVolumes::default();
+                cv.set(channels, volume);
+                SrInfo {
+                    name: entry.name.clone(),
+                    channel_map: entry.channel_map,
+                    volume: cv,
+                    device: entry.device.clone(),
+                    mute: entry.mute,
+                }
+            });
+            if let Err(e) = result {
+                warn!("audio: deferred stream-restore write for {target} failed: {e}");
+            }
+        }
+    }
+
+    /// Updates module-stream-restore database entries whose name contains
+    /// `target` (case-insensitive). The `updater` closure receives each
+    /// matching existing entry and returns the new entry that should
+    /// replace it. Use it to bump volume, mute state, or both.
+    fn update_stream_restore<F>(&self, target: &str, mut updater: F) -> Result<()>
+    where
+        F: FnMut(&SrInfo<'static>) -> SrInfo<'static>,
+    {
         let entries: Rc<RefCell<Vec<SrInfo<'static>>>> = Rc::new(RefCell::new(Vec::new()));
         let done = Rc::new(RefCell::new(false));
 
@@ -334,7 +429,7 @@ impl AudioController {
                 *done_clone.borrow_mut() = true;
             }
         });
-        self.wait_for(&done);
+        self.wait_for(&done)?;
 
         let mut updated: Vec<SrInfo<'static>> = Vec::new();
         for entry in entries.borrow().iter() {
@@ -346,16 +441,7 @@ impl AudioController {
             if !name_matches {
                 continue;
             }
-            let channels = entry.volume.len();
-            let mut cv = ChannelVolumes::default();
-            cv.set(channels, volume);
-            updated.push(SrInfo {
-                name: entry.name.clone(),
-                channel_map: entry.channel_map,
-                volume: cv,
-                device: entry.device.clone(),
-                mute: entry.mute,
-            });
+            updated.push(updater(entry));
         }
 
         if updated.is_empty() {
@@ -368,7 +454,7 @@ impl AudioController {
         let _op = sr.write(UpdateMode::Replace, &refs, false, move |success| {
             *result_clone.borrow_mut() = Some(success);
         });
-        self.wait_until(|| result.borrow().is_some());
+        self.wait_until(|| result.borrow().is_some())?;
 
         match *result.borrow() {
             None => bail!("stream-restore write did not complete"),
@@ -397,7 +483,7 @@ impl AudioController {
             }
         });
 
-        self.wait_for(&done);
+        self.wait_for(&done)?;
 
         let new_mute = !*current_mute.borrow();
         let mut introspect = self.context.borrow().introspect();
@@ -424,7 +510,7 @@ impl AudioController {
             }
         });
 
-        self.wait_for(&done);
+        self.wait_for(&done)?;
 
         let new_mute = !*current_mute.borrow();
         let mut introspect = self.context.borrow().introspect();
@@ -456,6 +542,20 @@ impl AudioController {
             let _op = introspect.set_sink_input_mute(entry.index, new_mute, None);
         }
         self.drain();
+
+        // Persist the mute state to the stream-restore database so that new
+        // streams for this app pick it up automatically — mirrors the
+        // volume-persist behavior in set_app_volume.
+        let result = self.update_stream_restore(&target, |entry| SrInfo {
+            name: entry.name.clone(),
+            channel_map: entry.channel_map,
+            volume: entry.volume,
+            device: entry.device.clone(),
+            mute: new_mute,
+        });
+        if let Err(e) = result {
+            warn!("failed to update stream-restore mute for {app_name}: {e}");
+        }
 
         Ok(Some(new_mute))
     }

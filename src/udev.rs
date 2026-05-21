@@ -44,5 +44,8 @@ pub fn create_udev_rules() -> Result<()> {
 }
 
 fn running_as_root() -> bool {
+    // SAFETY: geteuid() has no preconditions and no side effects — it just
+    // reads the effective UID. The libc binding is marked unsafe purely
+    // because all FFI calls are; this one is always safe to invoke.
     unsafe { libc::geteuid() == 0 }
 }

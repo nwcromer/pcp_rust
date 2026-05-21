@@ -19,6 +19,8 @@ toml = "0.8"
 obws = { version = "0.14", features = ["events"] }
 tokio = { version = "1", features = ["rt", "macros", "sync", "time", "net", "io-util"] }
 tokio-stream = "0.1"
+zbus = { version = "5", default-features = false, features = ["blocking-api", "async-io"] }
+freedesktop-icons = "0.4"
 
 # Patches libpulse-binding and libpulse-sys to a fork that fixes the
 # ext_stream_restore write() transmute bug. Submitted upstream as PR #66

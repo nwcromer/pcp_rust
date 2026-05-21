@@ -1,5 +1,7 @@
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
+use std::sync::{LazyLock, Mutex};
 
 const DESKTOP_DIRS: &[&str] = &[
     "/usr/share/applications",
@@ -12,7 +14,14 @@ const DESKTOP_DIRS: &[&str] = &[
 const DEFAULT_ICON: &str = "";
 
 /// Try to find an icon for the given apps.
-/// Priority: config icon > .desktop file lookup > app name > None.
+/// Priority: config icon > .desktop file lookup > lowercased app name
+/// (only if it exists in an installed icon theme) > None.
+///
+/// The last fallback uses `freedesktop-icons` to verify the candidate
+/// actually resolves under the XDG icon spec (themes, inheritance, all
+/// sizes/categories). If KDE wouldn't find an icon for the name either,
+/// we return None — the OSD then renders no icon, which is what we want
+/// instead of KDE's unknown-file (paper-fold) default.
 fn find_app_icon(config_icon: Option<&str>, app_names: &[String]) -> Option<String> {
     if let Some(icon) = config_icon {
         return Some(icon.to_string());
@@ -24,14 +33,29 @@ fn find_app_icon(config_icon: Option<&str>, app_names: &[String]) -> Option<Stri
         }
     }
 
-    if let Some(first) = app_names.first() {
-        let candidate = first.to_lowercase();
-        if icon_exists(&candidate) {
-            return Some(candidate);
-        }
+    let candidate = app_names.first()?.to_lowercase();
+    if freedesktop_icon_resolves(&candidate) {
+        Some(candidate)
+    } else {
+        None
     }
+}
 
-    None
+/// `freedesktop_icons::lookup(name).find()` exhaustively scans every
+/// installed theme/size/category when the name doesn't resolve — hundreds
+/// of stat() calls. That's fine once, but slider events fire ~10 Hz and
+/// each tick was hitting this for apps with no icon, backing up the HID
+/// event loop. Cache the answer so each name is resolved at most once
+/// per process lifetime.
+fn freedesktop_icon_resolves(name: &str) -> bool {
+    static CACHE: LazyLock<Mutex<HashMap<String, bool>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+    if let Some(&cached) = CACHE.lock().unwrap().get(name) {
+        return cached;
+    }
+    let found = freedesktop_icons::lookup(name).find().is_some();
+    CACHE.lock().unwrap().insert(name.to_string(), found);
+    found
 }
 
 /// Resolve an icon name for volume display.
@@ -77,9 +101,21 @@ fn find_icon_in_desktop_files(app_name: &str) -> Option<String> {
                 continue;
             }
 
-            // Parse the .desktop file for Icon=
+            // Parse the .desktop file for Icon= in the [Desktop Entry]
+            // section only. Other sections (`[Desktop Action ...]`,
+            // `[X-Foo]`) can carry their own Icon= for context-menu items,
+            // which are not the primary app icon.
             if let Ok(content) = fs::read_to_string(&path) {
-                for line in content.lines() {
+                let mut in_desktop_entry = false;
+                for raw in content.lines() {
+                    let line = raw.trim();
+                    if line.starts_with('[') && line.ends_with(']') {
+                        in_desktop_entry = line == "[Desktop Entry]";
+                        continue;
+                    }
+                    if !in_desktop_entry {
+                        continue;
+                    }
                     if let Some(icon) = line.strip_prefix("Icon=") {
                         let icon = icon.trim();
                         if !icon.is_empty() {
@@ -91,46 +127,4 @@ fn find_icon_in_desktop_files(app_name: &str) -> Option<String> {
         }
     }
     None
-}
-
-/// Check if a freedesktop icon name likely exists.
-/// This is a heuristic — we check common icon theme paths.
-fn icon_exists(name: &str) -> bool {
-    let theme_dirs = [
-        "/usr/share/icons/hicolor",
-        "/usr/share/icons/breeze",
-        "/usr/share/pixmaps",
-    ];
-
-    for dir in &theme_dirs {
-        let dir_path = Path::new(dir);
-        if !dir_path.is_dir() {
-            continue;
-        }
-        // Check pixmaps directly
-        if *dir == "/usr/share/pixmaps" {
-            for ext in &["png", "svg", "xpm"] {
-                if dir_path.join(format!("{name}.{ext}")).exists() {
-                    return true;
-                }
-            }
-            continue;
-        }
-        // For icon themes, check common sizes
-        for size in &["scalable", "48x48", "64x64", "128x128", "256x256"] {
-            for category in &["apps", "mimetypes"] {
-                for ext in &["svg", "png"] {
-                    if dir_path
-                        .join(size)
-                        .join(category)
-                        .join(format!("{name}.{ext}"))
-                        .exists()
-                    {
-                        return true;
-                    }
-                }
-            }
-        }
-    }
-    false
 }

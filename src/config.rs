@@ -89,6 +89,11 @@ pub struct ObsConfig {
     /// connection (skipping if it's already running). Off by default — the
     /// user normally manages replay buffer state in OBS directly.
     pub start_replay_buffer: bool,
+    /// If true, the panel shows a global breath effect when recording is
+    /// paused (driving every LED, including the logo, so the replay-buffer
+    /// indicator is unavailable during paused). If false (default), paused
+    /// renders as a solid color so the logo can keep showing replay state.
+    pub paused_use_breath: bool,
     pub colors: ObsColors,
 }
 
@@ -99,6 +104,16 @@ pub struct ObsColors {
     pub success_flash: RgbColor,
     pub error_flash: RgbColor,
     pub flash_duration_ms: u64,
+    /// Panel color when OBS is connected and idle (not recording). The
+    /// logo separately reflects replay-buffer state. When OBS is
+    /// disconnected, `[rgb]` is used instead.
+    pub idle_panel: RgbColor,
+    /// Logo color when OBS-connected-and-idle and the replay buffer is
+    /// currently running.
+    pub replay_active: RgbColor,
+    /// Logo color when OBS-connected-and-idle and the replay buffer is
+    /// stopped (or its state hasn't been queried yet).
+    pub replay_inactive: RgbColor,
 }
 
 impl Default for ObsColors {
@@ -112,6 +127,9 @@ impl Default for ObsColors {
             success_flash: RgbColor { r: 0x00, g: 0xFF, b: 0x00 },
             error_flash: RgbColor { r: 0xFF, g: 0x00, b: 0xFF },
             flash_duration_ms: 500,
+            idle_panel: RgbColor { r: 0x20, g: 0x20, b: 0x20 },
+            replay_active: RgbColor { r: 0x00, g: 0xFF, b: 0x00 },
+            replay_inactive: RgbColor { r: 0x00, g: 0x00, b: 0x00 },
         }
     }
 }
@@ -355,13 +373,20 @@ fn parse_obs_section(table: &toml::value::Table) -> Result<ObsConfig> {
             .context("[obs] \"start_replay_buffer\" must be a boolean")?,
     };
 
+    let paused_use_breath = match table.get("paused_use_breath") {
+        None => false,
+        Some(v) => v
+            .as_bool()
+            .context("[obs] \"paused_use_breath\" must be a boolean")?,
+    };
+
     let colors = match table.get("colors") {
         None => ObsColors::default(),
         Some(toml::Value::Table(t)) => parse_obs_colors(t)?,
         Some(_) => bail!("[obs.colors] must be a table"),
     };
 
-    Ok(ObsConfig { host, port, password, start_replay_buffer, colors })
+    Ok(ObsConfig { host, port, password, start_replay_buffer, paused_use_breath, colors })
 }
 
 fn parse_obs_colors(table: &toml::value::Table) -> Result<ObsColors> {
@@ -372,6 +397,9 @@ fn parse_obs_colors(table: &toml::value::Table) -> Result<ObsColors> {
         success_flash: parse_obs_color(table, "success_flash", defaults.success_flash)?,
         error_flash: parse_obs_color(table, "error_flash", defaults.error_flash)?,
         flash_duration_ms: parse_flash_duration(table, defaults.flash_duration_ms)?,
+        idle_panel: parse_obs_color(table, "idle_panel", defaults.idle_panel)?,
+        replay_active: parse_obs_color(table, "replay_active", defaults.replay_active)?,
+        replay_inactive: parse_obs_color(table, "replay_inactive", defaults.replay_inactive)?,
     })
 }
 
@@ -862,6 +890,26 @@ mod tests {
     }
 
     #[test]
+    fn test_obs_paused_use_breath() {
+        let config = parse_config(
+            r#"
+            [obs]
+            paused_use_breath = true
+            "#,
+        )
+        .unwrap();
+        assert!(config.obs.unwrap().paused_use_breath);
+
+        let config = parse_config(
+            r#"
+            [obs]
+            "#,
+        )
+        .unwrap();
+        assert!(!config.obs.unwrap().paused_use_breath);
+    }
+
+    #[test]
     fn test_obs_start_replay_buffer_must_be_bool() {
         let result = parse_config(
             r#"
@@ -871,6 +919,25 @@ mod tests {
         );
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("boolean"));
+    }
+
+    #[test]
+    fn test_obs_idle_and_replay_colors() {
+        let config = parse_config(
+            r##"
+            [obs]
+
+            [obs.colors]
+            idle_panel = "#101020"
+            replay_active = "#10FF10"
+            replay_inactive = "#330000"
+            "##,
+        )
+        .unwrap();
+        let colors = config.obs.unwrap().colors;
+        assert_eq!(colors.idle_panel, RgbColor { r: 0x10, g: 0x10, b: 0x20 });
+        assert_eq!(colors.replay_active, RgbColor { r: 0x10, g: 0xFF, b: 0x10 });
+        assert_eq!(colors.replay_inactive, RgbColor { r: 0x33, g: 0x00, b: 0x00 });
     }
 
     #[test]

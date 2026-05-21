@@ -218,6 +218,12 @@ start_replay_buffer = false   # optional, default false; if true, pcp_rust start
                               # running. Does not monitor or re-enable the buffer
                               # during a live session — if you stop it via OBS,
                               # it stays stopped until pcp_rust reconnects.
+paused_use_breath = false     # optional, default false. If true, paused
+                              # renders as a global breath animation (every
+                              # LED including the logo, so the replay-buffer
+                              # indicator is unavailable during paused). If
+                              # false, paused is a solid color and the logo
+                              # keeps its replay-buffer indicator.
 ```
 
 pcp_rust connects on startup and reconnects automatically (with exponential backoff, max ~30s) when OBS isn't running, restarts, or crashes. While disconnected, OBS action buttons produce an error flash.
@@ -256,23 +262,32 @@ action = "obs-split-recording"
 
 When `[obs]` is configured, the LEDs follow OBS state:
 
-| OBS state | LEDs |
-|---|---|
-| Idle (or OBS disconnected) | Your `[rgb]` mode (or all off if `[rgb]` is omitted) |
-| Recording active | Solid red (configurable) on every region |
-| Recording paused | Breathing amber (configurable hue) |
-| Any command succeeded | Brief green flash, then revert to current state |
-| Any command failed | Brief magenta flash, then revert |
+| OBS state | Panel (knobs/sliders/labels) | Logo |
+|---|---|---|
+| OBS disconnected | Your `[rgb]` mode (or off if omitted) | follows `[rgb]` |
+| OBS connected, idle | Solid `idle_panel` color (configurable) | green if replay buffer running, off if stopped |
+| Recording active | Solid red (configurable) | red |
+| Recording paused | Solid amber (configurable); breath if `paused_use_breath = true` | green if replay buffer running (or joins breath in `paused_use_breath` mode — hardware limit) |
+| Any command succeeded | Brief green flash | green |
+| Any command failed | Brief magenta blink | magenta blink |
+
+The split between "disconnected → `[rgb]`" and "connected → status display" is deliberate: while OBS isn't running, pcp_rust behaves as if OBS doesn't exist; once OBS is up, the panel switches to a dashboard-style appearance with the logo as a glanceable replay-buffer indicator.
 
 `[obs.colors]` lets you override these colors:
 
 ```toml
 [obs.colors]
-recording = "#FF0000"           # solid color while recording
-recording_paused = "#FFC000"    # color for the paused breath effect (hue derived from this)
+recording = "#500000"           # solid color while recording
+recording_paused = "#FFC000"    # paused color; used as full RGB for the solid panel, or as
+                                # the hue source if paused_use_breath = true (the breath
+                                # effect takes only a single hue byte)
 success_flash = "#00FF00"       # flash on successful OBS commands
-error_flash = "#FF00FF"         # flash on failed OBS commands
+error_flash = "#FF00FF"         # blinking flash on failed OBS commands
 flash_duration_ms = 500         # how long each flash stays before reverting
+
+idle_panel = "#202020"          # panel color when OBS is connected and idle
+replay_active = "#00FF00"       # logo color when replay buffer is running
+replay_inactive = "#000000"     # logo color when replay buffer is stopped (off = invisible)
 ```
 
 Static effects (solid, gradient, volume-gradient) and the `recording` / flash colors take full hex; the paused color's hue is derived from the hex (saturation and brightness are managed by the breath effect itself).

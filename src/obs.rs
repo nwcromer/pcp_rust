@@ -48,6 +48,10 @@ pub enum ObsEvent {
     RecordingPaused,
     /// Recording resumed from paused (active, not paused).
     RecordingResumed,
+    /// Replay buffer is running and accepting frames.
+    ReplayBufferActive,
+    /// Replay buffer is stopped.
+    ReplayBufferInactive,
     /// An OBS command completed successfully.
     CommandSucceeded(ObsCommand),
     /// An OBS command failed (e.g., OBS rejected it or we're disconnected).
@@ -101,11 +105,8 @@ async fn obs_main_loop(
     mut cmd_rx: UnboundedReceiver<ObsCommand>,
     event_tx: UnboundedSender<ObsEvent>,
 ) {
-    info!("OBS: attempting to connect to {}:{}", config.host, config.port);
+    debug!("OBS: connecting to {}:{}", config.host, config.port);
     let mut backoff = BACKOFF_INITIAL_SECS;
-    // Log the first failure at info so the user knows the loop is alive;
-    // subsequent retries log at debug to avoid filling the journal.
-    let mut first_failure_logged = false;
 
     loop {
         match try_connect(&config).await {
@@ -113,12 +114,11 @@ async fn obs_main_loop(
                 info!("OBS: connected to {}:{}", config.host, config.port);
                 let _ = event_tx.send(ObsEvent::Connected);
                 backoff = BACKOFF_INITIAL_SECS;
-                first_failure_logged = false;
 
                 // Run the session until the connection drops or the main
                 // thread closes the command channel.
                 if let Err(e) = run_session(&client, &config, &mut cmd_rx, &event_tx).await {
-                    warn!("OBS: session ended: {e}");
+                    info!("OBS: disconnected ({e})");
                 }
 
                 let _ = event_tx.send(ObsEvent::Disconnected);
@@ -126,12 +126,7 @@ async fn obs_main_loop(
                 // had a working connection, so reconnect attempt is cheap).
             }
             Err(e) => {
-                if !first_failure_logged {
-                    info!("OBS: connect failed ({e}); will keep retrying in background");
-                    first_failure_logged = true;
-                } else {
-                    debug!("OBS: connect failed ({e}); retrying in {backoff}s");
-                }
+                debug!("OBS: connect failed ({e}); retrying in {backoff}s");
                 sleep(Duration::from_secs(backoff)).await;
                 backoff = (backoff * 2).min(BACKOFF_MAX_SECS);
             }
@@ -155,6 +150,15 @@ async fn run_session(
     cmd_rx: &mut UnboundedReceiver<ObsCommand>,
     event_tx: &UnboundedSender<ObsEvent>,
 ) -> Result<()> {
+    // Subscribe to the OBS event stream FIRST — before sending any commands
+    // or queries. obws's stream queues incoming events internally, so any
+    // state-change events fired by OBS during the rest of this setup (e.g.,
+    // ReplayBufferStateChanged when we start the buffer below) are captured
+    // and processed by the main loop once we enter it. Subscribing later
+    // would lose events fired between command completion and subscription.
+    let events = client.events()?;
+    tokio::pin!(events);
+
     // Publish initial recording state so the LEDs reflect reality immediately
     // after connection (without waiting for the first event).
     if let Ok(status) = client.recording().status().await {
@@ -169,29 +173,48 @@ async fn run_session(
         }
     }
 
-    // Optionally start the replay buffer if the user asked for it via config.
-    // This runs on EVERY successful connect — including reconnects after OBS
-    // restarts or network blips. During an active session we don't monitor or
-    // re-enable the buffer; if the user stops it via OBS, it stays stopped
-    // until the next reconnect.
-    if config.start_replay_buffer {
+    // Determine the replay-buffer state and optionally start it. Runs on EVERY
+    // successful connect, including reconnects. We don't monitor or re-enable
+    // during a session — if the user stops it via OBS, it stays stopped until
+    // the next reconnect.
+    //
+    // After a successful `start()` we know the buffer is active without
+    // needing another status query (which would race with OBS's internal
+    // state transition). If start fails, or we're not configured to start,
+    // we fall back to querying the current state.
+    let initial_replay_active: Option<bool> = if config.start_replay_buffer {
         match client.replay_buffer().status().await {
-            Ok(true) => info!("OBS: replay buffer already running"),
+            Ok(true) => {
+                info!("OBS: replay buffer already running");
+                Some(true)
+            }
             Ok(false) => match client.replay_buffer().start().await {
-                Ok(()) => info!("OBS: started replay buffer"),
-                Err(e) => warn!("OBS: failed to start replay buffer: {e}"),
+                Ok(()) => {
+                    info!("OBS: started replay buffer");
+                    Some(true)
+                }
+                Err(e) => {
+                    warn!("OBS: failed to start replay buffer: {e}");
+                    Some(false)
+                }
             },
-            Err(e) => warn!("OBS: failed to query replay buffer status: {e}"),
+            Err(e) => {
+                warn!("OBS: failed to query replay buffer status: {e}");
+                None
+            }
         }
+    } else {
+        client.replay_buffer().status().await.ok()
+    };
+    match initial_replay_active {
+        Some(true) => {
+            let _ = event_tx.send(ObsEvent::ReplayBufferActive);
+        }
+        Some(false) => {
+            let _ = event_tx.send(ObsEvent::ReplayBufferInactive);
+        }
+        None => {} // unknown — wait for next event to populate
     }
-
-    // Subscribe to the OBS event stream. Note: this happens *after* the
-    // replay-buffer start above, so a `ReplayBufferStateChanged` event fired
-    // by OBS between our `start()` returning and this `events()` call would
-    // be missed. Doesn't matter today because we don't handle that event,
-    // but if we ever do, subscribe before sending replay-buffer commands.
-    let events = client.events()?;
-    tokio::pin!(events);
 
     loop {
         tokio::select! {
@@ -237,10 +260,9 @@ async fn handle_command(
 
 fn handle_obs_event(event: obws::events::Event, event_tx: &UnboundedSender<ObsEvent>) {
     use obws::events::Event::*;
+    use obws::events::OutputState;
     match event {
         RecordStateChanged { active, state, .. } => {
-            // The OutputState enum has variants like Started, Stopped, Paused, Resumed, etc.
-            use obws::events::OutputState;
             match state {
                 OutputState::Started => {
                     let _ = event_tx.send(ObsEvent::RecordingActive);
@@ -262,6 +284,13 @@ fn handle_obs_event(event: obws::events::Event, event_tx: &UnboundedSender<ObsEv
                         let _ = event_tx.send(ObsEvent::RecordingStopped);
                     }
                 }
+            }
+        }
+        ReplayBufferStateChanged { active, .. } => {
+            if active {
+                let _ = event_tx.send(ObsEvent::ReplayBufferActive);
+            } else {
+                let _ = event_tx.send(ObsEvent::ReplayBufferInactive);
             }
         }
         // Other OBS events (StreamStateChanged, SceneItemTransformChanged,

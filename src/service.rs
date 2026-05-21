@@ -18,11 +18,21 @@ fn service_path() -> Result<PathBuf> {
 }
 
 fn binary_path() -> Result<String> {
-    std::env::current_exe()
+    let path = std::env::current_exe()
         .context("could not determine binary path")?
         .to_str()
         .map(String::from)
-        .context("binary path is not valid UTF-8")
+        .context("binary path is not valid UTF-8")?;
+    // We embed the path inside double-quotes in the systemd unit file; a
+    // literal `"` in the path would break the unit. Reject rather than
+    // attempt to escape (no real-world Linux install puts `"` in PATH).
+    if path.contains('"') {
+        bail!(
+            "binary path contains a double-quote character ({path:?}); \
+             move or rename the binary to a path without `\"`"
+        );
+    }
+    Ok(path)
 }
 
 fn generate_service_file(bin_path: &str) -> String {

@@ -297,16 +297,26 @@ struct ObsRuntime {
     state: ObsState,
     colors: ObsColors,
     flash: Option<Flash>,
+    /// Whether OBS's replay buffer is currently running. `None` until OBS
+    /// reports its state (during initial-status query on connect or via an
+    /// event). Reset to `None` on disconnect.
+    replay_buffer_active: Option<bool>,
+    /// Pulled from `ObsConfig.paused_use_breath`. When true, paused state
+    /// renders as a global breath animation; when false, solid color so
+    /// the logo can keep its replay-buffer indicator.
+    paused_use_breath: bool,
 }
 
 impl ObsRuntime {
-    fn new(handle: Option<ObsHandle>, colors: ObsColors) -> Self {
+    fn new(handle: Option<ObsHandle>, colors: ObsColors, paused_use_breath: bool) -> Self {
         Self {
             handle,
             connected: false,
             state: ObsState::Idle,
             colors,
             flash: None,
+            replay_buffer_active: None,
+            paused_use_breath,
         }
     }
 
@@ -333,13 +343,32 @@ impl ObsRuntime {
     fn apply_event(&mut self, event: ObsEvent) -> bool {
         match event {
             ObsEvent::Connected => {
+                // Dirty only on the actual transition. The first Connected
+                // event flips us out of `[rgb]` and into the OBS-connected
+                // appearance; a redundant Connected (shouldn't happen, but
+                // defensive) is a no-op.
+                let was_disconnected = !self.connected;
                 self.connected = true;
-                false
+                was_disconnected
+            }
+            ObsEvent::ReplayBufferActive => {
+                let changed = self.replay_buffer_active != Some(true);
+                self.replay_buffer_active = Some(true);
+                changed
+            }
+            ObsEvent::ReplayBufferInactive => {
+                let changed = self.replay_buffer_active != Some(false);
+                self.replay_buffer_active = Some(false);
+                changed
             }
             ObsEvent::Disconnected => {
                 self.connected = false;
-                // Disconnected behaves visually like Idle.
-                self.transition_to(ObsState::Idle)
+                self.replay_buffer_active = None;
+                // Disconnected behaves visually like Idle. Also force a
+                // repaint so we switch back to `[rgb]` mode from the
+                // OBS-connected-idle appearance.
+                let _ = self.transition_to(ObsState::Idle);
+                true
             }
             ObsEvent::RecordingActive | ObsEvent::RecordingResumed => {
                 self.transition_to(ObsState::Recording)
@@ -464,26 +493,92 @@ fn set_all_solid(panel: &PcPanelPro, c: RgbColor) -> Result<()> {
 
 /// Repaint the LEDs based on the current OBS state and any active flash.
 /// Flash takes precedence over state.
+///
+/// When OBS is connected, the logo is owned by replay-buffer status and
+/// stays on its indicator color across the recording / idle / paused /
+/// flash states. The one exception is `RecordingPaused` when
+/// `paused_use_breath` is set: that uses the device's global breath
+/// animation, which drives every LED including the logo, so the logo
+/// joins the breath in that mode.
+///
+/// When OBS is disconnected, the panel and logo follow the user's `[rgb]`
+/// mode together — pcp_rust pretends OBS doesn't exist.
 fn paint_leds(panel: &PcPanelPro, obs: &ObsRuntime, idle_rgb: Option<RgbMode>) -> Result<()> {
     if let Some(f) = obs.flash {
-        return set_all_solid(panel, f.current_color());
+        // Panel flashes; logo stays on its replay-buffer indicator when
+        // connected (so the user keeps glanceable replay state even during
+        // a flash). Disconnected flashes paint the logo too — there's
+        // no indicator to preserve.
+        paint_panel_solid(panel, f.current_color())?;
+        if obs.connected {
+            paint_logo_replay_status(panel, obs)?;
+        } else {
+            paint_logo_solid(panel, f.current_color())?;
+        }
+        return Ok(());
     }
     match obs.state {
+        ObsState::Idle if obs.connected => {
+            paint_panel_solid(panel, obs.colors.idle_panel)?;
+            paint_logo_replay_status(panel, obs)?;
+        }
         ObsState::Idle => match idle_rgb {
             Some(mode) => apply_rgb(panel, mode)?,
             None => set_all_solid(panel, RgbColor { r: 0, g: 0, b: 0 })?,
         },
-        ObsState::Recording => set_all_solid(panel, obs.colors.recording)?,
+        ObsState::Recording => {
+            paint_panel_solid(panel, obs.colors.recording)?;
+            paint_logo_replay_status(panel, obs)?;
+        }
         ObsState::RecordingPaused => {
-            let hue = led::rgb_to_hue(Rgb::new(
-                obs.colors.paused.r,
-                obs.colors.paused.g,
-                obs.colors.paused.b,
-            ));
-            led::set_breath(panel, hue, config::DEFAULT_BRIGHTNESS, config::DEFAULT_SPEED)?;
+            if obs.paused_use_breath {
+                // Global breath animation — drives every LED including the
+                // logo, so the replay-buffer indicator is unavailable during
+                // paused.
+                let hue = led::rgb_to_hue(Rgb::new(
+                    obs.colors.paused.r,
+                    obs.colors.paused.g,
+                    obs.colors.paused.b,
+                ));
+                led::set_breath(panel, hue, config::DEFAULT_BRIGHTNESS, config::DEFAULT_SPEED)?;
+            } else {
+                paint_panel_solid(panel, obs.colors.paused)?;
+                paint_logo_replay_status(panel, obs)?;
+            }
         }
     }
     Ok(())
+}
+
+/// Paint knobs/sliders/labels to one solid color. Leaves the logo alone.
+///
+/// The slider strips have no firmware mode that lights all LEDs uniformly.
+/// Two options exist and we picked the second:
+///   - `Static(c)` lights every LED but applies a bottom-bright/top-dim
+///     brightness ramp — washed-out appearance.
+///   - `Gradient(c, c)` renders the strip as a level meter: only LEDs
+///     below the physical slider position are lit, with uniform color.
+/// Gradient looks more deliberate (it reads as "your slider is at X")
+/// than Static's brightness ramp, so we use it.
+fn paint_panel_solid(panel: &PcPanelPro, c: RgbColor) -> Result<()> {
+    let rgb = Rgb::new(c.r, c.g, c.b);
+    let static_mode = LedMode::Static(rgb);
+    let uniform_slider = LedMode::Gradient(rgb, rgb);
+    led::set_knob_colors(panel, &[static_mode; 5])?;
+    led::set_slider_colors(panel, &[uniform_slider; 4])?;
+    led::set_slider_label_colors(panel, &[static_mode; 4])
+}
+
+fn paint_logo_solid(panel: &PcPanelPro, c: RgbColor) -> Result<()> {
+    led::set_logo(panel, LogoMode::Static(Rgb::new(c.r, c.g, c.b)))
+}
+
+fn paint_logo_replay_status(panel: &PcPanelPro, obs: &ObsRuntime) -> Result<()> {
+    let color = match obs.replay_buffer_active {
+        Some(true) => obs.colors.replay_active,
+        Some(false) | None => obs.colors.replay_inactive,
+    };
+    paint_logo_solid(panel, color)
 }
 
 fn run(cli: Cli) -> Result<()> {
@@ -508,7 +603,7 @@ fn run(cli: Cli) -> Result<()> {
     let mut audio = audio::AudioController::connect()?;
 
     info!("connecting to PCPanel Pro...");
-    let panel = PcPanelPro::open()?;
+    let mut panel = PcPanelPro::open()?;
 
     // Apply initial LED state. If [rgb] is omitted, turn all LEDs off and warn.
     if let Some(rgb_mode) = config.rgb {
@@ -534,7 +629,12 @@ fn run(cli: Cli) -> Result<()> {
         .as_ref()
         .map(|c| c.colors)
         .unwrap_or_default();
-    let mut obs = ObsRuntime::new(obs_handle, obs_colors);
+    let paused_use_breath = config
+        .obs
+        .as_ref()
+        .map(|c| c.paused_use_breath)
+        .unwrap_or(false);
+    let mut obs = ObsRuntime::new(obs_handle, obs_colors, paused_use_breath);
 
     // Monitor for system resume to re-apply LED state
     let resume_rx = spawn_resume_monitor();
@@ -549,6 +649,11 @@ fn run(cli: Cli) -> Result<()> {
             info!("system resumed from sleep, re-applying LED state");
             led_dirty = true;
         }
+
+        // Flush any deferred stream-restore persistence writes that have
+        // been idle long enough. Coalesces slider-scrub bursts into a
+        // single DB write per app.
+        audio.flush_persist_writes();
 
         // Read a panel event (may block ~100ms). Process before painting so
         // any button-triggered state changes (e.g., a local error flash from
@@ -590,14 +695,34 @@ fn handle_panel_event(
                 let pct = (value as f32 / 255.0 * 100.0) as u8;
                 let mut matched_apps: Vec<String> = Vec::new();
                 for app in apps {
+                    // PulseAudio errors here are logged and skipped, never
+                    // propagated. A transient PA hiccup (sleep/resume,
+                    // server reload) shouldn't kill the daemon and force
+                    // a systemd restart that loses OBS state + LED config.
                     let matched = if Action::is_system(app) {
-                        audio.set_system_volume(value)?;
-                        true
+                        match audio.set_system_volume(value) {
+                            Ok(()) => true,
+                            Err(e) => {
+                                warn!("audio: set system volume failed: {e}");
+                                false
+                            }
+                        }
                     } else if Action::is_mic(app) {
-                        audio.set_mic_volume(value)?;
-                        true
+                        match audio.set_mic_volume(value) {
+                            Ok(()) => true,
+                            Err(e) => {
+                                warn!("audio: set mic volume failed: {e}");
+                                false
+                            }
+                        }
                     } else {
-                        audio.set_app_volume(app, value)?
+                        match audio.set_app_volume(app, value) {
+                            Ok(m) => m,
+                            Err(e) => {
+                                warn!("audio: set volume for {app} failed: {e}");
+                                false
+                            }
+                        }
                     };
                     if matched {
                         matched_apps.push(app.clone());
@@ -631,24 +756,40 @@ fn handle_panel_event(
             match config.mappings.get(&control_id) {
                 Some(Action::ToggleMute { apps, icon }) => {
                     for app in apps {
+                        // Same policy as the volume branch: PA errors log
+                        // and are skipped, never propagated.
                         if Action::is_system(app) {
-                            let muted = audio.toggle_system_mute()?;
-                            if cli.verbose {
-                                println!("System mute: {}", if muted { "on" } else { "off" });
+                            match audio.toggle_system_mute() {
+                                Ok(muted) => {
+                                    if cli.verbose {
+                                        println!("System mute: {}", if muted { "on" } else { "off" });
+                                    }
+                                    osd::show_mute("System", muted);
+                                }
+                                Err(e) => warn!("audio: toggle system mute failed: {e}"),
                             }
-                            osd::show_mute("System", muted);
                         } else if Action::is_mic(app) {
-                            let muted = audio.toggle_mic_mute()?;
-                            if cli.verbose {
-                                println!("Mic mute: {}", if muted { "on" } else { "off" });
+                            match audio.toggle_mic_mute() {
+                                Ok(muted) => {
+                                    if cli.verbose {
+                                        println!("Mic mute: {}", if muted { "on" } else { "off" });
+                                    }
+                                    osd::show_mic_mute(muted);
+                                }
+                                Err(e) => warn!("audio: toggle mic mute failed: {e}"),
                             }
-                            osd::show_mic_mute(muted);
-                        } else if let Some(muted) = audio.toggle_app_mute(app)? {
-                            if cli.verbose {
-                                println!("{app} mute: {}", if muted { "on" } else { "off" });
+                        } else {
+                            match audio.toggle_app_mute(app) {
+                                Ok(Some(muted)) => {
+                                    if cli.verbose {
+                                        println!("{app} mute: {}", if muted { "on" } else { "off" });
+                                    }
+                                    let icon_name = icons::resolve_mute(icon.as_deref(), apps, muted);
+                                    osd::show_text(&icon_name, &format!("{app}: {}", if muted { "Muted" } else { "Unmuted" }));
+                                }
+                                Ok(None) => {} // app not running, skip silently
+                                Err(e) => warn!("audio: toggle mute for {app} failed: {e}"),
                             }
-                            let icon_name = icons::resolve_mute(icon.as_deref(), apps, muted);
-                            osd::show_text(&icon_name, &format!("{app}: {}", if muted { "Muted" } else { "Unmuted" }));
                         }
                     }
                 }
@@ -733,5 +874,55 @@ mod tests {
         let t0 = Instant::now();
         let f = blink(t0);
         assert_eq!(f.current_color_at(t0 - Duration::from_millis(50)), RED);
+    }
+
+    fn fresh_runtime() -> ObsRuntime {
+        ObsRuntime::new(None, ObsColors::default(), false)
+    }
+
+    #[test]
+    fn apply_replay_buffer_state_transitions() {
+        let mut obs = fresh_runtime();
+        assert_eq!(obs.replay_buffer_active, None);
+
+        // First Active: None → Some(true), dirty.
+        assert!(obs.apply_event(ObsEvent::ReplayBufferActive));
+        assert_eq!(obs.replay_buffer_active, Some(true));
+
+        // Redundant Active: no change, not dirty.
+        assert!(!obs.apply_event(ObsEvent::ReplayBufferActive));
+        assert_eq!(obs.replay_buffer_active, Some(true));
+
+        // Inactive: Some(true) → Some(false), dirty.
+        assert!(obs.apply_event(ObsEvent::ReplayBufferInactive));
+        assert_eq!(obs.replay_buffer_active, Some(false));
+
+        // Redundant Inactive: no change, not dirty.
+        assert!(!obs.apply_event(ObsEvent::ReplayBufferInactive));
+    }
+
+    #[test]
+    fn apply_disconnect_resets_replay_state_and_is_dirty() {
+        let mut obs = fresh_runtime();
+        obs.apply_event(ObsEvent::Connected);
+        obs.apply_event(ObsEvent::ReplayBufferActive);
+        assert_eq!(obs.replay_buffer_active, Some(true));
+
+        // Disconnect always repaints (we need to drop OBS-connected
+        // appearance back to `[rgb]`) and clears the replay-buffer state.
+        assert!(obs.apply_event(ObsEvent::Disconnected));
+        assert_eq!(obs.replay_buffer_active, None);
+        assert!(!obs.connected);
+    }
+
+    #[test]
+    fn apply_connected_dirty_only_on_transition() {
+        let mut obs = fresh_runtime();
+        // First Connected: false → true, dirty.
+        assert!(obs.apply_event(ObsEvent::Connected));
+        assert!(obs.connected);
+
+        // Redundant Connected: already true, not dirty.
+        assert!(!obs.apply_event(ObsEvent::Connected));
     }
 }
