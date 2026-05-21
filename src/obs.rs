@@ -13,6 +13,7 @@ use anyhow::Result;
 use log::{debug, info, warn};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::time::sleep;
+use tokio_stream::StreamExt;
 
 use crate::config::ObsConfig;
 
@@ -59,12 +60,15 @@ pub struct ObsHandle {
 }
 
 /// Spawn the OBS background thread and return channels for the main thread
-/// to interact with it.
-pub fn spawn_obs_thread(config: ObsConfig) -> ObsHandle {
+/// to interact with it. Returns `None` if the OS won't let us spawn the
+/// thread (extreme resource exhaustion) — callers treat that the same as
+/// "no [obs] configured": OBS actions error-flash, audio control keeps
+/// working.
+pub fn spawn_obs_thread(config: ObsConfig) -> Option<ObsHandle> {
     let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel::<ObsCommand>();
     let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel::<ObsEvent>();
 
-    std::thread::Builder::new()
+    let spawn_result = std::thread::Builder::new()
         .name("pcp-obs".into())
         .spawn(move || {
             let rt = match tokio::runtime::Builder::new_current_thread()
@@ -78,10 +82,15 @@ pub fn spawn_obs_thread(config: ObsConfig) -> ObsHandle {
                 }
             };
             rt.block_on(obs_main_loop(config, cmd_rx, event_tx));
-        })
-        .expect("failed to spawn OBS thread");
+        });
 
-    ObsHandle { commands_tx: cmd_tx, events_rx: event_rx }
+    match spawn_result {
+        Ok(_) => Some(ObsHandle { commands_tx: cmd_tx, events_rx: event_rx }),
+        Err(e) => {
+            warn!("failed to spawn OBS thread: {e}; OBS integration disabled");
+            None
+        }
+    }
 }
 
 const BACKOFF_INITIAL_SECS: u64 = 2;
@@ -160,7 +169,6 @@ async fn run_session(
     }
 
     // Subscribe to the OBS event stream.
-    use tokio_stream::StreamExt;
     let events = client.events()?;
     tokio::pin!(events);
 
@@ -235,6 +243,11 @@ fn handle_obs_event(event: obws::events::Event, event_tx: &UnboundedSender<ObsEv
                 }
             }
         }
-        _ => {} // Other events ignored
+        // Other OBS events (StreamStateChanged, SceneItemTransformChanged,
+        // ReplayBufferSaved with the saved filename, etc.) are ignored.
+        // If we ever want to surface the replay-buffer-saved file path or
+        // react to stream state, add match arms here and map them to new
+        // ObsEvent variants.
+        _ => {}
     }
 }

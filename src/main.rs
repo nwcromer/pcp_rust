@@ -234,6 +234,155 @@ struct Flash {
     expires_at: Instant,
 }
 
+fn start_flash(color: RgbColor, duration_ms: u64) -> Flash {
+    Flash {
+        color,
+        expires_at: Instant::now() + Duration::from_millis(duration_ms),
+    }
+}
+
+/// All OBS-related state owned by the main thread: the handle to the OBS
+/// thread, the connection flag, the current recording state, the configured
+/// colors, and any active flash overlay. Bundling them avoids threading a
+/// long parameter list through `dispatch_obs` and `handle_panel_event`.
+struct ObsRuntime {
+    handle: Option<ObsHandle>,
+    connected: bool,
+    state: ObsState,
+    colors: ObsColors,
+    flash: Option<Flash>,
+}
+
+impl ObsRuntime {
+    fn new(handle: Option<ObsHandle>, colors: ObsColors) -> Self {
+        Self {
+            handle,
+            connected: false,
+            state: ObsState::Idle,
+            colors,
+            flash: None,
+        }
+    }
+
+    /// Drain pending events from the OBS thread. Returns `true` if any
+    /// event changed something that requires a LED repaint.
+    fn drain_events(&mut self) -> bool {
+        let mut dirty = false;
+        while let Some(event) = self.next_event() {
+            dirty |= self.apply_event(event);
+        }
+        dirty
+    }
+
+    /// Try to receive one event from the OBS thread without blocking.
+    /// Returns `None` if there's no event ready or no OBS thread.
+    fn next_event(&mut self) -> Option<ObsEvent> {
+        self.handle
+            .as_mut()
+            .and_then(|h| h.events_rx.try_recv().ok())
+    }
+
+    /// Apply a single event to the runtime's state. Returns `true` if the
+    /// LEDs need a repaint as a result.
+    fn apply_event(&mut self, event: ObsEvent) -> bool {
+        match event {
+            ObsEvent::Connected => {
+                self.connected = true;
+                false
+            }
+            ObsEvent::Disconnected => {
+                self.connected = false;
+                // Disconnected behaves visually like Idle.
+                self.transition_to(ObsState::Idle)
+            }
+            ObsEvent::RecordingActive | ObsEvent::RecordingResumed => {
+                self.transition_to(ObsState::Recording)
+            }
+            ObsEvent::RecordingPaused => self.transition_to(ObsState::RecordingPaused),
+            ObsEvent::RecordingStopped => self.transition_to(ObsState::Idle),
+            ObsEvent::CommandSucceeded(cmd) => {
+                info!("OBS: {} succeeded", cmd.label());
+                // Skip the success flash for commands whose effect is
+                // already visible on the LEDs via a state change.
+                // Save Replay and Split Recording cause no visible state
+                // change, so they still get the flash as the only
+                // acknowledgement.
+                let visibly_changes_state = matches!(
+                    cmd,
+                    ObsCommand::ToggleRecording | ObsCommand::PauseRecording
+                );
+                if visibly_changes_state {
+                    false
+                } else {
+                    self.set_flash(self.colors.success_flash);
+                    true
+                }
+            }
+            ObsEvent::CommandFailed(cmd, msg) => {
+                warn!("OBS command failed ({}): {msg}", cmd.label());
+                self.set_flash(self.colors.error_flash);
+                true
+            }
+        }
+    }
+
+    /// Move to a new recording state. Returns `true` if the state actually
+    /// changed (and the LEDs need a repaint).
+    fn transition_to(&mut self, new_state: ObsState) -> bool {
+        if self.state != new_state {
+            self.state = new_state;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Set the current flash overlay using the configured duration.
+    fn set_flash(&mut self, color: RgbColor) {
+        self.flash = Some(start_flash(color, self.colors.flash_duration_ms));
+    }
+
+    /// Clear any expired flash. Returns `true` if a flash just expired and
+    /// the LEDs need a repaint.
+    fn expire_flash(&mut self) -> bool {
+        match self.flash {
+            Some(f) if Instant::now() >= f.expires_at => {
+                self.flash = None;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Send a command to the OBS thread. Returns `true` if the LEDs need a
+    /// repaint (a local error flash was set because OBS is unreachable).
+    fn dispatch(&mut self, cmd: ObsCommand, verbose: bool) -> bool {
+        if verbose {
+            println!("OBS: {}", cmd.label());
+        }
+        let send_result = match &self.handle {
+            Some(h) if self.connected => h.commands_tx.send(cmd),
+            _ => {
+                // Either no [obs] in config (config validation rejects OBS
+                // actions when [obs] is absent, so this is normally only
+                // hit when OBS is disconnected) or the thread is gone.
+                warn!("OBS not connected — {} skipped", cmd.label());
+                self.set_flash(self.colors.error_flash);
+                return true;
+            }
+        };
+        if send_result.is_err() {
+            // Defensive: the OBS thread runs an infinite loop that owns
+            // cmd_rx for its entire lifetime, so this branch only fires if
+            // the runtime itself collapsed. Treated the same as disconnected.
+            warn!("OBS thread unreachable — {} skipped", cmd.label());
+            self.set_flash(self.colors.error_flash);
+            return true;
+        }
+        false
+    }
+}
+
 /// Set every LED region (knobs, sliders, slider labels, logo) to one solid color.
 fn set_all_solid(panel: &PcPanelPro, c: RgbColor) -> Result<()> {
     let rgb = Rgb::new(c.r, c.g, c.b);
@@ -245,93 +394,28 @@ fn set_all_solid(panel: &PcPanelPro, c: RgbColor) -> Result<()> {
     Ok(())
 }
 
-/// Convert an RGB color to a hue byte (0-255) for the device's breath/wave
-/// effects, which take only a hue value. Saturation and value information
-/// is discarded — only the dominant color wheel position is preserved.
-fn rgb_to_hue(c: RgbColor) -> u8 {
-    let r = c.r as f32 / 255.0;
-    let g = c.g as f32 / 255.0;
-    let b = c.b as f32 / 255.0;
-    let max = r.max(g).max(b);
-    let min = r.min(g).min(b);
-    let delta = max - min;
-    let hue_deg = if delta < 1e-6 {
-        0.0
-    } else if (max - r).abs() < 1e-6 {
-        60.0 * (((g - b) / delta).rem_euclid(6.0))
-    } else if (max - g).abs() < 1e-6 {
-        60.0 * (((b - r) / delta) + 2.0)
-    } else {
-        60.0 * (((r - g) / delta) + 4.0)
-    };
-    let hue_deg = if hue_deg < 0.0 { hue_deg + 360.0 } else { hue_deg };
-    ((hue_deg / 360.0 * 255.0).round() as u32).min(255) as u8
-}
-
 /// Repaint the LEDs based on the current OBS state and any active flash.
 /// Flash takes precedence over state.
-fn paint_leds(
-    panel: &PcPanelPro,
-    obs_state: ObsState,
-    flash: Option<Flash>,
-    idle_rgb: Option<RgbMode>,
-    colors: &ObsColors,
-) -> Result<()> {
-    if let Some(f) = flash {
+fn paint_leds(panel: &PcPanelPro, obs: &ObsRuntime, idle_rgb: Option<RgbMode>) -> Result<()> {
+    if let Some(f) = obs.flash {
         return set_all_solid(panel, f.color);
     }
-    match obs_state {
+    match obs.state {
         ObsState::Idle => match idle_rgb {
             Some(mode) => apply_rgb(panel, mode)?,
             None => set_all_solid(panel, RgbColor { r: 0, g: 0, b: 0 })?,
         },
-        ObsState::Recording => set_all_solid(panel, colors.recording)?,
+        ObsState::Recording => set_all_solid(panel, obs.colors.recording)?,
         ObsState::RecordingPaused => {
-            let hue = rgb_to_hue(colors.paused);
+            let hue = led::rgb_to_hue(Rgb::new(
+                obs.colors.paused.r,
+                obs.colors.paused.g,
+                obs.colors.paused.b,
+            ));
             led::set_breath(panel, hue, config::DEFAULT_BRIGHTNESS, config::DEFAULT_SPEED)?;
         }
     }
     Ok(())
-}
-
-fn start_flash(color: RgbColor, duration_ms: u64) -> Flash {
-    Flash {
-        color,
-        expires_at: Instant::now() + Duration::from_millis(duration_ms),
-    }
-}
-
-/// Send an OBS command to the OBS thread, or immediately produce an error
-/// flash if OBS is disconnected / not configured. Sets `led_dirty` if the
-/// LED state needs repainting (i.e., a local error flash was set).
-fn dispatch_obs(
-    cmd: ObsCommand,
-    handle: &Option<ObsHandle>,
-    connected: bool,
-    colors: &ObsColors,
-    flash: &mut Option<Flash>,
-    led_dirty: &mut bool,
-    verbose: bool,
-) {
-    if verbose {
-        println!("OBS: {}", cmd.label());
-    }
-    let send_result = match handle {
-        Some(h) if connected => h.commands_tx.send(cmd),
-        _ => {
-            // Either no [obs] in config (shouldn't happen — config validation
-            // rejects OBS actions when [obs] is absent) or OBS is disconnected.
-            warn!("OBS not connected — {} skipped", cmd.label());
-            *flash = Some(start_flash(colors.error_flash, colors.flash_duration_ms));
-            *led_dirty = true;
-            return;
-        }
-    };
-    if send_result.is_err() {
-        warn!("OBS thread is gone — {} skipped", cmd.label());
-        *flash = Some(start_flash(colors.error_flash, colors.flash_duration_ms));
-        *led_dirty = true;
-    }
 }
 
 fn run(cli: Cli) -> Result<()> {
@@ -366,101 +450,31 @@ fn run(cli: Cli) -> Result<()> {
         set_all_solid(&panel, RgbColor { r: 0, g: 0, b: 0 })?;
     }
 
-    // Spawn the OBS background thread if [obs] is configured.
-    let mut obs_handle: Option<ObsHandle> = config
+    // Spawn the OBS background thread if [obs] is configured. spawn_obs_thread
+    // itself returns Option (None if the thread can't be spawned), so we
+    // .and_then to flatten Option<Option<_>>.
+    let obs_handle: Option<ObsHandle> = config
         .obs
         .as_ref()
-        .map(|cfg| obs::spawn_obs_thread(cfg.clone()));
-    // Default colors when no [obs] is configured (only used to type-check
-    // paint_leds calls; the OBS code paths never fire without [obs]).
+        .and_then(|cfg| obs::spawn_obs_thread(cfg.clone()));
+    // ObsColors is always present so `paint_leds` and `ObsRuntime` have a
+    // value to read. When [obs] is absent, no OBS events fire and no OBS
+    // button dispatches happen, so the defaulted struct is never actually
+    // consulted — it just keeps the types simple.
     let obs_colors: ObsColors = config
         .obs
         .as_ref()
         .map(|c| c.colors)
         .unwrap_or_default();
-    let mut obs_state = ObsState::Idle;
-    let mut obs_connected = false;
-    let mut flash: Option<Flash> = None;
+    let mut obs = ObsRuntime::new(obs_handle, obs_colors);
 
     // Monitor for system resume to re-apply LED state
     let resume_rx = spawn_resume_monitor();
 
     info!("listening for events (Ctrl+C to quit)...");
     loop {
-        let mut led_dirty = false;
-
-        // Drain OBS events (non-blocking).
-        if let Some(ref mut h) = obs_handle {
-            while let Ok(event) = h.events_rx.try_recv() {
-                match event {
-                    ObsEvent::Connected => {
-                        obs_connected = true;
-                    }
-                    ObsEvent::Disconnected => {
-                        obs_connected = false;
-                        // Disconnected behaves visually like Idle.
-                        if obs_state != ObsState::Idle {
-                            obs_state = ObsState::Idle;
-                            led_dirty = true;
-                        }
-                    }
-                    ObsEvent::RecordingActive | ObsEvent::RecordingResumed => {
-                        if obs_state != ObsState::Recording {
-                            obs_state = ObsState::Recording;
-                            led_dirty = true;
-                        }
-                    }
-                    ObsEvent::RecordingPaused => {
-                        if obs_state != ObsState::RecordingPaused {
-                            obs_state = ObsState::RecordingPaused;
-                            led_dirty = true;
-                        }
-                    }
-                    ObsEvent::RecordingStopped => {
-                        if obs_state != ObsState::Idle {
-                            obs_state = ObsState::Idle;
-                            led_dirty = true;
-                        }
-                    }
-                    ObsEvent::CommandSucceeded(cmd) => {
-                        info!("OBS: {} succeeded", cmd.label());
-                        // Skip the success flash for commands whose effect is
-                        // already visible on the LEDs via a state change
-                        // (toggle-record flips Idle ↔ Recording, toggle-pause
-                        // flips Recording ↔ Paused). Save Replay and Split
-                        // Record cause no visible state change, so they still
-                        // get the flash as the only acknowledgement.
-                        let visibly_changes_state = matches!(
-                            cmd,
-                            ObsCommand::ToggleRecording | ObsCommand::PauseRecording
-                        );
-                        if !visibly_changes_state {
-                            flash = Some(start_flash(
-                                obs_colors.success_flash,
-                                obs_colors.flash_duration_ms,
-                            ));
-                            led_dirty = true;
-                        }
-                    }
-                    ObsEvent::CommandFailed(cmd, msg) => {
-                        warn!("OBS command failed ({}): {msg}", cmd.label());
-                        flash = Some(start_flash(
-                            obs_colors.error_flash,
-                            obs_colors.flash_duration_ms,
-                        ));
-                        led_dirty = true;
-                    }
-                }
-            }
-        }
-
-        // Check flash expiry.
-        if let Some(f) = flash {
-            if Instant::now() >= f.expires_at {
-                flash = None;
-                led_dirty = true;
-            }
-        }
+        let mut led_dirty = obs.drain_events();
+        led_dirty |= obs.expire_flash();
 
         // Check for resume signal — repaint everything from current state.
         if resume_rx.try_recv().is_ok() {
@@ -470,25 +484,19 @@ fn run(cli: Cli) -> Result<()> {
 
         // Read a panel event (may block ~100ms). Process before painting so
         // any button-triggered state changes (e.g., a local error flash from
-        // dispatch_obs when OBS is disconnected) get painted this iteration.
+        // a dispatch when OBS is disconnected) get painted this iteration.
         if let Some(event) = panel.read_event()? {
-            handle_panel_event(
-                event,
-                &cli,
-                &config,
-                &mut audio,
-                &obs_handle,
-                obs_connected,
-                &obs_colors,
-                &mut flash,
-                &mut led_dirty,
-            )?;
+            led_dirty |= handle_panel_event(event, &cli, &config, &mut audio, &mut obs)?;
         }
 
         // Repaint LEDs if anything changed (OBS event, flash expiry, resume,
-        // or button-press-induced flash).
+        // or button-press-induced flash). LED-write failures are logged and
+        // swallowed — they shouldn't kill the main loop. If one of the four
+        // region writes inside paint_leds fails, the remaining ones are
+        // skipped for this iteration but will be retried on the next dirty
+        // repaint.
         if led_dirty {
-            if let Err(e) = paint_leds(&panel, obs_state, flash, config.rgb, &obs_colors) {
+            if let Err(e) = paint_leds(&panel, &obs, config.rgb) {
                 warn!("failed to repaint LEDs: {e}");
             }
         }
@@ -500,12 +508,9 @@ fn handle_panel_event(
     cli: &Cli,
     config: &config::Config,
     audio: &mut audio::AudioController,
-    obs_handle: &Option<ObsHandle>,
-    obs_connected: bool,
-    obs_colors: &ObsColors,
-    flash: &mut Option<Flash>,
-    led_dirty: &mut bool,
-) -> Result<()> {
+    obs: &mut ObsRuntime,
+) -> Result<bool> {
+    let mut led_dirty = false;
     match event {
         Event::AnalogChange { control, value } => {
             let control_id = match control {
@@ -579,46 +584,22 @@ fn handle_panel_event(
                         }
                     }
                 }
-                Some(Action::ObsSaveReplay) => dispatch_obs(
-                    ObsCommand::SaveReplay,
-                    obs_handle,
-                    obs_connected,
-                    obs_colors,
-                    flash,
-                    led_dirty,
-                    cli.verbose,
-                ),
-                Some(Action::ObsToggleRecording) => dispatch_obs(
-                    ObsCommand::ToggleRecording,
-                    obs_handle,
-                    obs_connected,
-                    obs_colors,
-                    flash,
-                    led_dirty,
-                    cli.verbose,
-                ),
-                Some(Action::ObsPauseRecording) => dispatch_obs(
-                    ObsCommand::PauseRecording,
-                    obs_handle,
-                    obs_connected,
-                    obs_colors,
-                    flash,
-                    led_dirty,
-                    cli.verbose,
-                ),
-                Some(Action::ObsSplitRecording) => dispatch_obs(
-                    ObsCommand::SplitRecording,
-                    obs_handle,
-                    obs_connected,
-                    obs_colors,
-                    flash,
-                    led_dirty,
-                    cli.verbose,
-                ),
+                Some(Action::ObsSaveReplay) => {
+                    led_dirty |= obs.dispatch(ObsCommand::SaveReplay, cli.verbose);
+                }
+                Some(Action::ObsToggleRecording) => {
+                    led_dirty |= obs.dispatch(ObsCommand::ToggleRecording, cli.verbose);
+                }
+                Some(Action::ObsPauseRecording) => {
+                    led_dirty |= obs.dispatch(ObsCommand::PauseRecording, cli.verbose);
+                }
+                Some(Action::ObsSplitRecording) => {
+                    led_dirty |= obs.dispatch(ObsCommand::SplitRecording, cli.verbose);
+                }
                 _ => {}
             }
         }
         Event::ButtonRelease { .. } => {}
     }
-    Ok(())
+    Ok(led_dirty)
 }

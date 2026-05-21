@@ -215,6 +215,8 @@ password = "secret"  # optional; omit or leave empty if OBS auth is disabled
 
 pcp_rust connects on startup and reconnects automatically (with exponential backoff, max ~30s) when OBS isn't running, restarts, or crashes. While disconnected, OBS action buttons produce an error flash.
 
+The `password` is stored in plain text in `config.toml`. The file lives under your config directory (`~/.config/pcpanel/`) with default user-only permissions, and obs-websocket is normally bound to localhost, so this is a personal-machine convenience rather than a transport concern — but worth knowing.
+
 #### Action types
 
 Four new action types, button-only:
