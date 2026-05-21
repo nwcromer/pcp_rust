@@ -15,6 +15,10 @@ log = "0.4"
 env_logger = "0.11"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
+# OBS Studio integration via obs-websocket v5
+obws = { version = "0.14", features = ["events"] }
+tokio = { version = "1", features = ["rt", "macros", "sync", "time", "net", "io-util"] }
+tokio-stream = "0.1"
 
 # Patches libpulse-binding and libpulse-sys to a fork that fixes the
 # ext_stream_restore write() transmute bug. Submitted upstream as PR #66

@@ -11,6 +11,10 @@ const MIC_APP: &str = "mic";
 pub enum Action {
     Volume { apps: Vec<String>, icon: Option<String> },
     ToggleMute { apps: Vec<String>, icon: Option<String> },
+    ObsSaveReplay,
+    ObsToggleRecording,
+    ObsPauseRecording,
+    ObsSplitRecording,
 }
 
 impl Action {
@@ -20,6 +24,16 @@ impl Action {
 
     pub fn is_mic(app: &str) -> bool {
         app.eq_ignore_ascii_case(MIC_APP)
+    }
+
+    pub fn is_obs(&self) -> bool {
+        matches!(
+            self,
+            Action::ObsSaveReplay
+                | Action::ObsToggleRecording
+                | Action::ObsPauseRecording
+                | Action::ObsSplitRecording
+        )
     }
 }
 
@@ -63,6 +77,36 @@ pub enum RgbMode {
 pub struct Config {
     pub mappings: HashMap<ControlId, Action>,
     pub rgb: Option<RgbMode>,
+    pub obs: Option<ObsConfig>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ObsConfig {
+    pub host: String,
+    pub port: u16,
+    pub password: Option<String>,
+    pub colors: ObsColors,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ObsColors {
+    pub recording: RgbColor,
+    pub paused: RgbColor,
+    pub success_flash: RgbColor,
+    pub error_flash: RgbColor,
+    pub flash_duration_ms: u64,
+}
+
+impl Default for ObsColors {
+    fn default() -> Self {
+        Self {
+            recording: RgbColor { r: 0xFF, g: 0x00, b: 0x00 },
+            paused: RgbColor { r: 0xFF, g: 0xC0, b: 0x00 },
+            success_flash: RgbColor { r: 0x00, g: 0xFF, b: 0x00 },
+            error_flash: RgbColor { r: 0xFF, g: 0x00, b: 0xFF },
+            flash_duration_ms: 500,
+        }
+    }
 }
 
 pub fn default_config_path() -> Option<PathBuf> {
@@ -254,13 +298,98 @@ fn parse_action(key: &str, table: &toml::value::Table) -> Result<Action> {
         .and_then(|v| v.as_str())
         .with_context(|| format!("[{key}] missing \"action\" field"))?;
 
-    let apps = parse_apps(key, table)?;
-    let icon = table.get("icon").and_then(|v| v.as_str()).map(String::from);
-
     match action {
-        "volume" => Ok(Action::Volume { apps, icon }),
-        "toggle-mute" => Ok(Action::ToggleMute { apps, icon }),
+        "volume" => {
+            let apps = parse_apps(key, table)?;
+            let icon = table.get("icon").and_then(|v| v.as_str()).map(String::from);
+            Ok(Action::Volume { apps, icon })
+        }
+        "toggle-mute" => {
+            let apps = parse_apps(key, table)?;
+            let icon = table.get("icon").and_then(|v| v.as_str()).map(String::from);
+            Ok(Action::ToggleMute { apps, icon })
+        }
+        "obs-save-replay" => Ok(Action::ObsSaveReplay),
+        "obs-toggle-recording" => Ok(Action::ObsToggleRecording),
+        "obs-pause-recording" => Ok(Action::ObsPauseRecording),
+        "obs-split-recording" => Ok(Action::ObsSplitRecording),
         _ => bail!("[{key}] unknown action: \"{action}\""),
+    }
+}
+
+fn parse_obs_section(table: &toml::value::Table) -> Result<ObsConfig> {
+    let host = table
+        .get("host")
+        .and_then(|v| v.as_str())
+        .unwrap_or("localhost")
+        .to_string();
+    let port = match table.get("port") {
+        None => 4455,
+        Some(v) => {
+            let n = v
+                .as_integer()
+                .context("[obs] \"port\" must be an integer (1-65535)")?;
+            if !(1..=65535).contains(&n) {
+                bail!("[obs] \"port\" must be in 1-65535, got {n}");
+            }
+            n as u16
+        }
+    };
+    let password = table
+        .get("password")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+
+    let colors = match table.get("colors") {
+        None => ObsColors::default(),
+        Some(toml::Value::Table(t)) => parse_obs_colors(t)?,
+        Some(_) => bail!("[obs.colors] must be a table"),
+    };
+
+    Ok(ObsConfig { host, port, password, colors })
+}
+
+fn parse_obs_colors(table: &toml::value::Table) -> Result<ObsColors> {
+    let defaults = ObsColors::default();
+    Ok(ObsColors {
+        recording: parse_obs_color(table, "recording", defaults.recording)?,
+        paused: parse_obs_color(table, "recording_paused", defaults.paused)?,
+        success_flash: parse_obs_color(table, "success_flash", defaults.success_flash)?,
+        error_flash: parse_obs_color(table, "error_flash", defaults.error_flash)?,
+        flash_duration_ms: parse_flash_duration(table, defaults.flash_duration_ms)?,
+    })
+}
+
+fn parse_obs_color(
+    table: &toml::value::Table,
+    field: &str,
+    default: RgbColor,
+) -> Result<RgbColor> {
+    match table.get(field) {
+        None => Ok(default),
+        Some(v) => {
+            let s = v
+                .as_str()
+                .with_context(|| format!("[obs.colors] \"{field}\" must be a hex color string"))?;
+            let (r, g, b) = parse_hex_color(s)?;
+            Ok(RgbColor { r, g, b })
+        }
+    }
+}
+
+fn parse_flash_duration(table: &toml::value::Table, default: u64) -> Result<u64> {
+    match table.get("flash_duration_ms") {
+        None => Ok(default),
+        Some(v) => {
+            let n = v
+                .as_integer()
+                .context("[obs.colors] \"flash_duration_ms\" must be a non-negative integer")?;
+            if n < 0 {
+                bail!("[obs.colors] \"flash_duration_ms\" must be non-negative, got {n}");
+            }
+            Ok(n as u64)
+        }
     }
 }
 
@@ -270,11 +399,20 @@ fn parse_config(content: &str) -> Result<Config> {
 
     let mut mappings = HashMap::new();
     let mut rgb = None;
+    let mut obs = None;
+    // Track which keys had OBS actions so we can produce a clear error
+    // if [obs] is missing — order of TOML iteration isn't guaranteed.
+    let mut obs_action_keys: Vec<String> = Vec::new();
 
     for (key, value) in &top {
         if key == "rgb" {
             let table = value.as_table().context("[rgb] must be a table")?;
             rgb = Some(parse_rgb_section(table)?);
+            continue;
+        }
+        if key == "obs" {
+            let table = value.as_table().context("[obs] must be a table")?;
+            obs = Some(parse_obs_section(table)?);
             continue;
         }
 
@@ -294,10 +432,27 @@ fn parse_config(content: &str) -> Result<Config> {
             bail!("[{key}] volume controls cannot be assigned to buttons");
         }
 
+        // Validate: OBS actions only on buttons
+        if action.is_obs() && !control.is_button() {
+            bail!("[{key}] OBS actions can only be assigned to buttons");
+        }
+
+        if action.is_obs() {
+            obs_action_keys.push(key.clone());
+        }
+
         mappings.insert(control, action);
     }
 
-    Ok(Config { mappings, rgb })
+    // Validate: any OBS action requires an [obs] section
+    if !obs_action_keys.is_empty() && obs.is_none() {
+        bail!(
+            "OBS actions configured on [{}] require an [obs] section",
+            obs_action_keys.join("], [")
+        );
+    }
+
+    Ok(Config { mappings, rgb, obs })
 }
 
 #[cfg(test)]
@@ -518,5 +673,168 @@ mod tests {
         );
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("hue"));
+    }
+
+    #[test]
+    fn test_obs_defaults() {
+        let config = parse_config(
+            r#"
+            [obs]
+            "#,
+        )
+        .unwrap();
+        let obs = config.obs.unwrap();
+        assert_eq!(obs.host, "localhost");
+        assert_eq!(obs.port, 4455);
+        assert!(obs.password.is_none());
+        let defaults = ObsColors::default();
+        assert_eq!(obs.colors.recording.r, defaults.recording.r);
+        assert_eq!(obs.colors.flash_duration_ms, defaults.flash_duration_ms);
+    }
+
+    #[test]
+    fn test_obs_full() {
+        let config = parse_config(
+            r##"
+            [obs]
+            host = "192.168.1.10"
+            port = 4456
+            password = "secret"
+
+            [obs.colors]
+            recording = "#AA0000"
+            recording_paused = "#FFAA00"
+            success_flash = "#00AA00"
+            error_flash = "#AA00AA"
+            flash_duration_ms = 250
+            "##,
+        )
+        .unwrap();
+        let obs = config.obs.unwrap();
+        assert_eq!(obs.host, "192.168.1.10");
+        assert_eq!(obs.port, 4456);
+        assert_eq!(obs.password.as_deref(), Some("secret"));
+        assert_eq!(obs.colors.recording.r, 0xAA);
+        assert_eq!(obs.colors.paused.g, 0xAA);
+        assert_eq!(obs.colors.flash_duration_ms, 250);
+    }
+
+    #[test]
+    fn test_obs_action_on_knob_rejected() {
+        let result = parse_config(
+            r#"
+            [obs]
+
+            [knob1]
+            action = "obs-save-replay"
+            "#,
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("buttons"));
+    }
+
+    #[test]
+    fn test_all_obs_actions_on_knob_rejected() {
+        for action in [
+            "obs-save-replay",
+            "obs-toggle-recording",
+            "obs-pause-recording",
+            "obs-split-recording",
+        ] {
+            let cfg = format!(
+                r#"
+                [obs]
+
+                [knob1]
+                action = "{action}"
+                "#
+            );
+            let result = parse_config(&cfg);
+            assert!(result.is_err(), "{action} on knob should be rejected");
+            assert!(
+                result.unwrap_err().to_string().contains("buttons"),
+                "{action} on knob error should mention buttons"
+            );
+        }
+    }
+
+    #[test]
+    fn test_all_obs_actions_on_slider_rejected() {
+        for action in [
+            "obs-save-replay",
+            "obs-toggle-recording",
+            "obs-pause-recording",
+            "obs-split-recording",
+        ] {
+            let cfg = format!(
+                r#"
+                [obs]
+
+                [slider1]
+                action = "{action}"
+                "#
+            );
+            let result = parse_config(&cfg);
+            assert!(result.is_err(), "{action} on slider should be rejected");
+            assert!(
+                result.unwrap_err().to_string().contains("buttons"),
+                "{action} on slider error should mention buttons"
+            );
+        }
+    }
+
+    #[test]
+    fn test_obs_action_without_obs_section_rejected() {
+        let result = parse_config(
+            r#"
+            [button1]
+            action = "obs-save-replay"
+            "#,
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("[obs]"));
+    }
+
+    #[test]
+    fn test_obs_actions_on_buttons_ok() {
+        let config = parse_config(
+            r#"
+            [obs]
+
+            [button1]
+            action = "obs-save-replay"
+
+            [button2]
+            action = "obs-toggle-recording"
+
+            [button3]
+            action = "obs-pause-recording"
+
+            [button4]
+            action = "obs-split-recording"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(config.mappings.len(), 4);
+        assert!(matches!(
+            config.mappings.get(&ControlId::Button(0)),
+            Some(Action::ObsSaveReplay)
+        ));
+        assert!(matches!(
+            config.mappings.get(&ControlId::Button(1)),
+            Some(Action::ObsToggleRecording)
+        ));
+    }
+
+    #[test]
+    fn test_obs_port_out_of_range() {
+        let result = parse_config(
+            r#"
+            [obs]
+            port = 99999
+            "#,
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("port"));
     }
 }

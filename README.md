@@ -192,6 +192,82 @@ icon = "firefox"
 
 If not specified, icons are resolved automatically from `.desktop` files or the app name.
 
+### OBS Studio integration
+
+pcp_rust can drive OBS recording / replay buffer / pause / split-file actions from buttons and reflect OBS state on the LEDs. The integration is event-driven: LEDs follow OBS's reported state, so if recording is started or stopped from the OBS GUI or any other client, the panel reflects it.
+
+The OBS integration is opt-in. If you don't add an `[obs]` section to your config, none of this affects the rest of pcp_rust.
+
+#### Prerequisites
+
+1. **OBS 28 or newer** — obs-websocket v5 is built in.
+2. In OBS: `Tools → WebSocket Server Settings`. Tick **Enable WebSocket server**. Note the port (default 4455) and the server password (or untick "Enable Authentication" if you'd rather not use one).
+3. In OBS: enable the replay buffer if you want to use Save Replay (`Settings → Output → Replay Buffer → Enable Replay Buffer`), set a hotkey for "Save Replay" (`Settings → Hotkeys → Save Replay`), and start the replay buffer manually (`Controls → Start Replay Buffer`). **pcp_rust does not manage the replay buffer's start/stop state** — that's on you. If you press Save Replay while the replay buffer isn't running, the OBS call will fail and you'll see the error flash.
+
+#### Connection config
+
+```toml
+[obs]
+host = "localhost"   # optional, default "localhost"
+port = 4455          # optional, default 4455
+password = "secret"  # optional; omit or leave empty if OBS auth is disabled
+```
+
+pcp_rust connects on startup and reconnects automatically (with exponential backoff, max ~30s) when OBS isn't running, restarts, or crashes. While disconnected, OBS action buttons produce an error flash.
+
+#### Action types
+
+Four new action types, button-only:
+
+| Action | What it does |
+|---|---|
+| `obs-save-replay` | Save the current replay buffer to a file |
+| `obs-toggle-recording` | Start recording if stopped, stop if recording |
+| `obs-pause-recording` | Pause if recording, resume if paused |
+| `obs-split-recording` | Start a new recording file mid-session (OBS 30+) |
+
+Example:
+```toml
+[button1]
+action = "obs-save-replay"
+
+[button2]
+action = "obs-toggle-recording"
+
+[button3]
+action = "obs-pause-recording"
+
+[button4]
+action = "obs-split-recording"
+```
+
+`obs-toggle-recording` and `obs-pause-recording` change the LED state visibly (idle ↔ recording ↔ paused), so they don't add a green success flash — the state change is the feedback. `obs-save-replay` and `obs-split-recording` flash green on success since they don't otherwise change anything visible. All four flash magenta on failure.
+
+#### LED behavior
+
+When `[obs]` is configured, the LEDs follow OBS state:
+
+| OBS state | LEDs |
+|---|---|
+| Idle (or OBS disconnected) | Your `[rgb]` mode (or all off if `[rgb]` is omitted) |
+| Recording active | Solid red (configurable) on every region |
+| Recording paused | Breathing amber (configurable hue) |
+| Any command succeeded | Brief green flash, then revert to current state |
+| Any command failed | Brief magenta flash, then revert |
+
+`[obs.colors]` lets you override these colors:
+
+```toml
+[obs.colors]
+recording = "#FF0000"           # solid color while recording
+recording_paused = "#FFC000"    # color for the paused breath effect (hue derived from this)
+success_flash = "#00FF00"       # flash on successful OBS commands
+error_flash = "#FF00FF"         # flash on failed OBS commands
+flash_duration_ms = 500         # how long each flash stays before reverting
+```
+
+Static effects (solid, gradient, volume-gradient) and the `recording` / flash colors take full hex; the paused color's hue is derived from the hex (saturation and brightness are managed by the breath effect itself).
+
 ## Running
 
 ### Foreground
