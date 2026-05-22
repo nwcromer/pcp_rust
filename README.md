@@ -8,7 +8,8 @@ A Linux controller for the [PCPanel Pro](https://www.getpcpanel.com/product-page
 - **Mute toggle** for system output, microphone, and individual applications
 - **Multi-app mapping** - one control can target multiple apps
 - **App matching** - case-insensitive substring matching against PulseAudio app names, binary names, and process names (including SDL apps via PipeWire client PID lookup)
-- **RGB LED control** - solid colors or rainbow animation
+- **RGB LED control** - solid, gradient, volume-gradient, wave, breath, and rainbow modes
+- **OBS Studio integration** - buttons drive recording / replay buffer / pause / split-file via obs-websocket v5, and LEDs reflect OBS state (idle / recording / paused, with the logo as a replay-buffer indicator)
 - **KDE OSD** - native volume/mute popups with app icons
 - **Sleep/resume** - automatically re-applies LED config after waking from sleep
 - **Systemd service** - run as a background daemon with auto-start on login
@@ -18,8 +19,8 @@ A Linux controller for the [PCPanel Pro](https://www.getpcpanel.com/product-page
 - Linux with PipeWire (or PulseAudio)
 - `libhidapi-dev` / `hidapi` (for USB HID access)
 - `libpulse` (for audio control)
-- `gdbus` (for KDE OSD integration, included with glib2)
 - KDE Plasma (optional, for OSD popups)
+- OBS Studio 28+ (optional, for OBS integration — obs-websocket v5 is built in)
 
 ### Arch Linux
 
