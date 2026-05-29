@@ -203,11 +203,21 @@ The colors for each state default to sensible values; override any of them in th
 indicator = "mic"
 mic_muted = "#FF0000"        # default: bright red
 mic_unmuted = "#00FF00"      # default: bright green
+mic_unknown = "#804000"      # default: burnt orange; shown blinking when PA
+                             # can't confirm the mic state (see below)
 
 # Used when indicator = "replay":
 replay_active = "#00FFFF"    # default: cyan
 replay_inactive = "#000000"  # default: off (logo dark; doesn't track the panel color)
 ```
+
+**Trust contract for `indicator = "mic"`:** the logo tells you with certainty what state the microphone is in.
+
+- **Green (or `mic_unmuted`)** — PulseAudio confirmed unmuted within the last second. Safe to speak.
+- **Red (or `mic_muted`)** — PA confirmed muted within the last second.
+- **Blinking burnt-orange (or `mic_unknown`)** — PA hasn't been able to confirm the mic state recently (daemon hiccup, source briefly unresolvable, button-toggle that PA didn't ack in time). The cached state may not match the device. **Treat the mic as possibly unmuted until the indicator returns to red/green.**
+
+The blink is unmistakable so you don't miss it. The threshold for "stale" is 1 second (4 mic-mute poll intervals at 250 ms each) — a single transient PA failure won't trigger the warning, but a sustained outage will within ~1 second.
 
 External mic mute changes (KDE volume key, OSD, other tools) are picked up by a 250 ms poll when `indicator = "mic"`, so there's a small delay; muting via a pcp_rust button updates instantly. Replay-buffer state is event-driven from OBS, no polling.
 

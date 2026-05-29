@@ -36,17 +36,6 @@ enum Target {
     DefaultSource,
 }
 
-/// Three-state outcome of `query_default_mute`'s introspect callback.
-/// Distinguishes "device genuinely absent" (callback ran to End without
-/// ever yielding Item) from "PA-side enumeration error" (Error variant
-/// fired) so the surfaced error message is accurate during triage.
-#[derive(Clone)]
-enum MuteOutcome {
-    Pending,
-    Item(bool),
-    NotFound,
-    Error,
-}
 
 impl Target {
     fn pa_name(self) -> &'static str {
@@ -260,11 +249,21 @@ impl AudioController {
 
     /// Run a PA write that reports success/failure via a bool callback
     /// (e.g., `sr.write`). The `register` closure must return the
-    /// `Operation` handle so we can cancel it if the wait deadline trips —
-    /// otherwise libpulse-binding's `Operation::drop` deliberately leaks
-    /// the boxed callback (so PA can still invoke it after drop without
-    /// UAF). Returns the reported success state or an error if the
-    /// operation didn't complete in time.
+    /// `Operation` handle so we can call `cancel()` on it if the wait
+    /// deadline trips. Returns the reported success state or an error
+    /// if the operation didn't complete in time.
+    ///
+    /// Note on cancel(): `pa_operation_cancel` tells PA to abort the
+    /// operation, which is what prevents a UAF — without it, PA could
+    /// invoke the boxed callback into the `Rc<RefCell<Option<bool>>>` we
+    /// just dropped. It does NOT, however, actually free the boxed
+    /// callback in libpulse-binding 2.30.1: `Operation::from_raw` has
+    /// an inverted `saved_cb` storage condition that ends up storing
+    /// `None` for any non-null callback pointer, so `cancel()`'s drop
+    /// branch never runs for our use cases. The boxed FnMut therefore
+    /// leaks on each wait-deadline trip — bounded by how often PA
+    /// actually fails, so small in practice. Fixed properly by
+    /// patching upstream libpulse-binding.
     fn pa_write_with_result<R>(&self, register: R) -> Result<bool>
     where
         R: FnOnce(Rc<RefCell<Option<bool>>>) -> Option<Operation<dyn FnMut(bool) + 'static>>,
@@ -275,7 +274,9 @@ impl AudioController {
         if wait_result.is_err()
             && let Some(op) = op.as_mut()
         {
-            // Cancel before drop so the boxed FnMut can be freed cleanly.
+            // Tell PA to abort the operation so it doesn't fire the
+            // callback into the about-to-be-dropped result Rc. See the
+            // doc comment above re: the box-leak caveat.
             op.cancel();
         }
         wait_result?;
@@ -314,58 +315,54 @@ impl AudioController {
     /// label-distinguished message depending on whether PA finished
     /// enumeration without ever yielding an Item (genuinely not present)
     /// vs. reported an enumeration Error (server-side failure).
+    ///
+    /// The pa_query value is `(Option<bool>, bool)`: `(mute, errored)`.
+    /// Initial `(None, false)` represents both "no callback fired yet" and
+    /// "callback ran to End without Item" (genuinely not present) — End
+    /// is a no-op because the initial state is already correct for that
+    /// case, and Item-then-End leaves the populated value alone. Error
+    /// flips the second element; we never roll back to "not errored" so
+    /// the order of arrivals doesn't matter.
     fn query_default_mute(&self, target: Target) -> Result<bool> {
         let name = target.pa_name();
-        let outcome: MuteOutcome = self.pa_query(MuteOutcome::Pending, |out, done| {
-            let introspect = self.context.borrow().introspect();
-            match target {
-                Target::DefaultSink => {
-                    let _op = introspect.get_sink_info_by_name(name, move |result| {
-                        match result {
-                            ListResult::Item(sink) => {
-                                *out.borrow_mut() = MuteOutcome::Item(sink.mute);
-                            }
-                            ListResult::End => {
-                                if matches!(*out.borrow(), MuteOutcome::Pending) {
-                                    *out.borrow_mut() = MuteOutcome::NotFound;
+        let (mute, errored): (Option<bool>, bool) =
+            self.pa_query((None, false), |out, done| {
+                let introspect = self.context.borrow().introspect();
+                match target {
+                    Target::DefaultSink => {
+                        let _op = introspect.get_sink_info_by_name(name, move |result| {
+                            match result {
+                                ListResult::Item(sink) => {
+                                    out.borrow_mut().0 = Some(sink.mute);
+                                }
+                                ListResult::End => {}
+                                ListResult::Error => {
+                                    out.borrow_mut().1 = true;
                                 }
                             }
-                            ListResult::Error => {
-                                *out.borrow_mut() = MuteOutcome::Error;
-                            }
-                        }
-                        *done.borrow_mut() = true;
-                    });
-                }
-                Target::DefaultSource => {
-                    let _op = introspect.get_source_info_by_name(name, move |result| {
-                        match result {
-                            ListResult::Item(source) => {
-                                *out.borrow_mut() = MuteOutcome::Item(source.mute);
-                            }
-                            ListResult::End => {
-                                if matches!(*out.borrow(), MuteOutcome::Pending) {
-                                    *out.borrow_mut() = MuteOutcome::NotFound;
+                            *done.borrow_mut() = true;
+                        });
+                    }
+                    Target::DefaultSource => {
+                        let _op = introspect.get_source_info_by_name(name, move |result| {
+                            match result {
+                                ListResult::Item(source) => {
+                                    out.borrow_mut().0 = Some(source.mute);
+                                }
+                                ListResult::End => {}
+                                ListResult::Error => {
+                                    out.borrow_mut().1 = true;
                                 }
                             }
-                            ListResult::Error => {
-                                *out.borrow_mut() = MuteOutcome::Error;
-                            }
-                        }
-                        *done.borrow_mut() = true;
-                    });
+                            *done.borrow_mut() = true;
+                        });
+                    }
                 }
-            }
-        })?;
-        match outcome {
-            MuteOutcome::Item(b) => Ok(b),
-            MuteOutcome::NotFound | MuteOutcome::Pending => {
-                bail!("{} not found", target.label())
-            }
-            MuteOutcome::Error => {
-                bail!("PulseAudio enumeration error while querying {}", target.label())
-            }
+            })?;
+        if errored {
+            bail!("PulseAudio enumeration error while querying {}", target.label());
         }
+        mute.with_context(|| format!("{} not found", target.label()))
     }
 
     fn set_default_volume(&self, target: Target, value: u8) -> Result<()> {
@@ -667,6 +664,14 @@ impl AudioController {
 
     /// Current mute state of the default microphone (true = muted).
     pub fn is_mic_muted(&self) -> Result<bool> {
+        // Debug-only test hook: when PCPANEL_FORCE_MIC_ERROR is set in the
+        // environment, always fail. Lets you visually verify the mic
+        // indicator's stale-state ("unknown") blink without having to
+        // bring down PulseAudio. Stripped from release builds by the
+        // cfg!(debug_assertions) check.
+        if cfg!(debug_assertions) && std::env::var_os("PCPANEL_FORCE_MIC_ERROR").is_some() {
+            bail!("forced failure (PCPANEL_FORCE_MIC_ERROR set)");
+        }
         self.query_default_mute(Target::DefaultSource)
     }
 

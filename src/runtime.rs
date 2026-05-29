@@ -20,6 +20,19 @@ pub enum ObsState {
 /// Total on+off period for blinking flashes. Half is "on", half is "off".
 const BLINK_CYCLE: Duration = Duration::from_millis(200);
 
+/// How fresh a successful mic-mute confirmation must be before we trust
+/// the cached `mic_muted` value. After this threshold, the logo flips to
+/// the "unknown" indicator (blinking warning color) so the user knows
+/// the cache may not match the device. 4 poll intervals — a single
+/// transient PA hiccup won't trigger the warning, but a sustained outage
+/// will within ~1 second.
+const MIC_STALE_THRESHOLD: Duration = Duration::from_millis(1000);
+
+/// On+off period for the mic-unknown blink. Half is "on" (mic_unknown
+/// color), half is "off". 500 ms total is attention-grabbing without
+/// being seizure-inducing.
+const MIC_UNKNOWN_BLINK_CYCLE: Duration = Duration::from_millis(500);
+
 #[derive(Debug, Clone, Copy)]
 pub struct Flash {
     pub color: RgbColor,
@@ -105,6 +118,15 @@ pub struct ObsRuntime {
     /// queried fresh at paint time) so it persists across paints and so
     /// changes can mark the LEDs dirty for a repaint.
     mic_muted: bool,
+    /// Instant of the last successful mic-mute confirmation from PA. None
+    /// at startup before the first seed. If older than MIC_STALE_THRESHOLD,
+    /// `logo_indicator_color` returns the unknown-state color instead of
+    /// trusting the cached `mic_muted`.
+    mic_confirmed_at: Option<Instant>,
+    /// Reference instant for computing blink phase. Set once at
+    /// construction; stable across the runtime's lifetime so blink phases
+    /// are continuous.
+    created_at: Instant,
     /// Which logo indicator is active and the colors for each state.
     /// `LogoIndicator::None` (the default) means the logo just matches the
     /// panel color.
@@ -127,6 +149,8 @@ impl ObsRuntime {
             replay_buffer_active: None,
             paused_use_breath,
             mic_muted: false,
+            mic_confirmed_at: None,
+            created_at: Instant::now(),
             logo_cfg,
         }
     }
@@ -144,8 +168,8 @@ impl ObsRuntime {
         self.state
     }
 
-    pub fn colors(&self) -> &ObsColors {
-        &self.colors
+    pub fn colors(&self) -> ObsColors {
+        self.colors
     }
 
     pub fn flash(&self) -> Option<Flash> {
@@ -160,11 +184,44 @@ impl ObsRuntime {
         self.mic_muted
     }
 
-    /// Update the cached mic-mute state. The only external mutator —
-    /// button presses and the periodic poll both go through this so the
-    /// LED dirty-tracking can stay in main.rs.
+    /// Record a confirmed mic-mute state from PA. Updates the cached
+    /// `mic_muted` AND bumps `mic_confirmed_at` so the logo trusts the
+    /// value for the next MIC_STALE_THRESHOLD window. This is the only
+    /// external mutator — button presses and the periodic poll both go
+    /// through this so the LED dirty-tracking can stay in main.rs and so
+    /// the staleness clock is reset only on actual PA confirmations.
     pub fn set_mic_muted(&mut self, muted: bool) {
         self.mic_muted = muted;
+        self.mic_confirmed_at = Some(Instant::now());
+    }
+
+    /// True if the cached `mic_muted` is older than MIC_STALE_THRESHOLD
+    /// (or has never been confirmed). When stale, the logo flashes the
+    /// `mic_unknown` color to signal that the cache may not match the
+    /// device — the user should treat the mic as possibly unmuted until
+    /// PA recovers and the indicator returns to red/green.
+    fn mic_is_stale(&self) -> bool {
+        match self.mic_confirmed_at {
+            None => true,
+            Some(when) => when.elapsed() >= MIC_STALE_THRESHOLD,
+        }
+    }
+
+    /// Phase of a free-running blink with the given cycle. Returns true
+    /// for the "on" half, false for the "off" half. Driven from
+    /// `created_at` so the blink is continuous across the runtime's life.
+    fn blink_phase(&self, cycle: Duration) -> bool {
+        let elapsed_ms = self.created_at.elapsed().as_millis();
+        let half = (cycle.as_millis() / 2).max(1);
+        (elapsed_ms / half).is_multiple_of(2)
+    }
+
+    /// True if the mic indicator is selected AND the cached state is
+    /// stale. The main loop checks this to drive continuous repaints
+    /// during the blink (each main-loop iteration renders the current
+    /// phase of the blink cycle).
+    pub fn mic_indicator_needs_repaint(&self) -> bool {
+        self.mic_indicator_enabled() && self.mic_is_stale()
     }
 
     /// The color the configured logo indicator wants right now, or `None`
@@ -173,11 +230,7 @@ impl ObsRuntime {
     pub fn logo_indicator_color(&self) -> Option<RgbColor> {
         match self.logo_cfg.indicator {
             LogoIndicator::None => None,
-            LogoIndicator::Mic => Some(if self.mic_muted {
-                self.logo_cfg.mic_muted
-            } else {
-                self.logo_cfg.mic_unmuted
-            }),
+            LogoIndicator::Mic => Some(self.mic_logo_color()),
             LogoIndicator::Replay => {
                 if !self.connected {
                     return None;
@@ -187,6 +240,22 @@ impl ObsRuntime {
                     Some(false) | None => self.logo_cfg.replay_inactive,
                 })
             }
+        }
+    }
+
+    /// Compute the mic indicator color, honoring the staleness check.
+    /// Stale → blinking mic_unknown; fresh → mic_muted / mic_unmuted.
+    fn mic_logo_color(&self) -> RgbColor {
+        if self.mic_is_stale() {
+            if self.blink_phase(MIC_UNKNOWN_BLINK_CYCLE) {
+                self.logo_cfg.mic_unknown
+            } else {
+                RgbColor { r: 0, g: 0, b: 0 }
+            }
+        } else if self.mic_muted {
+            self.logo_cfg.mic_muted
+        } else {
+            self.logo_cfg.mic_unmuted
         }
     }
 
@@ -472,9 +541,34 @@ mod tests {
         };
         let mut obs = ObsRuntime::new(None, ObsColors::default(), false, cfg);
         assert!(obs.mic_indicator_enabled());
+        // set_mic_muted bumps mic_confirmed_at, so the indicator returns
+        // the confident color rather than the stale-state blink.
+        obs.set_mic_muted(false);
         assert_eq!(obs.logo_indicator_color(), Some(green));
-        obs.mic_muted = true;
+        obs.set_mic_muted(true);
         assert_eq!(obs.logo_indicator_color(), Some(red));
+    }
+
+    #[test]
+    fn logo_indicator_mic_unconfirmed_returns_unknown_or_off() {
+        // Fresh runtime → mic_confirmed_at is None → stale → blink between
+        // mic_unknown color and off. Color depends on the blink phase
+        // (driven by Instant::now() vs created_at), so we just assert it's
+        // one of the two valid stale-state colors.
+        let cfg = LogoConfig {
+            indicator: LogoIndicator::Mic,
+            ..Default::default()
+        };
+        let obs = ObsRuntime::new(None, ObsColors::default(), false, cfg);
+        assert!(obs.mic_indicator_needs_repaint());
+        let color = obs.logo_indicator_color().expect("Mic indicator returns a color");
+        let off = RgbColor { r: 0, g: 0, b: 0 };
+        assert!(
+            color == cfg.mic_unknown || color == off,
+            "expected mic_unknown {:?} or off, got {:?}",
+            cfg.mic_unknown,
+            color
+        );
     }
 
     #[test]

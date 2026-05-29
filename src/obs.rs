@@ -146,14 +146,26 @@ async fn obs_main_loop(
                 let session_start = Instant::now();
 
                 // Run the session until the connection drops or the main
-                // thread closes the command channel.
-                if let Err(e) = run_session(&client, &config, &mut cmd_rx, &event_tx).await {
-                    info!("OBS: disconnected ({e})");
+                // thread closes the command channel. Err = connection-level
+                // failure; Ok = main thread closed cmd_rx (graceful
+                // shutdown — the process is exiting, don't reconnect).
+                match run_session(&client, &config, &mut cmd_rx, &event_tx).await {
+                    Ok(()) => {
+                        debug!("OBS: main thread closed command channel; exiting thread");
+                        return;
+                    }
+                    Err(e) => info!("OBS: disconnected ({e})"),
                 }
 
+                // Snapshot the dwell BEFORE the post-disconnect send. The
+                // send below is a `.await` on a bounded channel and can
+                // block if main is slow to drain events — measuring after
+                // would inflate dwell by main's stall time and classify
+                // an instantly-dying session as stable.
+                let dwell = session_start.elapsed();
                 let _ = event_tx.send(ObsEvent::Disconnected).await;
 
-                if session_start.elapsed() >= STABLE_SESSION_DWELL {
+                if dwell >= STABLE_SESSION_DWELL {
                     // Stable session — reset backoff so the next reconnect
                     // (e.g. user restarted OBS) is quick.
                     backoff = BACKOFF_INITIAL_SECS;
@@ -162,7 +174,7 @@ async fn obs_main_loop(
                     // attempt so we don't hammer the network/journal.
                     debug!(
                         "OBS: session ended after {}s; backing off {backoff}s before retry",
-                        session_start.elapsed().as_secs()
+                        dwell.as_secs()
                     );
                     sleep(Duration::from_secs(backoff)).await;
                     backoff = (backoff * 2).min(BACKOFF_MAX_SECS);

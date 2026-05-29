@@ -265,8 +265,8 @@ fn run(cli: Cli) -> Result<()> {
     }
 
     // Initial LED write. paint_leds handles the disconnected-idle case
-    // (apply_rgb for [rgb] mode, or set_all_solid(black) if no [rgb]) plus
-    // the mic-indicator override when seeded mic_muted is true.
+    // (apply_rgb for the [rgb] mode, or solid black if no [rgb]) plus the
+    // mic-indicator override when seeded mic_muted is true.
     if let Err(e) = paint_leds(&panel, &obs, config.rgb) {
         warn!("initial LED paint failed: {e}");
     }
@@ -279,14 +279,10 @@ fn run(cli: Cli) -> Result<()> {
     // presses bypass this by updating obs.mic_muted directly. Skipped
     // entirely if the user didn't configure a mic-muted color.
     const MIC_POLL_INTERVAL: Duration = Duration::from_millis(250);
-    // Set last_mic_poll into the past so the very first loop iteration
-    // triggers a poll — otherwise if the startup seed failed (PA still
-    // booting), the cached mic_muted=false is shown for up to MIC_POLL_INTERVAL.
-    // checked_sub guards against the (currently theoretical) case where
-    // Instant::now() is smaller than MIC_POLL_INTERVAL.
-    let mut last_mic_poll = Instant::now()
-        .checked_sub(MIC_POLL_INTERVAL)
-        .unwrap_or_else(Instant::now);
+    // None = "never polled" → the first loop iteration polls immediately,
+    // so a failed startup seed (PA still booting) doesn't leave a stale
+    // mic_muted=false visible for up to MIC_POLL_INTERVAL.
+    let mut last_mic_poll: Option<Instant> = None;
     // Track repeated PA failures so we warn once per outage instead of
     // every 250 ms. Reset to 0 on a successful poll.
     let mut mic_poll_failures: u32 = 0;
@@ -295,6 +291,11 @@ fn run(cli: Cli) -> Result<()> {
     loop {
         let mut led_dirty = obs.drain_events();
         led_dirty |= obs.expire_flash();
+        // While the mic indicator is in its "unknown" state, force a
+        // repaint each iteration so the logo's blink renders. The blink
+        // phase is time-driven inside runtime, so just keeping led_dirty
+        // true is enough.
+        led_dirty |= obs.mic_indicator_needs_repaint();
 
         // Check for resume signal — re-poll mic so the post-resume paint
         // doesn't show stale state if the mic was toggled during suspend.
@@ -304,27 +305,34 @@ fn run(cli: Cli) -> Result<()> {
         if resume_rx.try_recv().is_ok() {
             info!("system resumed from sleep, re-applying LED state");
             if obs.mic_indicator_enabled() && refresh_mic_muted(&audio, &mut obs) {
-                last_mic_poll = Instant::now();
+                last_mic_poll = Some(Instant::now());
             }
             led_dirty = true;
         }
 
-        if obs.mic_indicator_enabled() && last_mic_poll.elapsed() >= MIC_POLL_INTERVAL {
-            last_mic_poll = Instant::now();
+        let mic_poll_due = obs.mic_indicator_enabled()
+            && last_mic_poll.is_none_or(|t| t.elapsed() >= MIC_POLL_INTERVAL);
+        if mic_poll_due {
+            last_mic_poll = Some(Instant::now());
             match audio.is_mic_muted() {
                 Ok(muted) => {
+                    let was_stale = obs.mic_indicator_needs_repaint();
                     if mic_poll_failures > 0 {
-                        // Convert failure count to an approximate outage
-                        // duration so the recovery line reads as a timespan
-                        // rather than an alarming-looking large integer.
-                        let outage_secs = u64::from(mic_poll_failures)
-                            * MIC_POLL_INTERVAL.as_millis() as u64
-                            / 1000;
-                        info!("audio: mic-mute poll recovered after ~{outage_secs}s");
+                        // Approximate outage duration. Duration's Debug
+                        // formatter picks an appropriate unit (250ms,
+                        // 1s, 1.25s, etc.) — better than an integer
+                        // second count that truncates short outages to 0.
+                        let outage = MIC_POLL_INTERVAL * mic_poll_failures;
+                        info!("audio: mic-mute poll recovered after ~{outage:?}");
                         mic_poll_failures = 0;
                     }
-                    if muted != obs.mic_muted() {
-                        obs.set_mic_muted(muted);
+                    let changed = muted != obs.mic_muted();
+                    // Always set on a successful poll — even when the value
+                    // hasn't changed — because set_mic_muted is the entry
+                    // point for refreshing mic_confirmed_at, which is what
+                    // keeps the logo out of its "unknown" stale state.
+                    obs.set_mic_muted(muted);
+                    if changed || was_stale {
                         led_dirty = true;
                     }
                 }
@@ -474,12 +482,19 @@ fn handle_panel_event(
                             AppTarget::Mic => {
                                 // Update the cached mic-mute state immediately
                                 // so the logo repaints this iteration instead
-                                // of waiting up to MIC_POLL_INTERVAL. Skip when
-                                // the mic indicator isn't selected — the cache
-                                // isn't read, so a repaint would do nothing.
-                                if obs.mic_indicator_enabled() && obs.mic_muted() != muted {
+                                // of waiting up to MIC_POLL_INTERVAL. Always
+                                // call set_mic_muted on a confirmed reading
+                                // so mic_confirmed_at stays fresh (the
+                                // stale-detection trust contract depends on
+                                // every successful confirmation refreshing
+                                // it, not just the changed ones).
+                                if obs.mic_indicator_enabled() {
+                                    let changed = obs.mic_muted() != muted;
+                                    let was_stale = obs.mic_indicator_needs_repaint();
                                     obs.set_mic_muted(muted);
-                                    led_dirty = true;
+                                    if changed || was_stale {
+                                        led_dirty = true;
+                                    }
                                 }
                                 osd::show_mic_mute(muted);
                             }

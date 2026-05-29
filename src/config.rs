@@ -143,6 +143,12 @@ pub struct LogoConfig {
     pub indicator: LogoIndicator,
     pub mic_muted: RgbColor,
     pub mic_unmuted: RgbColor,
+    /// Color shown (blinking) when the mic indicator is configured but PA
+    /// hasn't been able to confirm the mic's actual state recently. The
+    /// blink + non-standard color signal "do not trust the cached state"
+    /// — the user should treat the mic as possibly unmuted until the
+    /// logo returns to red/green.
+    pub mic_unknown: RgbColor,
     pub replay_active: RgbColor,
     pub replay_inactive: RgbColor,
 }
@@ -153,6 +159,9 @@ impl Default for LogoConfig {
             indicator: LogoIndicator::None,
             mic_muted: RgbColor { r: 0xFF, g: 0x00, b: 0x00 },
             mic_unmuted: RgbColor { r: 0x00, g: 0xFF, b: 0x00 },
+            // Burnt-orange / dark amber — visually distinct from red, green,
+            // and amber-paused, with semantic weight of "warning, verify."
+            mic_unknown: RgbColor { r: 0x80, g: 0x40, b: 0x00 },
             replay_active: RgbColor { r: 0x00, g: 0xFF, b: 0xFF },
             replay_inactive: RgbColor { r: 0x00, g: 0x00, b: 0x00 },
         }
@@ -628,6 +637,7 @@ fn parse_logo_section(table: &toml::value::Table) -> Result<LogoConfig> {
         indicator,
         mic_muted: parse_logo_color(table, "mic_muted", defaults.mic_muted)?,
         mic_unmuted: parse_logo_color(table, "mic_unmuted", defaults.mic_unmuted)?,
+        mic_unknown: parse_logo_color(table, "mic_unknown", defaults.mic_unknown)?,
         replay_active: parse_logo_color(table, "replay_active", defaults.replay_active)?,
         replay_inactive: parse_logo_color(table, "replay_inactive", defaults.replay_inactive)?,
     })
