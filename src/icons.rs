@@ -87,9 +87,17 @@ pub fn resolve_mute(config_icon: Option<&str>, app_names: &[String], muted: bool
 
 /// Search .desktop files for an app and return its Icon= value.
 fn find_icon_in_desktop_files(app_name: &str) -> Option<String> {
+    find_icon_in_dirs(app_name, DESKTOP_DIRS.iter().map(Path::new))
+}
+
+/// Inner search loop parameterized over the directories to scan. Extracted
+/// so tests can point it at a tempdir.
+fn find_icon_in_dirs<'a, I>(app_name: &str, dirs: I) -> Option<String>
+where
+    I: IntoIterator<Item = &'a Path>,
+{
     let target = app_name.to_lowercase();
-    for dir in DESKTOP_DIRS {
-        let dir_path = Path::new(dir);
+    for dir_path in dirs {
         if !dir_path.is_dir() {
             continue;
         }
@@ -112,30 +120,117 @@ fn find_icon_in_desktop_files(app_name: &str) -> Option<String> {
                 continue;
             }
 
-            // Parse the .desktop file for Icon= in the [Desktop Entry]
-            // section only. Other sections (`[Desktop Action ...]`,
-            // `[X-Foo]`) can carry their own Icon= for context-menu items,
-            // which are not the primary app icon.
-            if let Ok(content) = fs::read_to_string(&path) {
-                let mut in_desktop_entry = false;
-                for raw in content.lines() {
-                    let line = raw.trim();
-                    if line.starts_with('[') && line.ends_with(']') {
-                        in_desktop_entry = line == "[Desktop Entry]";
-                        continue;
-                    }
-                    if !in_desktop_entry {
-                        continue;
-                    }
-                    if let Some(icon) = line.strip_prefix("Icon=") {
-                        let icon = icon.trim();
-                        if !icon.is_empty() {
-                            return Some(icon.to_string());
-                        }
-                    }
-                }
+            if let Ok(content) = fs::read_to_string(&path)
+                && let Some(icon) = parse_desktop_entry_icon(&content)
+            {
+                return Some(icon);
             }
         }
     }
     None
+}
+
+/// Parse the `Icon=` value from a `.desktop` file's `[Desktop Entry]`
+/// section. Other sections (`[Desktop Action ...]`, `[X-Foo]`) can carry
+/// their own `Icon=` for context-menu items, which are not the primary
+/// app icon — so we deliberately ignore them.
+fn parse_desktop_entry_icon(content: &str) -> Option<String> {
+    let mut in_desktop_entry = false;
+    for raw in content.lines() {
+        let line = raw.trim();
+        if line.starts_with('[') && line.ends_with(']') {
+            in_desktop_entry = line == "[Desktop Entry]";
+            continue;
+        }
+        if !in_desktop_entry {
+            continue;
+        }
+        if let Some(icon) = line.strip_prefix("Icon=") {
+            let icon = icon.trim();
+            if !icon.is_empty() {
+                return Some(icon.to_string());
+            }
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    fn write_desktop(dir: &Path, name: &str, content: &str) {
+        let path = dir.join(format!("{name}.desktop"));
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(content.as_bytes()).unwrap();
+    }
+
+    #[test]
+    fn parse_icon_from_desktop_entry() {
+        let content = "\
+[Desktop Entry]
+Name=Foo
+Icon=foo-app
+Exec=/usr/bin/foo
+";
+        assert_eq!(parse_desktop_entry_icon(content), Some("foo-app".into()));
+    }
+
+    #[test]
+    fn parse_icon_ignores_other_sections() {
+        // The [Desktop Action] icon should NOT win — it's for a context-menu
+        // entry, not the app icon.
+        let content = "\
+[Desktop Action New]
+Name=New Window
+Icon=action-new
+
+[Desktop Entry]
+Name=Foo
+Icon=foo-app
+";
+        assert_eq!(parse_desktop_entry_icon(content), Some("foo-app".into()));
+    }
+
+    #[test]
+    fn parse_icon_skips_when_only_other_section_has_icon() {
+        let content = "\
+[Desktop Action New]
+Icon=action-only
+";
+        assert_eq!(parse_desktop_entry_icon(content), None);
+    }
+
+    #[test]
+    fn parse_icon_empty_value_returns_none() {
+        let content = "\
+[Desktop Entry]
+Icon=
+";
+        assert_eq!(parse_desktop_entry_icon(content), None);
+    }
+
+    #[test]
+    fn find_icon_in_dirs_matches_filename_substring() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_desktop(
+            tmp.path(),
+            "org.example.firefox",
+            "[Desktop Entry]\nIcon=firefox-icon\n",
+        );
+        let dirs = [tmp.path()];
+        assert_eq!(
+            find_icon_in_dirs("firefox", dirs.iter().copied()),
+            Some("firefox-icon".into())
+        );
+    }
+
+    #[test]
+    fn find_icon_in_dirs_returns_none_for_unrelated_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_desktop(tmp.path(), "vlc", "[Desktop Entry]\nIcon=vlc\n");
+        let dirs = [tmp.path()];
+        assert_eq!(find_icon_in_dirs("firefox", dirs.iter().copied()), None);
+    }
 }

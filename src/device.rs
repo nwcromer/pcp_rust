@@ -108,41 +108,7 @@ impl PcPanelPro {
             buf
         };
 
-        let msg_type = buf[0];
-        let index = buf[1];
-        let value = buf[2];
-
-        match msg_type {
-            MSG_ANALOG => {
-                let control = match index {
-                    KNOB_FIRST..=KNOB_LAST => Control::Knob(index - KNOB_FIRST),
-                    SLIDER_FIRST..=SLIDER_LAST => Control::Slider(index - SLIDER_FIRST),
-                    _ => {
-                        warn!("unknown analog index: {}", index);
-                        return Ok(None);
-                    }
-                };
-                Ok(Some(Event::AnalogChange { control, value }))
-            }
-            MSG_BUTTON => {
-                if !(BUTTON_FIRST..=BUTTON_LAST).contains(&index) {
-                    warn!("unknown button index: {}", index);
-                    return Ok(None);
-                }
-                match value {
-                    0x01 => Ok(Some(Event::ButtonPress { index })),
-                    0x00 => Ok(Some(Event::ButtonRelease { index })),
-                    _ => {
-                        warn!("unknown button value: {:#04x}", value);
-                        Ok(None)
-                    }
-                }
-            }
-            _ => {
-                debug!("unknown message type: {:#04x}", msg_type);
-                Ok(None)
-            }
-        }
+        Ok(parse_event(&buf))
     }
 
     pub fn set_led(&self, packet: &[u8]) -> Result<()> {
@@ -158,5 +124,123 @@ impl PcPanelPro {
             .write(&buf)
             .context("failed to write LED command")?;
         Ok(())
+    }
+}
+
+/// Parse a 64-byte HID report into an Event. Pure function (no I/O) so it
+/// can be unit-tested. Returns `None` for messages we don't recognize —
+/// the daemon logs at warn/debug and continues rather than bailing, since
+/// firmware versions may emit message types we don't care about.
+fn parse_event(buf: &[u8; PACKET_SIZE]) -> Option<Event> {
+    let msg_type = buf[0];
+    let index = buf[1];
+    let value = buf[2];
+
+    match msg_type {
+        MSG_ANALOG => {
+            let control = match index {
+                KNOB_FIRST..=KNOB_LAST => Control::Knob(index - KNOB_FIRST),
+                SLIDER_FIRST..=SLIDER_LAST => Control::Slider(index - SLIDER_FIRST),
+                _ => {
+                    warn!("unknown analog index: {}", index);
+                    return None;
+                }
+            };
+            Some(Event::AnalogChange { control, value })
+        }
+        MSG_BUTTON => {
+            if !(BUTTON_FIRST..=BUTTON_LAST).contains(&index) {
+                warn!("unknown button index: {}", index);
+                return None;
+            }
+            match value {
+                0x01 => Some(Event::ButtonPress { index }),
+                0x00 => Some(Event::ButtonRelease { index }),
+                _ => {
+                    warn!("unknown button value: {:#04x}", value);
+                    None
+                }
+            }
+        }
+        _ => {
+            debug!("unknown message type: {:#04x}", msg_type);
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn frame(msg: u8, index: u8, value: u8) -> [u8; PACKET_SIZE] {
+        let mut b = [0u8; PACKET_SIZE];
+        b[0] = msg;
+        b[1] = index;
+        b[2] = value;
+        b
+    }
+
+    #[test]
+    fn parse_knob_boundaries() {
+        assert_eq!(
+            parse_event(&frame(MSG_ANALOG, 0, 128)),
+            Some(Event::AnalogChange { control: Control::Knob(0), value: 128 })
+        );
+        assert_eq!(
+            parse_event(&frame(MSG_ANALOG, 4, 255)),
+            Some(Event::AnalogChange { control: Control::Knob(4), value: 255 })
+        );
+    }
+
+    #[test]
+    fn parse_slider_boundaries() {
+        assert_eq!(
+            parse_event(&frame(MSG_ANALOG, 5, 0)),
+            Some(Event::AnalogChange { control: Control::Slider(0), value: 0 })
+        );
+        assert_eq!(
+            parse_event(&frame(MSG_ANALOG, 8, 200)),
+            Some(Event::AnalogChange { control: Control::Slider(3), value: 200 })
+        );
+    }
+
+    #[test]
+    fn parse_analog_out_of_range_indices_dropped() {
+        // Index 9 is one past the last slider.
+        assert_eq!(parse_event(&frame(MSG_ANALOG, 9, 100)), None);
+        // 0xFF is well outside any defined range.
+        assert_eq!(parse_event(&frame(MSG_ANALOG, 0xFF, 100)), None);
+    }
+
+    #[test]
+    fn parse_button_press_and_release() {
+        assert_eq!(
+            parse_event(&frame(MSG_BUTTON, 0, 0x01)),
+            Some(Event::ButtonPress { index: 0 })
+        );
+        assert_eq!(
+            parse_event(&frame(MSG_BUTTON, 4, 0x00)),
+            Some(Event::ButtonRelease { index: 4 })
+        );
+    }
+
+    #[test]
+    fn parse_button_out_of_range_dropped() {
+        assert_eq!(parse_event(&frame(MSG_BUTTON, 5, 0x01)), None);
+        assert_eq!(parse_event(&frame(MSG_BUTTON, 0xFF, 0x01)), None);
+    }
+
+    #[test]
+    fn parse_button_unknown_value_dropped() {
+        // Only 0x00 / 0x01 are press/release; anything else is dropped.
+        assert_eq!(parse_event(&frame(MSG_BUTTON, 0, 0x02)), None);
+        assert_eq!(parse_event(&frame(MSG_BUTTON, 0, 0xFF)), None);
+    }
+
+    #[test]
+    fn parse_unknown_message_type_dropped() {
+        assert_eq!(parse_event(&frame(0x00, 0, 0)), None);
+        assert_eq!(parse_event(&frame(0xAB, 0, 0)), None);
     }
 }

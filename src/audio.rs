@@ -59,17 +59,22 @@ impl Target {
     }
 }
 
-/// Info collected from a sink input for matching and display.
+/// Info collected from a sink input for matching and display. The lower-
+/// cased forms of `name`, `binary`, and `comm` are computed once during
+/// `collect_sink_inputs` so `matches()` is a pure `&str::contains` —
+/// sliders fire ~10 Hz × multiple configured apps and the per-call
+/// `to_lowercase()` was real work.
 #[derive(Clone)]
 struct SinkInputEntry {
     index: u32,
     name: String,
+    name_lower: String,
     binary: Option<String>,
+    binary_lower: Option<String>,
     pid: Option<String>,
     /// Cached lower-cased `/proc/<pid>/comm`. Populated once during
-    /// `collect_sink_inputs` so `matches()` is pure RAM comparison —
-    /// avoids re-reading /proc on every match attempt (especially for
-    /// sliders with multiple configured apps).
+    /// `collect_sink_inputs` so `matches()` doesn't re-read /proc per
+    /// match attempt.
     comm: Option<String>,
     client_index: u32,
     channels: u8,
@@ -77,21 +82,16 @@ struct SinkInputEntry {
 }
 
 impl SinkInputEntry {
-    /// Check if this entry matches a target app name (case-insensitive substring).
-    /// Checks PA app name, then binary, then cached /proc/<pid>/comm.
+    /// Check if this entry matches a target app name (case-insensitive
+    /// substring). `target` is expected to already be lower-cased by the
+    /// caller — `matches` does no per-call allocation.
     fn matches(&self, target: &str) -> bool {
-        if self.name.to_lowercase().contains(target) {
-            return true;
-        }
-        if let Some(ref binary) = self.binary
-            && binary.to_lowercase().contains(target) {
-                return true;
-            }
-        if let Some(ref comm) = self.comm
-            && comm.contains(target) {
-                return true;
-            }
-        false
+        self.name_lower.contains(target)
+            || self
+                .binary_lower
+                .as_deref()
+                .is_some_and(|b| b.contains(target))
+            || self.comm.as_deref().is_some_and(|c| c.contains(target))
     }
 }
 
@@ -286,16 +286,18 @@ impl AudioController {
         })
     }
 
-    /// Current mute state of the named default sink/source.
+    /// Current mute state of the named default sink/source. Errors if the
+    /// source/sink isn't found (otherwise the caller can't distinguish a
+    /// genuinely unmuted device from one that doesn't exist).
     fn query_default_mute(&self, target: Target) -> Result<bool> {
         let name = target.pa_name();
-        self.pa_query(false, |mute, done| {
+        let mute: Option<bool> = self.pa_query(None, |mute, done| {
             let introspect = self.context.borrow().introspect();
             match target {
                 Target::DefaultSink => {
                     let _op = introspect.get_sink_info_by_name(name, move |result| {
                         if let ListResult::Item(sink) = result {
-                            *mute.borrow_mut() = sink.mute;
+                            *mute.borrow_mut() = Some(sink.mute);
                         }
                         *done.borrow_mut() = true;
                     });
@@ -303,13 +305,14 @@ impl AudioController {
                 Target::DefaultSource => {
                     let _op = introspect.get_source_info_by_name(name, move |result| {
                         if let ListResult::Item(source) = result {
-                            *mute.borrow_mut() = source.mute;
+                            *mute.borrow_mut() = Some(source.mute);
                         }
                         *done.borrow_mut() = true;
                     });
                 }
             }
-        })
+        })?;
+        mute.with_context(|| format!("{} not found", target.label()))
     }
 
     fn set_default_volume(&self, target: Target, value: u8) -> Result<()> {
@@ -334,17 +337,50 @@ impl AudioController {
 
     fn toggle_default_mute(&self, target: Target) -> Result<bool> {
         let new_mute = !self.query_default_mute(target)?;
-        let mut introspect = self.context.borrow().introspect();
-        match target {
-            Target::DefaultSink => {
-                let _op = introspect.set_sink_mute_by_name(target.pa_name(), new_mute, None);
+        // Wait for PA to actually apply the mute before returning, so the
+        // caller can synchronously cache the new state without racing the
+        // next mic-mute poll (which would otherwise read the pre-toggle
+        // value and momentarily revert the cached state).
+        //
+        // If PA reports !success or the wait deadline trips, treat the
+        // attempt optimistically: re-query the current state and return
+        // that. The set-mute call may still have taken effect on the
+        // device even when the ack didn't come back in time; re-querying
+        // gives the caller (and the OSD) the truth instead of erroring
+        // out and leaving the UI silent on transient PA hiccups.
+        let write = self.pa_write_with_result(|done| {
+            let mut introspect = self.context.borrow().introspect();
+            let cb: Box<dyn FnMut(bool) + 'static> = Box::new(move |ok| {
+                *done.borrow_mut() = Some(ok);
+            });
+            match target {
+                Target::DefaultSink => {
+                    let _op = introspect.set_sink_mute_by_name(
+                        target.pa_name(),
+                        new_mute,
+                        Some(cb),
+                    );
+                }
+                Target::DefaultSource => {
+                    let _op = introspect.set_source_mute_by_name(
+                        target.pa_name(),
+                        new_mute,
+                        Some(cb),
+                    );
+                }
             }
-            Target::DefaultSource => {
-                let _op = introspect.set_source_mute_by_name(target.pa_name(), new_mute, None);
+        });
+        match write {
+            Ok(true) => Ok(new_mute),
+            Ok(false) => {
+                warn!("PA reported failure setting mute on {}; re-querying actual state", target.label());
+                self.query_default_mute(target)
+            }
+            Err(e) => {
+                warn!("PA mute write did not complete on {} ({e}); re-querying actual state", target.label());
+                self.query_default_mute(target)
             }
         }
-        self.drain();
-        Ok(new_mute)
     }
 
     /// Collect all sink inputs with their properties.
@@ -363,10 +399,14 @@ impl AudioController {
                     let pid = info
                         .proplist
                         .get_str(pulse::proplist::properties::APPLICATION_PROCESS_ID);
+                    let name_lower = name.to_lowercase();
+                    let binary_lower = binary.as_deref().map(str::to_lowercase);
                     entries.borrow_mut().push(SinkInputEntry {
                         index: info.index,
                         name,
+                        name_lower,
                         binary,
+                        binary_lower,
                         pid,
                         comm: None, // populated after PID resolution below
                         client_index: info.client.unwrap_or(u32::MAX),
@@ -555,7 +595,14 @@ impl AudioController {
             bail!("stream-restore write rejected by server");
         }
 
-        debug!("updated {} stream-restore entries for {target}", updated.len());
+        let touched: Vec<&str> = updated
+            .iter()
+            .filter_map(|e| e.name.as_deref())
+            .collect();
+        debug!(
+            "updated {} stream-restore entries for {target}: {touched:?}",
+            updated.len()
+        );
         Ok(())
     }
 
@@ -567,6 +614,11 @@ impl AudioController {
     /// Returns the new mute state (true = muted).
     pub fn toggle_mic_mute(&self) -> Result<bool> {
         self.toggle_default_mute(Target::DefaultSource)
+    }
+
+    /// Current mute state of the default microphone (true = muted).
+    pub fn is_mic_muted(&self) -> Result<bool> {
+        self.query_default_mute(Target::DefaultSource)
     }
 
     /// Returns the new mute state, or None if the app wasn't found.
@@ -622,4 +674,39 @@ fn volume_from_u8(value: u8) -> Volume {
     let fraction = value as f64 / 255.0;
     let raw = (fraction * f64::from(Volume::NORMAL.0) + 0.5) as u32;
     Volume(raw)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn volume_from_u8_endpoints() {
+        // 0 → silent, 255 → exactly NORMAL (100%).
+        assert_eq!(volume_from_u8(0).0, 0);
+        assert_eq!(volume_from_u8(255).0, Volume::NORMAL.0);
+    }
+
+    #[test]
+    fn volume_from_u8_midpoint() {
+        // 127 ≈ 49.8%, 128 ≈ 50.2% — round-to-nearest puts midpoint near 50%.
+        let mid_lo = volume_from_u8(127).0 as f64 / Volume::NORMAL.0 as f64;
+        let mid_hi = volume_from_u8(128).0 as f64 / Volume::NORMAL.0 as f64;
+        assert!((0.49..=0.51).contains(&mid_lo), "127 → {mid_lo}");
+        assert!((0.49..=0.51).contains(&mid_hi), "128 → {mid_hi}");
+    }
+
+    #[test]
+    fn volume_from_u8_monotonic_at_low_end() {
+        // 1 must produce a strictly higher volume than 0 (a slider just
+        // off the floor should be audibly distinguishable from muted).
+        assert!(volume_from_u8(1).0 > volume_from_u8(0).0);
+    }
+
+    #[test]
+    fn volume_from_u8_near_max_doesnt_exceed_normal() {
+        // 254 must be strictly below NORMAL (255 = NORMAL); the cast
+        // shouldn't overshoot.
+        assert!(volume_from_u8(254).0 < Volume::NORMAL.0);
+    }
 }

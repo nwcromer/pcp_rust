@@ -10,6 +10,7 @@ A Linux controller for the [PCPanel Pro](https://www.getpcpanel.com/product-page
 - **App matching** - case-insensitive substring matching against PulseAudio app names, binary names, and process names (including SDL apps via PipeWire client PID lookup)
 - **RGB LED control** - solid, gradient, volume-gradient, wave, breath, and rainbow modes
 - **OBS Studio integration** - buttons drive recording / replay buffer / pause / split-file via obs-websocket v5, and LEDs reflect OBS state (idle / recording / paused, with the logo as a replay-buffer indicator)
+- **Logo indicator** - optionally turns the logo LED into a glanceable indicator for either microphone mute state or OBS replay-buffer state
 - **KDE OSD** - native volume/mute popups with app icons
 - **Sleep/resume** - automatically re-applies LED config after waking from sleep
 - **Systemd service** - run as a background daemon with auto-start on login
@@ -180,6 +181,38 @@ brightness = 200       # optional, default 200
 speed = 64             # optional, default 64
 ```
 
+#### Logo indicator (optional)
+
+The logo is a single LED, so it can show at most one thing at a time. Pick which state it should indicate via `indicator`:
+
+```toml
+[logo]
+indicator = "mic"   # "none" (default), "mic", or "replay"
+```
+
+| `indicator` | What the logo shows |
+|---|---|
+| `"none"` | Matches the panel color (no separate indication). This is the default if `[logo]` is omitted. |
+| `"mic"` | Default microphone mute state. Logo color depends on whether the mic is muted. Works regardless of OBS state. |
+| `"replay"` | OBS replay-buffer state. Logo color depends on whether the replay buffer is running. Matches the panel color while OBS is disconnected (state is unknown). |
+
+The colors for each state default to sensible values; override any of them in the same section:
+
+```toml
+[logo]
+indicator = "mic"
+mic_muted = "#FF0000"        # default: bright red
+mic_unmuted = "#00FF00"      # default: bright green
+
+# Used when indicator = "replay":
+replay_active = "#00FFFF"    # default: cyan
+replay_inactive = "#000000"  # default: off (logo dark; doesn't track the panel color)
+```
+
+External mic mute changes (KDE volume key, OSD, other tools) are picked up by a 250 ms poll when `indicator = "mic"`, so there's a small delay; muting via a pcp_rust button updates instantly. Replay-buffer state is event-driven from OBS, no polling.
+
+The indicator only applies in modes where the logo is independently writable — solid, gradient, volume-gradient, and all OBS-connected states except `paused_use_breath`. It does **not** apply during the global animations (rainbow, wave, breath) or the paused breath effect, since those drive every LED in lockstep.
+
 #### Icons (optional)
 
 Override the OSD icon for a control:
@@ -229,7 +262,10 @@ paused_use_breath = false     # optional, default false. If true, paused
 
 pcp_rust connects on startup and reconnects automatically (with exponential backoff, max ~30s) when OBS isn't running, restarts, or crashes. While disconnected, OBS action buttons produce an error flash.
 
-The `password` is stored in plain text in `config.toml`. The file lives under your config directory (`~/.config/pcpanel/`) with default user-only permissions, and obs-websocket is normally bound to localhost, so this is a personal-machine convenience rather than a transport concern — but worth knowing.
+**Password handling.** The `password` field in `config.toml` is stored in plain text. obs-websocket is normally bound to localhost, so this is a personal-machine convenience rather than a transport concern, but two things to know:
+
+- Set `$PCPANEL_OBS_PASSWORD` in the environment to override the config-file value. The env var wins if both are set. Useful so the password doesn't end up in dotfile backups or version control.
+- If you do put the password in `config.toml`, tighten permissions: `chmod 600 ~/.config/pcpanel/config.toml`.
 
 #### Action types
 
@@ -263,18 +299,20 @@ action = "obs-split-recording"
 
 When `[obs]` is configured, the LEDs follow OBS state:
 
-| OBS state | Panel (knobs/sliders/labels) | Logo |
+| OBS state | Panel (knobs/sliders/labels) | Logo (with no `[logo]` indicators) |
 |---|---|---|
 | OBS disconnected | Your `[rgb]` mode (or off if omitted) | follows `[rgb]` |
-| OBS connected, idle | Solid `idle_panel` color (configurable) | green if replay buffer running, off if stopped |
-| Recording active | Solid red (configurable) | red |
-| Recording paused | Solid amber (configurable); breath if `paused_use_breath = true` | green if replay buffer running (or joins breath in `paused_use_breath` mode — hardware limit) |
-| Any command succeeded | Brief green flash | green |
-| Any command failed | Brief magenta blink | magenta blink |
+| OBS connected, idle | Solid `idle_panel` color (configurable) | matches panel |
+| Recording active | Solid red (configurable) | matches panel |
+| Recording paused | Solid amber (configurable); breath if `paused_use_breath = true` | matches panel (or joins breath in `paused_use_breath` mode — hardware limit) |
+| Any command succeeded | Brief green flash | follows flash |
+| Any command failed | Brief magenta blink | follows flash |
 
-The split between "disconnected → `[rgb]`" and "connected → status display" is deliberate: while OBS isn't running, pcp_rust behaves as if OBS doesn't exist; once OBS is up, the panel switches to a dashboard-style appearance with the logo as a glanceable replay-buffer indicator.
+The split between "disconnected → `[rgb]`" and "connected → status display" is deliberate: while OBS isn't running, pcp_rust behaves as if OBS doesn't exist; once OBS is up, the panel switches to a dashboard-style appearance.
 
-`[obs.colors]` lets you override these colors:
+By default the logo just mirrors the panel color. To turn it into a glanceable indicator — for mic-mute state or replay-buffer state — set `indicator` in `[logo]`. See [Logo indicator](#logo-indicator-optional).
+
+`[obs.colors]` lets you override the panel colors and flash behavior:
 
 ```toml
 [obs.colors]
@@ -287,11 +325,11 @@ error_flash = "#FF00FF"         # blinking flash on failed OBS commands
 flash_duration_ms = 500         # how long each flash stays before reverting
 
 idle_panel = "#202020"          # panel color when OBS is connected and idle
-replay_active = "#00FF00"       # logo color when replay buffer is running
-replay_inactive = "#000000"     # logo color when replay buffer is stopped (off = invisible)
 ```
 
 Static effects (solid, gradient, volume-gradient) and the `recording` / flash colors take full hex; the paused color's hue is derived from the hex (saturation and brightness are managed by the breath effect itself).
+
+For a replay-buffer logo indicator, see [Logo indicator](#logo-indicator-optional) — it's opt-in via the `[logo]` section.
 
 ## Running
 
@@ -328,6 +366,10 @@ Remove the service:
 ```
 ./target/release/pcp_rust --remove-service
 ```
+
+## Dependencies note
+
+`Cargo.toml` includes a `[patch.crates-io]` section pointing `libpulse-binding` and `libpulse-sys` at a personal fork ([nwcromer/pulse-binding-rust@fix-ext-stream-restore-write](https://github.com/nwcromer/pulse-binding-rust/tree/fix-ext-stream-restore-write)) that fixes a stream-restore write API issue. The upstream PR is still pending — once merged, this patch can go away. If you build from source you'll fetch that branch automatically.
 
 ## Protocol references
 

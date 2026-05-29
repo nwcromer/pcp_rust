@@ -1,7 +1,7 @@
 //! OBS Studio integration via obs-websocket v5 (using the obws crate).
 //!
 //! Runs on a dedicated OS thread that owns a tokio runtime. Communicates
-//! with the rest of pcp_rust over two unbounded mpsc channels:
+//! with the rest of pcp_rust over two bounded mpsc channels:
 //!   main → OBS thread:  `ObsCommand` (button-triggered actions)
 //!   OBS thread → main:  `ObsEvent`   (state changes and command results)
 //!
@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use log::{debug, info, warn};
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::time::sleep;
 use tokio_stream::StreamExt;
 
@@ -58,9 +58,15 @@ pub enum ObsEvent {
     CommandFailed(ObsCommand, String),
 }
 
+/// Bound for the cross-thread mpsc channels. Both directions carry events
+/// at human rates (button presses, recording state transitions) so 64 is
+/// generous; the bound exists only so a wedged consumer can't accumulate
+/// unbounded memory.
+const CHANNEL_CAP: usize = 64;
+
 pub struct ObsHandle {
-    pub commands_tx: UnboundedSender<ObsCommand>,
-    pub events_rx: UnboundedReceiver<ObsEvent>,
+    pub commands_tx: Sender<ObsCommand>,
+    pub events_rx: Receiver<ObsEvent>,
 }
 
 /// Spawn the OBS background thread and return channels for the main thread
@@ -69,8 +75,8 @@ pub struct ObsHandle {
 /// "no [obs] configured": OBS actions error-flash, audio control keeps
 /// working.
 pub fn spawn_obs_thread(config: ObsConfig) -> Option<ObsHandle> {
-    let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel::<ObsCommand>();
-    let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel::<ObsEvent>();
+    let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<ObsCommand>(CHANNEL_CAP);
+    let (event_tx, event_rx) = tokio::sync::mpsc::channel::<ObsEvent>(CHANNEL_CAP);
 
     let spawn_result = std::thread::Builder::new()
         .name("pcp-obs".into())
@@ -111,8 +117,8 @@ fn host_is_local(host: &str) -> bool {
 
 async fn obs_main_loop(
     config: ObsConfig,
-    mut cmd_rx: UnboundedReceiver<ObsCommand>,
-    event_tx: UnboundedSender<ObsEvent>,
+    mut cmd_rx: Receiver<ObsCommand>,
+    event_tx: Sender<ObsEvent>,
 ) {
     if !host_is_local(&config.host) && config.password.is_some() {
         warn!(
@@ -129,7 +135,7 @@ async fn obs_main_loop(
         match try_connect(&config).await {
             Ok(client) => {
                 info!("OBS: connected to {}:{}", config.host, config.port);
-                let _ = event_tx.send(ObsEvent::Connected);
+                let _ = event_tx.send(ObsEvent::Connected).await;
                 backoff = BACKOFF_INITIAL_SECS;
 
                 // Run the session until the connection drops or the main
@@ -138,7 +144,7 @@ async fn obs_main_loop(
                     info!("OBS: disconnected ({e})");
                 }
 
-                let _ = event_tx.send(ObsEvent::Disconnected);
+                let _ = event_tx.send(ObsEvent::Disconnected).await;
                 // Continue to outer loop to reconnect (no backoff — we just
                 // had a working connection, so reconnect attempt is cheap).
             }
@@ -164,8 +170,8 @@ async fn try_connect(config: &ObsConfig) -> Result<obws::Client> {
 async fn run_session(
     client: &obws::Client,
     config: &ObsConfig,
-    cmd_rx: &mut UnboundedReceiver<ObsCommand>,
-    event_tx: &UnboundedSender<ObsEvent>,
+    cmd_rx: &mut Receiver<ObsCommand>,
+    event_tx: &Sender<ObsEvent>,
 ) -> Result<()> {
     // Subscribe to the OBS event stream FIRST — before sending any commands
     // or queries. obws's stream queues incoming events internally, so any
@@ -181,12 +187,12 @@ async fn run_session(
     if let Ok(status) = client.recording().status().await {
         if status.active {
             if status.paused {
-                let _ = event_tx.send(ObsEvent::RecordingPaused);
+                let _ = event_tx.send(ObsEvent::RecordingPaused).await;
             } else {
-                let _ = event_tx.send(ObsEvent::RecordingActive);
+                let _ = event_tx.send(ObsEvent::RecordingActive).await;
             }
         } else {
-            let _ = event_tx.send(ObsEvent::RecordingStopped);
+            let _ = event_tx.send(ObsEvent::RecordingStopped).await;
         }
     }
 
@@ -225,10 +231,10 @@ async fn run_session(
     };
     match initial_replay_active {
         Some(true) => {
-            let _ = event_tx.send(ObsEvent::ReplayBufferActive);
+            let _ = event_tx.send(ObsEvent::ReplayBufferActive).await;
         }
         Some(false) => {
-            let _ = event_tx.send(ObsEvent::ReplayBufferInactive);
+            let _ = event_tx.send(ObsEvent::ReplayBufferInactive).await;
         }
         None => {} // unknown — wait for next event to populate
     }
@@ -243,7 +249,7 @@ async fn run_session(
             }
             evt = events.next() => {
                 match evt {
-                    Some(evt) => handle_obs_event(evt, event_tx),
+                    Some(evt) => handle_obs_event(evt, event_tx).await,
                     None => return Err(anyhow::anyhow!("event stream ended")),
                 }
             }
@@ -254,7 +260,7 @@ async fn run_session(
 async fn handle_command(
     client: &obws::Client,
     cmd: ObsCommand,
-    event_tx: &UnboundedSender<ObsEvent>,
+    event_tx: &Sender<ObsEvent>,
 ) {
     let result: Result<(), obws::error::Error> = match cmd {
         ObsCommand::SaveReplay => client.replay_buffer().save().await,
@@ -266,48 +272,48 @@ async fn handle_command(
     match result {
         Ok(()) => {
             debug!("OBS: {} succeeded", cmd.label());
-            let _ = event_tx.send(ObsEvent::CommandSucceeded(cmd));
+            let _ = event_tx.send(ObsEvent::CommandSucceeded(cmd)).await;
         }
         Err(e) => {
             warn!("OBS: {} failed: {e}", cmd.label());
-            let _ = event_tx.send(ObsEvent::CommandFailed(cmd, e.to_string()));
+            let _ = event_tx.send(ObsEvent::CommandFailed(cmd, e.to_string())).await;
         }
     }
 }
 
-fn handle_obs_event(event: obws::events::Event, event_tx: &UnboundedSender<ObsEvent>) {
+async fn handle_obs_event(event: obws::events::Event, event_tx: &Sender<ObsEvent>) {
     use obws::events::Event::*;
     use obws::events::OutputState;
     match event {
         RecordStateChanged { active, state, .. } => {
             match state {
                 OutputState::Started => {
-                    let _ = event_tx.send(ObsEvent::RecordingActive);
+                    let _ = event_tx.send(ObsEvent::RecordingActive).await;
                 }
                 OutputState::Stopped => {
-                    let _ = event_tx.send(ObsEvent::RecordingStopped);
+                    let _ = event_tx.send(ObsEvent::RecordingStopped).await;
                 }
                 OutputState::Paused => {
-                    let _ = event_tx.send(ObsEvent::RecordingPaused);
+                    let _ = event_tx.send(ObsEvent::RecordingPaused).await;
                 }
                 OutputState::Resumed => {
-                    let _ = event_tx.send(ObsEvent::RecordingResumed);
+                    let _ = event_tx.send(ObsEvent::RecordingResumed).await;
                 }
                 _ => {
                     // Other transitions (Starting, Stopping, etc.) — derive from `active`
                     if active {
-                        let _ = event_tx.send(ObsEvent::RecordingActive);
+                        let _ = event_tx.send(ObsEvent::RecordingActive).await;
                     } else {
-                        let _ = event_tx.send(ObsEvent::RecordingStopped);
+                        let _ = event_tx.send(ObsEvent::RecordingStopped).await;
                     }
                 }
             }
         }
         ReplayBufferStateChanged { active, .. } => {
             if active {
-                let _ = event_tx.send(ObsEvent::ReplayBufferActive);
+                let _ = event_tx.send(ObsEvent::ReplayBufferActive).await;
             } else {
-                let _ = event_tx.send(ObsEvent::ReplayBufferInactive);
+                let _ = event_tx.send(ObsEvent::ReplayBufferInactive).await;
             }
         }
         // Other OBS events (StreamStateChanged, SceneItemTransformChanged,

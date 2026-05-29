@@ -3,14 +3,57 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
+use log::warn;
 
 const SYSTEM_APP: &str = "system";
 const MIC_APP: &str = "mic";
 
+/// What an audio control targets. Parsed once from the config string so
+/// downstream code can dispatch by enum variant instead of repeated
+/// case-insensitive string comparisons at every call site.
+#[derive(Debug, Clone)]
+pub enum AppTarget {
+    /// Default audio output (sink).
+    System,
+    /// Default audio input (source).
+    Mic,
+    /// Substring match against running audio applications.
+    Named(String),
+}
+
+impl AppTarget {
+    fn parse(s: &str) -> Self {
+        if s.eq_ignore_ascii_case(SYSTEM_APP) {
+            AppTarget::System
+        } else if s.eq_ignore_ascii_case(MIC_APP) {
+            AppTarget::Mic
+        } else {
+            AppTarget::Named(s.to_string())
+        }
+    }
+
+    /// Human-readable label used in verbose logs and OSD captions.
+    pub fn label(&self) -> &str {
+        match self {
+            AppTarget::System => "System",
+            AppTarget::Mic => "Mic",
+            AppTarget::Named(s) => s.as_str(),
+        }
+    }
+}
+
+/// Shared payload for volume/mute actions: which targets to drive plus an
+/// optional explicit icon name for the OSD.
+#[derive(Debug)]
+pub struct AppAction {
+    pub targets: Vec<AppTarget>,
+    pub icon: Option<String>,
+}
+
 #[derive(Debug)]
 pub enum Action {
-    Volume { apps: Vec<String>, icon: Option<String> },
-    ToggleMute { apps: Vec<String>, icon: Option<String> },
+    Volume(AppAction),
+    ToggleMute(AppAction),
     ObsSaveReplay,
     ObsToggleRecording,
     ObsPauseRecording,
@@ -18,14 +61,6 @@ pub enum Action {
 }
 
 impl Action {
-    pub fn is_system(app: &str) -> bool {
-        app.eq_ignore_ascii_case(SYSTEM_APP)
-    }
-
-    pub fn is_mic(app: &str) -> bool {
-        app.eq_ignore_ascii_case(MIC_APP)
-    }
-
     pub fn is_obs(&self) -> bool {
         matches!(
             self,
@@ -78,6 +113,50 @@ pub struct Config {
     pub mappings: HashMap<ControlId, Action>,
     pub rgb: Option<RgbMode>,
     pub obs: Option<ObsConfig>,
+    pub logo: LogoConfig,
+}
+
+/// Which (if any) state the logo LED should indicate. The logo is a single
+/// LED, so it can show at most one thing at a time — the user picks which.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum LogoIndicator {
+    /// Logo just matches the panel color — no separate indication.
+    #[default]
+    None,
+    /// Logo shows the default microphone's mute state.
+    Mic,
+    /// Logo shows OBS's replay-buffer state (only meaningful when OBS is
+    /// connected; matches the panel color when disconnected).
+    Replay,
+}
+
+/// Logo configuration: which indicator (if any) drives the logo, plus the
+/// color for each possible state. Unused colors are simply ignored.
+/// Sensible defaults mean users can just pick an indicator and get
+/// reasonable behavior without touching the colors.
+///
+/// Only effective in states where the logo is independently writable
+/// (i.e. not global animations like rainbow/wave/breath, nor the global
+/// breath used by `paused_use_breath`).
+#[derive(Debug, Clone, Copy)]
+pub struct LogoConfig {
+    pub indicator: LogoIndicator,
+    pub mic_muted: RgbColor,
+    pub mic_unmuted: RgbColor,
+    pub replay_active: RgbColor,
+    pub replay_inactive: RgbColor,
+}
+
+impl Default for LogoConfig {
+    fn default() -> Self {
+        Self {
+            indicator: LogoIndicator::None,
+            mic_muted: RgbColor { r: 0xFF, g: 0x00, b: 0x00 },
+            mic_unmuted: RgbColor { r: 0x00, g: 0xFF, b: 0x00 },
+            replay_active: RgbColor { r: 0x00, g: 0xFF, b: 0xFF },
+            replay_inactive: RgbColor { r: 0x00, g: 0x00, b: 0x00 },
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -90,9 +169,10 @@ pub struct ObsConfig {
     /// user normally manages replay buffer state in OBS directly.
     pub start_replay_buffer: bool,
     /// If true, the panel shows a global breath effect when recording is
-    /// paused (driving every LED, including the logo, so the replay-buffer
-    /// indicator is unavailable during paused). If false (default), paused
-    /// renders as a solid color so the logo can keep showing replay state.
+    /// paused — every LED including the logo joins the breath, so any
+    /// configured `[logo]` indicator is unavailable while paused. If false
+    /// (default), paused renders as a solid color and the logo continues
+    /// to show whatever the indicator says.
     pub paused_use_breath: bool,
     pub colors: ObsColors,
 }
@@ -104,16 +184,9 @@ pub struct ObsColors {
     pub success_flash: RgbColor,
     pub error_flash: RgbColor,
     pub flash_duration_ms: u64,
-    /// Panel color when OBS is connected and idle (not recording). The
-    /// logo separately reflects replay-buffer state. When OBS is
-    /// disconnected, `[rgb]` is used instead.
+    /// Panel color when OBS is connected and idle (not recording). When OBS
+    /// is disconnected, `[rgb]` is used instead.
     pub idle_panel: RgbColor,
-    /// Logo color when OBS-connected-and-idle and the replay buffer is
-    /// currently running.
-    pub replay_active: RgbColor,
-    /// Logo color when OBS-connected-and-idle and the replay buffer is
-    /// stopped (or its state hasn't been queried yet).
-    pub replay_inactive: RgbColor,
 }
 
 impl Default for ObsColors {
@@ -128,8 +201,6 @@ impl Default for ObsColors {
             error_flash: RgbColor { r: 0xFF, g: 0x00, b: 0xFF },
             flash_duration_ms: 500,
             idle_panel: RgbColor { r: 0x20, g: 0x20, b: 0x20 },
-            replay_active: RgbColor { r: 0x00, g: 0xFF, b: 0x00 },
-            replay_inactive: RgbColor { r: 0x00, g: 0x00, b: 0x00 },
         }
     }
 }
@@ -293,7 +364,12 @@ fn parse_bool_with_default(
     }
 }
 
-fn parse_apps(key: &str, table: &toml::value::Table) -> Result<Vec<String>> {
+fn parse_targets(key: &str, table: &toml::value::Table) -> Result<Vec<AppTarget>> {
+    let strings = parse_app_strings(key, table)?;
+    Ok(strings.into_iter().map(|s| AppTarget::parse(&s)).collect())
+}
+
+fn parse_app_strings(key: &str, table: &toml::value::Table) -> Result<Vec<String>> {
     let value = table
         .get("app")
         .with_context(|| format!("[{key}] missing \"app\" field"))?;
@@ -323,17 +399,15 @@ fn parse_action(key: &str, table: &toml::value::Table) -> Result<Action> {
         .and_then(|v| v.as_str())
         .with_context(|| format!("[{key}] missing \"action\" field"))?;
 
+    let app_action = |table: &toml::value::Table| -> Result<AppAction> {
+        Ok(AppAction {
+            targets: parse_targets(key, table)?,
+            icon: table.get("icon").and_then(|v| v.as_str()).map(String::from),
+        })
+    };
     match action {
-        "volume" => {
-            let apps = parse_apps(key, table)?;
-            let icon = table.get("icon").and_then(|v| v.as_str()).map(String::from);
-            Ok(Action::Volume { apps, icon })
-        }
-        "toggle-mute" => {
-            let apps = parse_apps(key, table)?;
-            let icon = table.get("icon").and_then(|v| v.as_str()).map(String::from);
-            Ok(Action::ToggleMute { apps, icon })
-        }
+        "volume" => Ok(Action::Volume(app_action(table)?)),
+        "toggle-mute" => Ok(Action::ToggleMute(app_action(table)?)),
         "obs-save-replay" => Ok(Action::ObsSaveReplay),
         "obs-toggle-recording" => Ok(Action::ObsToggleRecording),
         "obs-pause-recording" => Ok(Action::ObsPauseRecording),
@@ -360,11 +434,19 @@ fn parse_obs_section(table: &toml::value::Table) -> Result<ObsConfig> {
             n as u16
         }
     };
-    let password = table
-        .get("password")
-        .and_then(|v| v.as_str())
+    // Env var takes precedence over the config file value so secrets can be
+    // injected without leaving them in dotfile backups. Falls back to the
+    // file value when the env var is unset or empty.
+    let password = std::env::var("PCPANEL_OBS_PASSWORD")
+        .ok()
         .filter(|s| !s.is_empty())
-        .map(String::from);
+        .or_else(|| {
+            table
+                .get("password")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+        });
 
     let start_replay_buffer = match table.get("start_replay_buffer") {
         None => false,
@@ -390,6 +472,16 @@ fn parse_obs_section(table: &toml::value::Table) -> Result<ObsConfig> {
 }
 
 fn parse_obs_colors(table: &toml::value::Table) -> Result<ObsColors> {
+    // Warn on keys that used to live under [obs.colors] before being moved
+    // to [logo] — old configs would otherwise lose those customizations
+    // silently since the TOML parser doesn't reject unknown fields.
+    for moved_key in ["replay_active", "replay_inactive"] {
+        if table.contains_key(moved_key) {
+            warn!(
+                "[obs.colors] \"{moved_key}\" was moved to [logo] in a recent update — set [logo] indicator = \"replay\" and put \"{moved_key}\" there to keep this customization (the value here is being ignored)"
+            );
+        }
+    }
     let defaults = ObsColors::default();
     Ok(ObsColors {
         recording: parse_obs_color(table, "recording", defaults.recording)?,
@@ -398,8 +490,6 @@ fn parse_obs_colors(table: &toml::value::Table) -> Result<ObsColors> {
         error_flash: parse_obs_color(table, "error_flash", defaults.error_flash)?,
         flash_duration_ms: parse_flash_duration(table, defaults.flash_duration_ms)?,
         idle_panel: parse_obs_color(table, "idle_panel", defaults.idle_panel)?,
-        replay_active: parse_obs_color(table, "replay_active", defaults.replay_active)?,
-        replay_inactive: parse_obs_color(table, "replay_inactive", defaults.replay_inactive)?,
     })
 }
 
@@ -408,12 +498,24 @@ fn parse_obs_color(
     field: &str,
     default: RgbColor,
 ) -> Result<RgbColor> {
+    parse_section_color(table, "obs.colors", field, default)
+}
+
+/// Read an optional `field = "#RRGGBB"` entry from a TOML table, or return
+/// `default` if absent. `section` is the bracketed table name used in error
+/// messages (e.g. `"obs.colors"`, `"logo"`).
+fn parse_section_color(
+    table: &toml::value::Table,
+    section: &str,
+    field: &str,
+    default: RgbColor,
+) -> Result<RgbColor> {
     match table.get(field) {
         None => Ok(default),
         Some(v) => {
             let s = v
                 .as_str()
-                .with_context(|| format!("[obs.colors] \"{field}\" must be a hex color string"))?;
+                .with_context(|| format!("[{section}] \"{field}\" must be a hex color string"))?;
             let (r, g, b) = parse_hex_color(s)?;
             Ok(RgbColor { r, g, b })
         }
@@ -442,6 +544,7 @@ fn parse_config(content: &str) -> Result<Config> {
     let mut mappings = HashMap::new();
     let mut rgb = None;
     let mut obs = None;
+    let mut logo = LogoConfig::default();
     // Track which keys had OBS actions so we can produce a clear error
     // if [obs] is missing — order of TOML iteration isn't guaranteed.
     let mut obs_action_keys: Vec<String> = Vec::new();
@@ -457,6 +560,11 @@ fn parse_config(content: &str) -> Result<Config> {
             obs = Some(parse_obs_section(table)?);
             continue;
         }
+        if key == "logo" {
+            let table = value.as_table().context("[logo] must be a table")?;
+            logo = parse_logo_section(table)?;
+            continue;
+        }
 
         let table = value
             .as_table()
@@ -465,12 +573,12 @@ fn parse_config(content: &str) -> Result<Config> {
         let control = parse_control_id(key)?;
 
         // Validate: toggle-mute only on buttons
-        if matches!(action, Action::ToggleMute { .. }) && !control.is_button() {
+        if matches!(action, Action::ToggleMute(_)) && !control.is_button() {
             bail!("[{key}] toggle-mute can only be assigned to buttons");
         }
 
         // Validate: volume controls not on buttons
-        if matches!(action, Action::Volume { .. }) && control.is_button() {
+        if matches!(action, Action::Volume(_)) && control.is_button() {
             bail!("[{key}] volume controls cannot be assigned to buttons");
         }
 
@@ -494,7 +602,40 @@ fn parse_config(content: &str) -> Result<Config> {
         );
     }
 
-    Ok(Config { mappings, rgb, obs })
+    Ok(Config { mappings, rgb, obs, logo })
+}
+
+fn parse_logo_section(table: &toml::value::Table) -> Result<LogoConfig> {
+    let defaults = LogoConfig::default();
+    let indicator = match table.get("indicator") {
+        None => LogoIndicator::None,
+        Some(v) => {
+            let s = v
+                .as_str()
+                .context("[logo] \"indicator\" must be one of \"none\", \"mic\", \"replay\"")?;
+            match s {
+                "none" => LogoIndicator::None,
+                "mic" => LogoIndicator::Mic,
+                "replay" => LogoIndicator::Replay,
+                other => bail!("[logo] unknown indicator \"{other}\" (expected \"none\", \"mic\", or \"replay\")"),
+            }
+        }
+    };
+    Ok(LogoConfig {
+        indicator,
+        mic_muted: parse_logo_color(table, "mic_muted", defaults.mic_muted)?,
+        mic_unmuted: parse_logo_color(table, "mic_unmuted", defaults.mic_unmuted)?,
+        replay_active: parse_logo_color(table, "replay_active", defaults.replay_active)?,
+        replay_inactive: parse_logo_color(table, "replay_inactive", defaults.replay_inactive)?,
+    })
+}
+
+fn parse_logo_color(
+    table: &toml::value::Table,
+    field: &str,
+    default: RgbColor,
+) -> Result<RgbColor> {
+    parse_section_color(table, "logo", field, default)
 }
 
 #[cfg(test)]
@@ -551,8 +692,9 @@ mod tests {
         .unwrap();
 
         match config.mappings.get(&ControlId::Slider(0)) {
-            Some(Action::Volume { apps, .. }) => {
-                assert_eq!(apps, &["firefox", "Dota 2"]);
+            Some(Action::Volume(action)) => {
+                let labels: Vec<&str> = action.targets.iter().map(|t| t.label()).collect();
+                assert_eq!(labels, vec!["firefox", "Dota 2"]);
             }
             other => panic!("expected Volume, got {other:?}"),
         }
@@ -922,22 +1064,92 @@ mod tests {
     }
 
     #[test]
-    fn test_obs_idle_and_replay_colors() {
+    fn test_obs_idle_panel_color() {
         let config = parse_config(
             r##"
             [obs]
 
             [obs.colors]
             idle_panel = "#101020"
-            replay_active = "#10FF10"
-            replay_inactive = "#330000"
             "##,
         )
         .unwrap();
         let colors = config.obs.unwrap().colors;
         assert_eq!(colors.idle_panel, RgbColor { r: 0x10, g: 0x10, b: 0x20 });
-        assert_eq!(colors.replay_active, RgbColor { r: 0x10, g: 0xFF, b: 0x10 });
-        assert_eq!(colors.replay_inactive, RgbColor { r: 0x33, g: 0x00, b: 0x00 });
+    }
+
+    #[test]
+    fn test_logo_indicator_mic() {
+        let config = parse_config(
+            r##"
+            [logo]
+            indicator = "mic"
+            mic_muted = "#FF2030"
+            "##,
+        )
+        .unwrap();
+        assert_eq!(config.logo.indicator, LogoIndicator::Mic);
+        assert_eq!(config.logo.mic_muted, RgbColor { r: 0xFF, g: 0x20, b: 0x30 });
+        // Defaults applied to unset colors.
+        let defaults = LogoConfig::default();
+        assert_eq!(config.logo.mic_unmuted, defaults.mic_unmuted);
+    }
+
+    #[test]
+    fn test_logo_indicator_replay() {
+        let config = parse_config(
+            r##"
+            [logo]
+            indicator = "replay"
+            replay_active = "#10FF10"
+            replay_inactive = "#330000"
+            "##,
+        )
+        .unwrap();
+        assert_eq!(config.logo.indicator, LogoIndicator::Replay);
+        assert_eq!(config.logo.replay_active, RgbColor { r: 0x10, g: 0xFF, b: 0x10 });
+        assert_eq!(config.logo.replay_inactive, RgbColor { r: 0x33, g: 0x00, b: 0x00 });
+    }
+
+    #[test]
+    fn test_logo_section_absent_defaults_to_none() {
+        let config = parse_config("").unwrap();
+        assert_eq!(config.logo.indicator, LogoIndicator::None);
+    }
+
+    #[test]
+    fn test_logo_indicator_unknown_rejected() {
+        let result = parse_config(
+            r#"
+            [logo]
+            indicator = "foo"
+            "#,
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("foo"));
+    }
+
+    #[test]
+    fn test_logo_mic_muted_must_be_string() {
+        let result = parse_config(
+            r#"
+            [logo]
+            mic_muted = 42
+            "#,
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("hex color"));
+    }
+
+    #[test]
+    fn test_logo_mic_muted_bad_hex() {
+        let result = parse_config(
+            r##"
+            [logo]
+            mic_muted = "#GGGGGG"
+            "##,
+        );
+        assert!(result.is_err());
     }
 
     #[test]

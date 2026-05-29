@@ -40,6 +40,13 @@ fn binary_path() -> Result<String> {
 }
 
 fn generate_service_file(bin_path: &str) -> String {
+    // Hardening directives chosen to be compatible with the daemon's needs:
+    // - HID I/O via /dev/hidraw* (ProtectSystem=strict leaves /dev alone)
+    // - PulseAudio over its UNIX socket
+    // - OBS over a TCP socket (AF_INET / AF_INET6)
+    // - System D-Bus for logind's PrepareForSleep signal
+    // - Session D-Bus for KDE's org.kde.osdService
+    // No writes to disk at runtime, so ProtectHome=read-only is safe.
     format!(
         "\
 [Unit]
@@ -51,6 +58,25 @@ Wants=graphical-session.target
 ExecStart=\"{bin_path}\"
 Restart=on-failure
 RestartSec=5
+
+# Hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallFilter=@system-service
+SystemCallArchitectures=native
 
 [Install]
 WantedBy=default.target

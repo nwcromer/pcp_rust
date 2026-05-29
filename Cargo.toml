@@ -29,3 +29,6 @@ freedesktop-icons = "0.4"
 [patch.crates-io]
 libpulse-binding = { git = "https://github.com/nwcromer/pulse-binding-rust", branch = "fix-ext-stream-restore-write" }
 libpulse-sys = { git = "https://github.com/nwcromer/pulse-binding-rust", branch = "fix-ext-stream-restore-write" }
+
+[dev-dependencies]
+tempfile = "3.27.0"
