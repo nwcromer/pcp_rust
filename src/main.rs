@@ -137,6 +137,13 @@ fn spawn_resume_monitor() -> mpsc::Receiver<()> {
             }
         };
 
+        // All three pinned values (sender, interface, member) are hardcoded
+        // valid D-Bus identifiers, so the builder calls can't realistically
+        // error in production. The match arm exists as a defensive catch,
+        // not because we expect to hit it. If the sender pin ever did fail
+        // on some exotic D-Bus setup, resume detection would silently
+        // disable until the daemon is restarted — acceptable for the
+        // spoof-defense it buys.
         let rule = match MatchRule::builder()
             .msg_type(zbus::message::Type::Signal)
             .sender("org.freedesktop.login1")
@@ -183,7 +190,7 @@ fn spawn_resume_monitor() -> mpsc::Receiver<()> {
 fn refresh_mic_muted(audio: &audio::AudioController, obs: &mut ObsRuntime) -> bool {
     match audio.is_mic_muted() {
         Ok(muted) => {
-            obs.mic_muted = muted;
+            obs.set_mic_muted(muted);
             true
         }
         Err(e) => {
@@ -275,7 +282,11 @@ fn run(cli: Cli) -> Result<()> {
     // Set last_mic_poll into the past so the very first loop iteration
     // triggers a poll — otherwise if the startup seed failed (PA still
     // booting), the cached mic_muted=false is shown for up to MIC_POLL_INTERVAL.
-    let mut last_mic_poll = Instant::now() - MIC_POLL_INTERVAL;
+    // checked_sub guards against the (currently theoretical) case where
+    // Instant::now() is smaller than MIC_POLL_INTERVAL.
+    let mut last_mic_poll = Instant::now()
+        .checked_sub(MIC_POLL_INTERVAL)
+        .unwrap_or_else(Instant::now);
     // Track repeated PA failures so we warn once per outage instead of
     // every 250 ms. Reset to 0 on a successful poll.
     let mut mic_poll_failures: u32 = 0;
@@ -303,13 +314,17 @@ fn run(cli: Cli) -> Result<()> {
             match audio.is_mic_muted() {
                 Ok(muted) => {
                     if mic_poll_failures > 0 {
-                        info!(
-                            "audio: mic-mute poll recovered after {mic_poll_failures} failure(s)"
-                        );
+                        // Convert failure count to an approximate outage
+                        // duration so the recovery line reads as a timespan
+                        // rather than an alarming-looking large integer.
+                        let outage_secs = u64::from(mic_poll_failures)
+                            * MIC_POLL_INTERVAL.as_millis() as u64
+                            / 1000;
+                        info!("audio: mic-mute poll recovered after ~{outage_secs}s");
                         mic_poll_failures = 0;
                     }
-                    if muted != obs.mic_muted {
-                        obs.mic_muted = muted;
+                    if muted != obs.mic_muted() {
+                        obs.set_mic_muted(muted);
                         led_dirty = true;
                     }
                 }
@@ -462,8 +477,8 @@ fn handle_panel_event(
                                 // of waiting up to MIC_POLL_INTERVAL. Skip when
                                 // the mic indicator isn't selected — the cache
                                 // isn't read, so a repaint would do nothing.
-                                if obs.mic_indicator_enabled() && obs.mic_muted != muted {
-                                    obs.mic_muted = muted;
+                                if obs.mic_indicator_enabled() && obs.mic_muted() != muted {
+                                    obs.set_mic_muted(muted);
                                     led_dirty = true;
                                 }
                                 osd::show_mic_mute(muted);

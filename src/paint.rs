@@ -108,7 +108,8 @@ pub fn apply_rgb(panel: &PcPanelPro, mode: RgbMode, logo_override: Option<RgbCol
 /// breath, and the paused breath effect from `paused_use_breath = true`),
 /// which drive every LED in lockstep and don't expose the logo separately.
 pub fn paint_leds(panel: &PcPanelPro, obs: &ObsRuntime, idle_rgb: Option<RgbMode>) -> Result<()> {
-    if let Some(f) = obs.flash {
+    let colors = obs.colors();
+    if let Some(f) = obs.flash() {
         // Flash takes the whole panel including the logo — command feedback
         // (especially success on SaveReplay / SplitRecording, whose only ack
         // is the flash) wins over the steady-state indicator for the brief
@@ -118,10 +119,10 @@ pub fn paint_leds(panel: &PcPanelPro, obs: &ObsRuntime, idle_rgb: Option<RgbMode
         paint_logo_solid(panel, flash_color)?;
         return Ok(());
     }
-    match obs.state {
-        ObsState::Idle if obs.connected => {
-            paint_panel_solid(panel, obs.colors.idle_panel)?;
-            paint_logo_with_indicator(panel, obs, obs.colors.idle_panel)?;
+    match obs.state() {
+        ObsState::Idle if obs.connected() => {
+            paint_panel_solid(panel, colors.idle_panel)?;
+            paint_logo_with_indicator(panel, obs, colors.idle_panel)?;
         }
         ObsState::Idle => {
             // Only pass the indicator color through when the active mode
@@ -141,23 +142,23 @@ pub fn paint_leds(panel: &PcPanelPro, obs: &ObsRuntime, idle_rgb: Option<RgbMode
             }
         }
         ObsState::Recording => {
-            paint_panel_solid(panel, obs.colors.recording)?;
-            paint_logo_with_indicator(panel, obs, obs.colors.recording)?;
+            paint_panel_solid(panel, colors.recording)?;
+            paint_logo_with_indicator(panel, obs, colors.recording)?;
         }
         ObsState::RecordingPaused => {
-            if obs.paused_use_breath {
+            if obs.paused_use_breath() {
                 // Global breath animation — drives every LED including the
                 // logo, so the replay-buffer indicator (and mic-mute
                 // override) is unavailable during paused.
                 let hue = led::rgb_to_hue(Rgb::new(
-                    obs.colors.paused.r,
-                    obs.colors.paused.g,
-                    obs.colors.paused.b,
+                    colors.paused.r,
+                    colors.paused.g,
+                    colors.paused.b,
                 ));
                 led::set_breath(panel, hue, config::DEFAULT_BRIGHTNESS, config::DEFAULT_SPEED)?;
             } else {
-                paint_panel_solid(panel, obs.colors.paused)?;
-                paint_logo_with_indicator(panel, obs, obs.colors.paused)?;
+                paint_panel_solid(panel, colors.paused)?;
+                paint_logo_with_indicator(panel, obs, colors.paused)?;
             }
         }
     }

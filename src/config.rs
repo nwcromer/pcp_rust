@@ -613,11 +613,14 @@ fn parse_logo_section(table: &toml::value::Table) -> Result<LogoConfig> {
             let s = v
                 .as_str()
                 .context("[logo] \"indicator\" must be one of \"none\", \"mic\", \"replay\"")?;
-            match s {
-                "none" => LogoIndicator::None,
-                "mic" => LogoIndicator::Mic,
-                "replay" => LogoIndicator::Replay,
-                other => bail!("[logo] unknown indicator \"{other}\" (expected \"none\", \"mic\", or \"replay\")"),
+            if s.eq_ignore_ascii_case("none") {
+                LogoIndicator::None
+            } else if s.eq_ignore_ascii_case("mic") {
+                LogoIndicator::Mic
+            } else if s.eq_ignore_ascii_case("replay") {
+                LogoIndicator::Replay
+            } else {
+                bail!("[logo] unknown indicator \"{s}\" (expected \"none\", \"mic\", or \"replay\")");
             }
         }
     };
@@ -1115,6 +1118,20 @@ mod tests {
     fn test_logo_section_absent_defaults_to_none() {
         let config = parse_config("").unwrap();
         assert_eq!(config.logo.indicator, LogoIndicator::None);
+    }
+
+    #[test]
+    fn test_logo_indicator_case_insensitive() {
+        for variant in ["MIC", "Mic", "mIc"] {
+            let config = parse_config(&format!(
+                r#"
+                [logo]
+                indicator = "{variant}"
+                "#
+            ))
+            .unwrap();
+            assert_eq!(config.logo.indicator, LogoIndicator::Mic, "for {variant}");
+        }
     }
 
     #[test]

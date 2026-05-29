@@ -7,7 +7,7 @@
 //!
 //! Reconnects automatically with exponential backoff when OBS is absent.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use log::{debug, info, warn};
@@ -105,6 +105,13 @@ pub fn spawn_obs_thread(config: ObsConfig) -> Option<ObsHandle> {
 
 const BACKOFF_INITIAL_SECS: u64 = 2;
 const BACKOFF_MAX_SECS: u64 = 30;
+/// A session must dwell at least this long for us to consider it "stable"
+/// and reset the reconnect backoff. Shorter sessions (e.g. OBS accepts the
+/// WebSocket handshake but immediately rejects the event subscription
+/// because of an auth version mismatch or a plugin restart) get treated
+/// as failed attempts so the backoff keeps growing — otherwise the
+/// reconnect loop fires as fast as the network allows.
+const STABLE_SESSION_DWELL: Duration = Duration::from_secs(30);
 
 /// Best-effort check for whether the configured OBS host is on the local
 /// machine. obs-websocket is unencrypted plain ws://, so a non-localhost
@@ -136,7 +143,7 @@ async fn obs_main_loop(
             Ok(client) => {
                 info!("OBS: connected to {}:{}", config.host, config.port);
                 let _ = event_tx.send(ObsEvent::Connected).await;
-                backoff = BACKOFF_INITIAL_SECS;
+                let session_start = Instant::now();
 
                 // Run the session until the connection drops or the main
                 // thread closes the command channel.
@@ -145,8 +152,21 @@ async fn obs_main_loop(
                 }
 
                 let _ = event_tx.send(ObsEvent::Disconnected).await;
-                // Continue to outer loop to reconnect (no backoff — we just
-                // had a working connection, so reconnect attempt is cheap).
+
+                if session_start.elapsed() >= STABLE_SESSION_DWELL {
+                    // Stable session — reset backoff so the next reconnect
+                    // (e.g. user restarted OBS) is quick.
+                    backoff = BACKOFF_INITIAL_SECS;
+                } else {
+                    // Flapping — session died too quickly. Treat as a failed
+                    // attempt so we don't hammer the network/journal.
+                    debug!(
+                        "OBS: session ended after {}s; backing off {backoff}s before retry",
+                        session_start.elapsed().as_secs()
+                    );
+                    sleep(Duration::from_secs(backoff)).await;
+                    backoff = (backoff * 2).min(BACKOFF_MAX_SECS);
+                }
             }
             Err(e) => {
                 debug!("OBS: connect failed ({e}); retrying in {backoff}s");
@@ -240,7 +260,12 @@ async fn run_session(
     }
 
     loop {
+        // `biased` polls cmd_rx first every iteration so button presses
+        // can't get starved when the events arm is parked on
+        // `event_tx.send(...).await` (which happens if the main thread
+        // can't drain the bounded events channel fast enough).
         tokio::select! {
+            biased;
             cmd = cmd_rx.recv() => {
                 match cmd {
                     Some(cmd) => handle_command(client, cmd, event_tx).await,

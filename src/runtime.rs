@@ -87,28 +87,28 @@ impl Flash {
 /// `dispatch`/`drain_events` operate over a single self.
 pub struct ObsRuntime {
     handle: Option<ObsHandle>,
-    pub connected: bool,
-    pub state: ObsState,
-    pub colors: ObsColors,
-    pub flash: Option<Flash>,
+    connected: bool,
+    state: ObsState,
+    colors: ObsColors,
+    flash: Option<Flash>,
     /// Whether OBS's replay buffer is currently running. `None` until OBS
     /// reports its state (during initial-status query on connect or via an
     /// event). Reset to `None` on disconnect.
-    pub replay_buffer_active: Option<bool>,
+    replay_buffer_active: Option<bool>,
     /// Pulled from `ObsConfig.paused_use_breath`. When true, paused state
     /// renders as a global breath animation that drives every LED including
     /// the logo (so any configured logo indicator is unavailable while
     /// paused). When false, paused is a solid panel color and the logo
     /// continues to show whatever the configured indicator says.
-    pub paused_use_breath: bool,
+    paused_use_breath: bool,
     /// Current default-microphone mute state. Tracked here (rather than
     /// queried fresh at paint time) so it persists across paints and so
     /// changes can mark the LEDs dirty for a repaint.
-    pub mic_muted: bool,
+    mic_muted: bool,
     /// Which logo indicator is active and the colors for each state.
     /// `LogoIndicator::None` (the default) means the logo just matches the
     /// panel color.
-    pub logo_cfg: LogoConfig,
+    logo_cfg: LogoConfig,
 }
 
 impl ObsRuntime {
@@ -129,6 +129,42 @@ impl ObsRuntime {
             mic_muted: false,
             logo_cfg,
         }
+    }
+
+    // ---- Field accessors. paint.rs and main.rs read these via methods so
+    // ---- the field-level invariants enforced by apply_event (e.g. "if
+    // ---- !connected then replay_buffer_active is None") can't be
+    // ---- accidentally violated by a stray direct write.
+
+    pub fn connected(&self) -> bool {
+        self.connected
+    }
+
+    pub fn state(&self) -> ObsState {
+        self.state
+    }
+
+    pub fn colors(&self) -> &ObsColors {
+        &self.colors
+    }
+
+    pub fn flash(&self) -> Option<Flash> {
+        self.flash
+    }
+
+    pub fn paused_use_breath(&self) -> bool {
+        self.paused_use_breath
+    }
+
+    pub fn mic_muted(&self) -> bool {
+        self.mic_muted
+    }
+
+    /// Update the cached mic-mute state. The only external mutator —
+    /// button presses and the periodic poll both go through this so the
+    /// LED dirty-tracking can stay in main.rs.
+    pub fn set_mic_muted(&mut self, muted: bool) {
+        self.mic_muted = muted;
     }
 
     /// The color the configured logo indicator wants right now, or `None`
@@ -273,6 +309,14 @@ impl ObsRuntime {
     /// if a blinking flash is active (in which case we keep repainting so
     /// the on/off phases render — the simplest implementation, costs an
     /// extra LED write per main-loop iteration for the flash duration).
+    ///
+    /// This produces redundant paints: the main loop runs at roughly
+    /// 10 Hz (paced by panel.read_event's 100 ms HID timeout) while the
+    /// blink phase only flips every 100 ms, so up to half of the paints
+    /// during a blink rewrite the same color. Not worth tracking
+    /// last-painted-phase to skip them — default flash_duration_ms is
+    /// 500 ms (~5 paints total) and each paint is microseconds of HID
+    /// traffic.
     pub fn expire_flash(&mut self) -> bool {
         match self.flash {
             Some(f) if Instant::now() >= f.expires_at => {

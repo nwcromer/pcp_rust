@@ -11,6 +11,7 @@ use pulse::callbacks::ListResult;
 use pulse::context::ext_stream_restore::Info as SrInfo;
 use pulse::context::{self, FlagSet};
 use pulse::mainloop::standard::{IterateResult, Mainloop};
+use pulse::operation::Operation;
 use pulse::proplist::{Proplist, UpdateMode};
 use pulse::volume::{ChannelVolumes, Volume};
 
@@ -33,6 +34,18 @@ struct PendingPersist {
 enum Target {
     DefaultSink,
     DefaultSource,
+}
+
+/// Three-state outcome of `query_default_mute`'s introspect callback.
+/// Distinguishes "device genuinely absent" (callback ran to End without
+/// ever yielding Item) from "PA-side enumeration error" (Error variant
+/// fired) so the surfaced error message is accurate during triage.
+#[derive(Clone)]
+enum MuteOutcome {
+    Pending,
+    Item(bool),
+    NotFound,
+    Error,
 }
 
 impl Target {
@@ -246,15 +259,26 @@ impl AudioController {
     }
 
     /// Run a PA write that reports success/failure via a bool callback
-    /// (e.g., `sr.write`). Returns the reported success state or an error
-    /// if the operation didn't complete.
+    /// (e.g., `sr.write`). The `register` closure must return the
+    /// `Operation` handle so we can cancel it if the wait deadline trips —
+    /// otherwise libpulse-binding's `Operation::drop` deliberately leaks
+    /// the boxed callback (so PA can still invoke it after drop without
+    /// UAF). Returns the reported success state or an error if the
+    /// operation didn't complete in time.
     fn pa_write_with_result<R>(&self, register: R) -> Result<bool>
     where
-        R: FnOnce(Rc<RefCell<Option<bool>>>),
+        R: FnOnce(Rc<RefCell<Option<bool>>>) -> Option<Operation<dyn FnMut(bool) + 'static>>,
     {
         let result: Rc<RefCell<Option<bool>>> = Rc::new(RefCell::new(None));
-        register(result.clone());
-        self.wait_until(|| result.borrow().is_some())?;
+        let mut op = register(result.clone());
+        let wait_result = self.wait_until(|| result.borrow().is_some());
+        if wait_result.is_err()
+            && let Some(op) = op.as_mut()
+        {
+            // Cancel before drop so the boxed FnMut can be freed cleanly.
+            op.cancel();
+        }
+        wait_result?;
         result
             .borrow()
             .ok_or_else(|| anyhow::anyhow!("PA write did not complete"))
@@ -286,33 +310,62 @@ impl AudioController {
         })
     }
 
-    /// Current mute state of the named default sink/source. Errors if the
-    /// source/sink isn't found (otherwise the caller can't distinguish a
-    /// genuinely unmuted device from one that doesn't exist).
+    /// Current mute state of the named default sink/source. Errors with a
+    /// label-distinguished message depending on whether PA finished
+    /// enumeration without ever yielding an Item (genuinely not present)
+    /// vs. reported an enumeration Error (server-side failure).
     fn query_default_mute(&self, target: Target) -> Result<bool> {
         let name = target.pa_name();
-        let mute: Option<bool> = self.pa_query(None, |mute, done| {
+        let outcome: MuteOutcome = self.pa_query(MuteOutcome::Pending, |out, done| {
             let introspect = self.context.borrow().introspect();
             match target {
                 Target::DefaultSink => {
                     let _op = introspect.get_sink_info_by_name(name, move |result| {
-                        if let ListResult::Item(sink) = result {
-                            *mute.borrow_mut() = Some(sink.mute);
+                        match result {
+                            ListResult::Item(sink) => {
+                                *out.borrow_mut() = MuteOutcome::Item(sink.mute);
+                            }
+                            ListResult::End => {
+                                if matches!(*out.borrow(), MuteOutcome::Pending) {
+                                    *out.borrow_mut() = MuteOutcome::NotFound;
+                                }
+                            }
+                            ListResult::Error => {
+                                *out.borrow_mut() = MuteOutcome::Error;
+                            }
                         }
                         *done.borrow_mut() = true;
                     });
                 }
                 Target::DefaultSource => {
                     let _op = introspect.get_source_info_by_name(name, move |result| {
-                        if let ListResult::Item(source) = result {
-                            *mute.borrow_mut() = Some(source.mute);
+                        match result {
+                            ListResult::Item(source) => {
+                                *out.borrow_mut() = MuteOutcome::Item(source.mute);
+                            }
+                            ListResult::End => {
+                                if matches!(*out.borrow(), MuteOutcome::Pending) {
+                                    *out.borrow_mut() = MuteOutcome::NotFound;
+                                }
+                            }
+                            ListResult::Error => {
+                                *out.borrow_mut() = MuteOutcome::Error;
+                            }
                         }
                         *done.borrow_mut() = true;
                     });
                 }
             }
         })?;
-        mute.with_context(|| format!("{} not found", target.label()))
+        match outcome {
+            MuteOutcome::Item(b) => Ok(b),
+            MuteOutcome::NotFound | MuteOutcome::Pending => {
+                bail!("{} not found", target.label())
+            }
+            MuteOutcome::Error => {
+                bail!("PulseAudio enumeration error while querying {}", target.label())
+            }
+        }
     }
 
     fn set_default_volume(&self, target: Target, value: u8) -> Result<()> {
@@ -354,20 +407,16 @@ impl AudioController {
                 *done.borrow_mut() = Some(ok);
             });
             match target {
-                Target::DefaultSink => {
-                    let _op = introspect.set_sink_mute_by_name(
-                        target.pa_name(),
-                        new_mute,
-                        Some(cb),
-                    );
-                }
-                Target::DefaultSource => {
-                    let _op = introspect.set_source_mute_by_name(
-                        target.pa_name(),
-                        new_mute,
-                        Some(cb),
-                    );
-                }
+                Target::DefaultSink => Some(introspect.set_sink_mute_by_name(
+                    target.pa_name(),
+                    new_mute,
+                    Some(cb),
+                )),
+                Target::DefaultSource => Some(introspect.set_source_mute_by_name(
+                    target.pa_name(),
+                    new_mute,
+                    Some(cb),
+                )),
             }
         });
         match write {
@@ -587,9 +636,9 @@ impl AudioController {
         let refs: Vec<&SrInfo> = updated.iter().collect();
         let success = self.pa_write_with_result(|result| {
             let mut sr = self.context.borrow().stream_restore();
-            let _op = sr.write(UpdateMode::Replace, &refs, false, move |success| {
+            Some(sr.write(UpdateMode::Replace, &refs, false, move |success| {
                 *result.borrow_mut() = Some(success);
-            });
+            }))
         })?;
         if !success {
             bail!("stream-restore write rejected by server");
