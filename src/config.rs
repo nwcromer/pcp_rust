@@ -224,6 +224,40 @@ pub fn load_config(path: &Path) -> Result<Config> {
     parse_config(&content)
 }
 
+/// Keys present in `table` that aren't in `known`. Pure so it can be
+/// unit-tested; `warn_unknown_keys` is the logging wrapper.
+fn unknown_keys(table: &toml::value::Table, known: &[&str]) -> Vec<String> {
+    table
+        .keys()
+        .filter(|k| !known.contains(&k.as_str()))
+        .cloned()
+        .collect()
+}
+
+/// Warn (don't fail) on keys the parser doesn't recognize. The TOML parser
+/// silently ignores unknown keys, so a typo like `brigthness` would
+/// otherwise leave the user with a default value and no feedback. We warn
+/// rather than bail so a config written for a newer pcp_rust doesn't
+/// hard-fail an older binary — an unknown key and a future key are
+/// indistinguishable here.
+fn warn_unknown_keys(table: &toml::value::Table, section: &str, known: &[&str]) {
+    for key in unknown_keys(table, known) {
+        warn!("[{section}] unknown key \"{key}\" — ignored (possible typo?)");
+    }
+}
+
+/// Recognized keys for an `[rgb]` table, which depend on the mode.
+fn rgb_known_keys(mode: &str) -> &'static [&'static str] {
+    match mode {
+        "solid" => &["mode", "color"],
+        "rainbow" => &["mode", "style"],
+        "gradient" | "volume-gradient" => &["mode", "color1", "color2"],
+        "wave" => &["mode", "hue", "brightness", "speed", "reverse", "bounce"],
+        "breath" => &["mode", "hue", "brightness", "speed"],
+        _ => &["mode"], // unknown mode bails below; nothing else to validate
+    }
+}
+
 fn parse_control_id(key: &str) -> Result<ControlId> {
     if let Some(n) = key.strip_prefix("knob") {
         let i: u8 = n.parse().context("invalid knob number")?;
@@ -265,6 +299,8 @@ fn parse_rgb_section(table: &toml::value::Table) -> Result<RgbMode> {
         .get("mode")
         .and_then(|v| v.as_str())
         .context("[rgb] missing \"mode\" field")?;
+
+    warn_unknown_keys(table, "rgb", rgb_known_keys(mode));
 
     match mode {
         "solid" => {
@@ -426,6 +462,11 @@ fn parse_action(key: &str, table: &toml::value::Table) -> Result<Action> {
 }
 
 fn parse_obs_section(table: &toml::value::Table) -> Result<ObsConfig> {
+    warn_unknown_keys(
+        table,
+        "obs",
+        &["host", "port", "password", "start_replay_buffer", "paused_use_breath", "colors"],
+    );
     let host = table
         .get("host")
         .and_then(|v| v.as_str())
@@ -491,6 +532,16 @@ fn parse_obs_colors(table: &toml::value::Table) -> Result<ObsColors> {
             );
         }
     }
+    // `replay_active`/`replay_inactive` are listed as known here so they
+    // don't double-warn — the moved-key message above already covers them.
+    warn_unknown_keys(
+        table,
+        "obs.colors",
+        &[
+            "recording", "recording_paused", "success_flash", "error_flash",
+            "flash_duration_ms", "idle_panel", "replay_active", "replay_inactive",
+        ],
+    );
     let defaults = ObsColors::default();
     Ok(ObsColors {
         recording: parse_obs_color(table, "recording", defaults.recording)?,
@@ -578,6 +629,7 @@ fn parse_config(content: &str) -> Result<Config> {
         let table = value
             .as_table()
             .with_context(|| format!("[{key}] expected a table"))?;
+        warn_unknown_keys(table, key, &["action", "app", "icon"]);
         let action = parse_action(key, table)?;
         let control = parse_control_id(key)?;
 
@@ -615,6 +667,11 @@ fn parse_config(content: &str) -> Result<Config> {
 }
 
 fn parse_logo_section(table: &toml::value::Table) -> Result<LogoConfig> {
+    warn_unknown_keys(
+        table,
+        "logo",
+        &["indicator", "mic_muted", "mic_unmuted", "mic_unknown", "replay_active", "replay_inactive"],
+    );
     let defaults = LogoConfig::default();
     let indicator = match table.get("indicator") {
         None => LogoIndicator::None,
@@ -654,6 +711,54 @@ fn parse_logo_color(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn table(toml_src: &str) -> toml::value::Table {
+        toml::from_str(toml_src).unwrap()
+    }
+
+    #[test]
+    fn unknown_keys_flags_only_unrecognized() {
+        let t = table("action = \"volume\"\napp = \"x\"\nicn = \"firefox\"\n");
+        let unknown = unknown_keys(&t, &["action", "app", "icon"]);
+        assert_eq!(unknown, vec!["icn".to_string()]);
+    }
+
+    #[test]
+    fn unknown_keys_empty_when_all_recognized() {
+        let t = table("action = \"volume\"\napp = \"x\"\nicon = \"firefox\"\n");
+        assert!(unknown_keys(&t, &["action", "app", "icon"]).is_empty());
+    }
+
+    #[test]
+    fn rgb_known_keys_track_mode() {
+        assert_eq!(rgb_known_keys("solid"), &["mode", "color"]);
+        assert_eq!(rgb_known_keys("gradient"), rgb_known_keys("volume-gradient"));
+        // Unknown mode → only "mode" is recognized (the mode itself bails later).
+        assert_eq!(rgb_known_keys("bogus"), &["mode"]);
+    }
+
+    #[test]
+    fn unknown_key_warns_but_does_not_fail_parse() {
+        // A typo'd optional key must still parse (warn, not error) so a
+        // config written for a newer pcp_rust doesn't hard-fail here.
+        let config = parse_config(
+            r#"
+            [rgb]
+            mode = "wave"
+            hue = 100
+            brigthness = 150
+            "#,
+        )
+        .expect("typo'd optional key should warn, not fail");
+        match config.rgb {
+            Some(RgbMode::Wave { hue, brightness, .. }) => {
+                assert_eq!(hue, 100);
+                // The misspelled key was ignored, so brightness is the default.
+                assert_eq!(brightness, DEFAULT_BRIGHTNESS);
+            }
+            other => panic!("expected Wave, got {other:?}"),
+        }
+    }
 
     #[test]
     fn test_valid_config() {
