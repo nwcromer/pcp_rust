@@ -685,8 +685,11 @@ fn parse_config(content: &str) -> Result<Config> {
             .as_table()
             .with_context(|| format!("[{key}] expected a table"))?;
         warn_unknown_keys(table, key, &["action", "app", "icon"]);
-        let action = parse_action(key, table)?;
+        // Resolve the control name first so a mistyped section (e.g.
+        // `[slder1]`) reports "unknown control" rather than a downstream
+        // "missing action field" from parsing its contents.
         let control = parse_control_id(key)?;
+        let action = parse_action(key, table)?;
 
         // Validate: toggle-mute only on buttons
         if matches!(action, Action::ToggleMute(_)) && !control.is_button() {
