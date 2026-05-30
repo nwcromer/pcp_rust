@@ -362,7 +362,7 @@ fn run(cli: Cli) -> Result<()> {
         // any button-triggered state changes (e.g., a local error flash from
         // a dispatch when OBS is disconnected) get painted this iteration.
         if let Some(event) = panel.read_event()? {
-            led_dirty |= handle_panel_event(event, &cli, &config, &mut audio, &mut obs)?;
+            led_dirty |= handle_panel_event(event, &cli, &config, &mut audio, &mut obs);
         }
 
         // Repaint LEDs if anything changed (OBS event, flash expiry, resume,
@@ -428,7 +428,7 @@ fn handle_panel_event(
     config: &config::Config,
     audio: &mut audio::AudioController,
     obs: &mut ObsRuntime,
-) -> Result<bool> {
+) -> bool {
     let mut led_dirty = false;
     match event {
         Event::AnalogChange { control, value } => {
@@ -540,6 +540,6 @@ fn handle_panel_event(
         }
         Event::ButtonRelease { .. } => {}
     }
-    Ok(led_dirty)
+    led_dirty
 }
 
