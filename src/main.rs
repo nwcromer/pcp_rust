@@ -441,11 +441,15 @@ fn handle_panel_event(
                 let pct = (value as f32 / 255.0 * 100.0) as u8;
                 let mut matched: Vec<&AppTarget> = Vec::new();
                 for target in &action.targets {
+                    // Only trace targets that actually changed — a miss
+                    // (app not running) or PA error is already logged at
+                    // debug!/warn! in the audio layer, so printing here too
+                    // would falsely claim a change happened.
                     if apply_volume_to(audio, target, value) {
                         matched.push(target);
-                    }
-                    if cli.verbose {
-                        println!("{} volume: {pct}%", target.label());
+                        if cli.verbose {
+                            println!("{} volume: {pct}%", target.label());
+                        }
                     }
                 }
                 // Show OSD once per control event, only if something matched.
