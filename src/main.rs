@@ -324,7 +324,6 @@ fn run(cli: Cli) -> Result<()> {
             last_mic_poll = Some(Instant::now());
             match audio.is_mic_muted() {
                 Ok(muted) => {
-                    let was_stale = obs.mic_indicator_needs_repaint();
                     if mic_poll_failures > 0 {
                         // Approximate outage duration. Duration's Debug
                         // formatter picks an appropriate unit (250ms,
@@ -334,15 +333,11 @@ fn run(cli: Cli) -> Result<()> {
                         info!("audio: mic-mute poll recovered after ~{outage:?}");
                         mic_poll_failures = 0;
                     }
-                    let changed = muted != obs.mic_muted();
-                    // Always set on a successful poll — even when the value
-                    // hasn't changed — because set_mic_muted is the entry
-                    // point for refreshing mic_confirmed_at, which is what
-                    // keeps the logo out of its "unknown" stale state.
-                    obs.set_mic_muted(muted);
-                    if changed || was_stale {
-                        led_dirty = true;
-                    }
+                    // Always record on a successful poll — even when unchanged
+                    // — so mic_confirmed_at stays fresh and the logo leaves the
+                    // "unknown" stale state. update_mic_muted reports whether a
+                    // repaint is needed (value changed, or we just recovered).
+                    led_dirty |= obs.update_mic_muted(muted);
                 }
                 Err(e) => {
                     if mic_poll_failures == 0 {
@@ -494,20 +489,8 @@ fn handle_panel_event(
                             AppTarget::Mic => {
                                 // Update the cached mic-mute state immediately
                                 // so the logo repaints this iteration instead
-                                // of waiting up to MIC_POLL_INTERVAL. Always
-                                // call set_mic_muted on a confirmed reading
-                                // so mic_confirmed_at stays fresh (the
-                                // stale-detection trust contract depends on
-                                // every successful confirmation refreshing
-                                // it, not just the changed ones).
-                                if obs.mic_indicator_enabled() {
-                                    let changed = obs.mic_muted() != muted;
-                                    let was_stale = obs.mic_indicator_needs_repaint();
-                                    obs.set_mic_muted(muted);
-                                    if changed || was_stale {
-                                        led_dirty = true;
-                                    }
-                                }
+                                // of waiting up to MIC_POLL_INTERVAL.
+                                led_dirty |= obs.update_mic_muted(muted);
                                 osd::show_mic_mute(muted);
                             }
                             AppTarget::Named(name) => {

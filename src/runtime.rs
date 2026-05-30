@@ -180,19 +180,31 @@ impl ObsRuntime {
         self.paused_use_breath
     }
 
-    pub fn mic_muted(&self) -> bool {
-        self.mic_muted
-    }
-
     /// Record a confirmed mic-mute state from PA. Updates the cached
     /// `mic_muted` AND bumps `mic_confirmed_at` so the logo trusts the
-    /// value for the next MIC_STALE_THRESHOLD window. This is the only
-    /// external mutator — button presses and the periodic poll both go
-    /// through this so the LED dirty-tracking can stay in main.rs and so
-    /// the staleness clock is reset only on actual PA confirmations.
+    /// value for the next MIC_STALE_THRESHOLD window. The staleness clock is
+    /// reset only on actual PA confirmations. Used directly for the startup
+    /// seed and the post-resume refresh, where dirty-tracking is handled by
+    /// the caller; the button and poll paths go through `update_mic_muted`.
     pub fn set_mic_muted(&mut self, muted: bool) {
         self.mic_muted = muted;
         self.mic_confirmed_at = Some(Instant::now());
+    }
+
+    /// Record a confirmed mic-mute state and report whether the logo needs a
+    /// repaint as a result. A repaint is needed if the value changed OR if we
+    /// were in the stale "unknown" state (so recovering from a PA outage stops
+    /// the blink even when the value is unchanged). No-op returning `false`
+    /// when the mic indicator isn't selected — nothing reads `mic_muted` then,
+    /// so there's no reason to touch the state or the staleness clock. This is
+    /// the single home for the button and poll paths' dirty rule.
+    pub fn update_mic_muted(&mut self, muted: bool) -> bool {
+        if !self.mic_indicator_enabled() {
+            return false;
+        }
+        let dirty = muted != self.mic_muted || self.mic_is_stale();
+        self.set_mic_muted(muted);
+        dirty
     }
 
     /// True if the cached `mic_muted` is older than MIC_STALE_THRESHOLD
