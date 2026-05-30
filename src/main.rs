@@ -201,6 +201,74 @@ fn refresh_mic_muted(audio: &audio::AudioController, obs: &mut ObsRuntime) -> bo
     }
 }
 
+/// Periodic poll of the default mic's mute state so external changes (system
+/// hotkeys, KDE tray, other tools) show up on the logo. Owns its cadence
+/// timer and the consecutive-failure counter, so the main loop just calls
+/// `tick` and reads the returned dirty flag.
+struct MicPoller {
+    /// `None` = never polled, so the first `tick` polls immediately — a failed
+    /// startup seed (PA still booting) doesn't leave a stale value visible for
+    /// up to one interval.
+    last_poll: Option<Instant>,
+    /// Consecutive failed polls. Used to warn once at the start of an outage
+    /// and report the recovery duration when it clears. Reset to 0 on success.
+    failures: u32,
+}
+
+impl MicPoller {
+    const INTERVAL: Duration = Duration::from_millis(250);
+
+    fn new() -> Self {
+        Self { last_poll: None, failures: 0 }
+    }
+
+    /// Poll the mic state if the indicator is enabled and the interval has
+    /// elapsed. Returns whether the LEDs need a repaint.
+    fn tick(&mut self, audio: &audio::AudioController, obs: &mut ObsRuntime) -> bool {
+        let due = obs.mic_indicator_enabled()
+            && self.last_poll.is_none_or(|t| t.elapsed() >= Self::INTERVAL);
+        if !due {
+            return false;
+        }
+        self.last_poll = Some(Instant::now());
+        match audio.is_mic_muted() {
+            Ok(muted) => {
+                if self.failures > 0 {
+                    // Approximate outage duration. Duration's Debug formatter
+                    // picks an appropriate unit (250ms, 1s, 1.25s, etc.) —
+                    // better than an integer second count that truncates short
+                    // outages to 0.
+                    let outage = Self::INTERVAL * self.failures;
+                    info!("audio: mic-mute poll recovered after ~{outage:?}");
+                    self.failures = 0;
+                }
+                // Always record on a successful poll — even when unchanged — so
+                // mic_confirmed_at stays fresh and the logo leaves the "unknown"
+                // stale state. update_mic_muted reports whether a repaint is
+                // needed (value changed, or we just recovered).
+                obs.update_mic_muted(muted)
+            }
+            Err(e) => {
+                if self.failures == 0 {
+                    warn!("audio: mic-mute poll failed: {e} (suppressing further warnings until recovery)");
+                }
+                self.failures = self.failures.saturating_add(1);
+                false
+            }
+        }
+    }
+
+    /// Force an immediate re-poll (used on resume, so a mic toggle during
+    /// suspend is reflected without waiting for the cadence). Resets the timer
+    /// only on a successful query, so a not-yet-ready PA gets retried on the
+    /// next loop iteration instead of waiting a full INTERVAL.
+    fn refresh_now(&mut self, audio: &audio::AudioController, obs: &mut ObsRuntime) {
+        if obs.mic_indicator_enabled() && refresh_mic_muted(audio, obs) {
+            self.last_poll = Some(Instant::now());
+        }
+    }
+}
+
 
 fn run(cli: Cli) -> Result<()> {
     let config_path = cli
@@ -275,18 +343,10 @@ fn run(cli: Cli) -> Result<()> {
     // Monitor for system resume to re-apply LED state
     let resume_rx = spawn_resume_monitor();
 
-    // Poll mic mute state periodically so external mute changes (system
+    // Poll mic-mute state periodically so external mute changes (system
     // hotkeys, KDE's tray, other tools) are reflected on the logo. Button
-    // presses bypass this by updating obs.mic_muted directly. Skipped
-    // entirely if the user didn't configure a mic-muted color.
-    const MIC_POLL_INTERVAL: Duration = Duration::from_millis(250);
-    // None = "never polled" → the first loop iteration polls immediately,
-    // so a failed startup seed (PA still booting) doesn't leave a stale
-    // mic_muted=false visible for up to MIC_POLL_INTERVAL.
-    let mut last_mic_poll: Option<Instant> = None;
-    // Track repeated PA failures so we warn once per outage instead of
-    // every 250 ms. Reset to 0 on a successful poll.
-    let mut mic_poll_failures: u32 = 0;
+    // presses bypass the cadence by updating the cached state directly.
+    let mut mic_poller = MicPoller::new();
 
     info!("listening for events (Ctrl+C to quit)...");
     loop {
@@ -307,46 +367,13 @@ fn run(cli: Cli) -> Result<()> {
 
         // Check for resume signal — re-poll mic so the post-resume paint
         // doesn't show stale state if the mic was toggled during suspend.
-        // Only bump last_mic_poll on a successful query so that a
-        // not-yet-ready PA gets re-polled on the next loop iteration
-        // instead of waiting a full MIC_POLL_INTERVAL.
         if resume_rx.try_recv().is_ok() {
             info!("system resumed from sleep, re-applying LED state");
-            if obs.mic_indicator_enabled() && refresh_mic_muted(&audio, &mut obs) {
-                last_mic_poll = Some(Instant::now());
-            }
+            mic_poller.refresh_now(&audio, &mut obs);
             led_dirty = true;
         }
 
-        let mic_poll_due = obs.mic_indicator_enabled()
-            && last_mic_poll.is_none_or(|t| t.elapsed() >= MIC_POLL_INTERVAL);
-        if mic_poll_due {
-            last_mic_poll = Some(Instant::now());
-            match audio.is_mic_muted() {
-                Ok(muted) => {
-                    if mic_poll_failures > 0 {
-                        // Approximate outage duration. Duration's Debug
-                        // formatter picks an appropriate unit (250ms,
-                        // 1s, 1.25s, etc.) — better than an integer
-                        // second count that truncates short outages to 0.
-                        let outage = MIC_POLL_INTERVAL * mic_poll_failures;
-                        info!("audio: mic-mute poll recovered after ~{outage:?}");
-                        mic_poll_failures = 0;
-                    }
-                    // Always record on a successful poll — even when unchanged
-                    // — so mic_confirmed_at stays fresh and the logo leaves the
-                    // "unknown" stale state. update_mic_muted reports whether a
-                    // repaint is needed (value changed, or we just recovered).
-                    led_dirty |= obs.update_mic_muted(muted);
-                }
-                Err(e) => {
-                    if mic_poll_failures == 0 {
-                        warn!("audio: mic-mute poll failed: {e} (suppressing further warnings until recovery)");
-                    }
-                    mic_poll_failures = mic_poll_failures.saturating_add(1);
-                }
-            }
-        }
+        led_dirty |= mic_poller.tick(&audio, &mut obs);
 
         // Flush any deferred stream-restore persistence writes that have
         // been idle long enough. Coalesces slider-scrub bursts into a
