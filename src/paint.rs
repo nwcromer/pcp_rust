@@ -7,7 +7,7 @@ use log::info;
 
 use crate::config::{self, RainbowStyle, RgbColor, RgbMode};
 use crate::device::PcPanelPro;
-use crate::led::{self, LedMode, LogoMode, Rgb};
+use crate::led::{self, LedMode, Rgb};
 use crate::runtime::{ObsRuntime, ObsState};
 
 /// Log a human-readable description of the configured RGB mode. Called
@@ -235,7 +235,7 @@ fn paint_panel_solid(panel: &PcPanelPro, c: RgbColor) -> Result<()> {
 }
 
 fn paint_logo_solid(panel: &PcPanelPro, c: RgbColor) -> Result<()> {
-    led::set_logo(panel, LogoMode::Static(Rgb::new(c.r, c.g, c.b)))
+    led::set_logo(panel, Rgb::new(c.r, c.g, c.b))
 }
 
 #[cfg(test)]

@@ -68,17 +68,6 @@ impl LedMode {
     }
 }
 
-// Rainbow and Breath are intentionally not exposed in config — pcp_rust
-// keeps the config logo-agnostic. Kept as protocol documentation for
-// anyone wanting to use them programmatically.
-#[derive(Debug, Clone, Copy)]
-#[allow(dead_code)]
-pub enum LogoMode {
-    Static(Rgb),
-    Rainbow { brightness: u8, speed: u8 },
-    Breath { hue: u8, brightness: u8, speed: u8 },
-}
-
 /// Write a per-LED color packet for one panel region: `[PRO_PREFIX, cmd]`
 /// followed by 7 bytes per `LedMode`. The knob/slider/label setters differ
 /// only in the command byte and the LED count, so they share this. Takes a
@@ -104,19 +93,15 @@ pub fn set_slider_label_colors(device: &PcPanelPro, labels: &[LedMode; 4]) -> Re
     set_region_colors(device, CMD_SLIDER_LABELS, labels)
 }
 
-pub fn set_logo(device: &PcPanelPro, mode: LogoMode) -> Result<()> {
-    let packet = match mode {
-        LogoMode::Static(c) => vec![PRO_PREFIX, CMD_LOGO, 0x01, c.r, c.g, c.b],
-        LogoMode::Rainbow { brightness, speed } => {
-            vec![PRO_PREFIX, CMD_LOGO, 0x02, 0xFF, brightness, speed]
-        }
-        LogoMode::Breath {
-            hue,
-            brightness,
-            speed,
-        } => vec![PRO_PREFIX, CMD_LOGO, 0x03, hue, brightness, speed],
-    };
-    device.set_led(&packet)
+/// Set the logo LED to a solid color.
+///
+/// The logo also supports two firmware effects that pcp_rust intentionally
+/// does not expose — it keeps the logo as a per-color indicator rather than an
+/// independent animation. Recorded here for anyone driving the device directly:
+///   - rainbow: `[PRO_PREFIX, CMD_LOGO, 0x02, 0xFF, brightness, speed]`
+///   - breath:  `[PRO_PREFIX, CMD_LOGO, 0x03, hue, brightness, speed]`
+pub fn set_logo(device: &PcPanelPro, color: Rgb) -> Result<()> {
+    device.set_led(&[PRO_PREFIX, CMD_LOGO, 0x01, color.r, color.g, color.b])
 }
 
 /// Rainbow animation type: 0x01 = horizontal, 0x02 = vertical
