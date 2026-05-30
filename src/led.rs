@@ -118,36 +118,6 @@ pub fn set_logo(device: &PcPanelPro, mode: LogoMode) -> Result<()> {
     device.set_led(&packet)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn rgb_to_hue_primaries() {
-        // Red, green, blue map to 0°, 120°, 240° respectively. Scaled to
-        // 0-255: 0, 85, 170.
-        assert_eq!(rgb_to_hue(Rgb::new(0xFF, 0, 0)), 0);
-        assert_eq!(rgb_to_hue(Rgb::new(0, 0xFF, 0)), 85);
-        assert_eq!(rgb_to_hue(Rgb::new(0, 0, 0xFF)), 170);
-    }
-
-    #[test]
-    fn rgb_to_hue_amber() {
-        // Amber #FFC000 has hue ≈ 45° → scaled byte ≈ 32.
-        let h = rgb_to_hue(Rgb::new(0xFF, 0xC0, 0));
-        assert!((30..=34).contains(&h), "expected hue near 32 for amber, got {h}");
-    }
-
-    #[test]
-    fn rgb_to_hue_achromatic() {
-        // Pure white, black, and gray have no hue; the function returns 0
-        // by convention (matches HSL/HSV).
-        assert_eq!(rgb_to_hue(Rgb::new(0xFF, 0xFF, 0xFF)), 0);
-        assert_eq!(rgb_to_hue(Rgb::new(0x00, 0x00, 0x00)), 0);
-        assert_eq!(rgb_to_hue(Rgb::new(0x80, 0x80, 0x80)), 0);
-    }
-}
-
 /// Rainbow animation type: 0x01 = horizontal, 0x02 = vertical
 pub fn set_rainbow(device: &PcPanelPro, rainbow_type: u8, brightness: u8, speed: u8) -> Result<()> {
     let packet = vec![
@@ -190,4 +160,34 @@ pub fn set_breath(device: &PcPanelPro, hue: u8, brightness: u8, speed: u8) -> Re
         speed,
     ];
     device.set_led(&packet)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rgb_to_hue_primaries() {
+        // Red, green, blue map to 0°, 120°, 240° respectively. Scaled to
+        // 0-255: 0, 85, 170.
+        assert_eq!(rgb_to_hue(Rgb::new(0xFF, 0, 0)), 0);
+        assert_eq!(rgb_to_hue(Rgb::new(0, 0xFF, 0)), 85);
+        assert_eq!(rgb_to_hue(Rgb::new(0, 0, 0xFF)), 170);
+    }
+
+    #[test]
+    fn rgb_to_hue_amber() {
+        // Amber #FFC000 has hue ≈ 45° → scaled byte ≈ 32.
+        let h = rgb_to_hue(Rgb::new(0xFF, 0xC0, 0));
+        assert!((30..=34).contains(&h), "expected hue near 32 for amber, got {h}");
+    }
+
+    #[test]
+    fn rgb_to_hue_achromatic() {
+        // Pure white, black, and gray have no hue; the function returns 0
+        // by convention (matches HSL/HSV).
+        assert_eq!(rgb_to_hue(Rgb::new(0xFF, 0xFF, 0xFF)), 0);
+        assert_eq!(rgb_to_hue(Rgb::new(0x00, 0x00, 0x00)), 0);
+        assert_eq!(rgb_to_hue(Rgb::new(0x80, 0x80, 0x80)), 0);
+    }
 }
