@@ -420,13 +420,27 @@ fn parse_app_strings(key: &str, table: &toml::value::Table) -> Result<Vec<String
         .with_context(|| format!("[{key}] missing \"app\" field"))?;
 
     match value {
-        toml::Value::String(s) => Ok(vec![s.clone()]),
+        toml::Value::String(s) => {
+            // A blank app name would become Named("") and match every
+            // stream (contains("") is always true), so a slider/button with
+            // app = "" would silently control/mute every app — including
+            // persisting mute to the whole stream-restore DB. Reject it.
+            if s.trim().is_empty() {
+                bail!("[{key}] \"app\" cannot be empty");
+            }
+            Ok(vec![s.clone()])
+        }
         toml::Value::Array(arr) => {
             let mut apps = Vec::new();
             for item in arr {
                 let s = item
                     .as_str()
                     .with_context(|| format!("[{key}] app array entries must be strings"))?;
+                // Guard each entry too: one blank element would reintroduce
+                // the match-everything wildcard for the whole control.
+                if s.trim().is_empty() {
+                    bail!("[{key}] \"app\" entries cannot be empty");
+                }
                 apps.push(s.to_string());
             }
             if apps.is_empty() {
@@ -758,6 +772,47 @@ mod tests {
             }
             other => panic!("expected Wave, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_empty_app_string_rejected() {
+        // app = "" would match every stream (contains("") is always true).
+        let result = parse_config(
+            r#"
+            [slider1]
+            action = "volume"
+            app = ""
+            "#,
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("cannot be empty"));
+    }
+
+    #[test]
+    fn test_whitespace_app_string_rejected() {
+        let result = parse_config(
+            r#"
+            [slider1]
+            action = "volume"
+            app = "   "
+            "#,
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("cannot be empty"));
+    }
+
+    #[test]
+    fn test_blank_app_array_entry_rejected() {
+        // One blank element would reintroduce the match-everything wildcard.
+        let result = parse_config(
+            r#"
+            [slider1]
+            action = "volume"
+            app = ["firefox", ""]
+            "#,
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("cannot be empty"));
     }
 
     #[test]
