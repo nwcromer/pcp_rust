@@ -6,6 +6,7 @@ mod led;
 mod obs;
 mod osd;
 mod paint;
+mod prompt;
 mod runtime;
 mod service;
 mod udev;

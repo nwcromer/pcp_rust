@@ -1,8 +1,9 @@
 use std::fs;
-use std::io::{self, Write};
 use std::path::Path;
 
 use anyhow::{bail, Result};
+
+use crate::prompt::confirm_overwrite;
 
 const RULES_PATH: &str = "/etc/udev/rules.d/99-pcpanel.rules";
 
@@ -21,16 +22,8 @@ pub fn create_udev_rules() -> Result<()> {
     }
 
     let path = Path::new(RULES_PATH);
-    if path.exists() {
-        eprint!("{RULES_PATH} already exists. Overwrite? [y/N] ");
-        io::stderr().flush()?;
-
-        let mut input = String::new();
-        io::stdin().read_line(&mut input)?;
-        if !input.trim().eq_ignore_ascii_case("y") {
-            println!("Aborted.");
-            return Ok(());
-        }
+    if path.exists() && !confirm_overwrite(RULES_PATH)? {
+        return Ok(());
     }
 
     fs::write(path, RULES_CONTENT)?;

@@ -1,9 +1,10 @@
 use std::fs;
-use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process::Command;
 
 use anyhow::{bail, Context, Result};
+
+use crate::prompt::confirm_overwrite;
 
 const SERVICE_NAME: &str = "pcpanel";
 
@@ -103,13 +104,7 @@ pub fn install() -> Result<()> {
     let bin = binary_path()?;
 
     if path.exists() {
-        eprint!("{} already exists. Overwrite? [y/N] ", path.display());
-        io::stderr().flush()?;
-
-        let mut input = String::new();
-        io::stdin().read_line(&mut input)?;
-        if !input.trim().eq_ignore_ascii_case("y") {
-            println!("Aborted.");
+        if !confirm_overwrite(&path.display().to_string())? {
             return Ok(());
         }
 
