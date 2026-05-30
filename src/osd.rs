@@ -69,24 +69,28 @@ pub fn show_text(icon: &str, text: &str) {
     call("showText", &(icon, text));
 }
 
+/// Show a `"<label>: Muted/Unmuted"` OSD with a muted/unmuted icon pair.
+/// Shared by the system and mic mute popups, which differ only in the label
+/// and which icon set fits the device. Named-app mute does NOT use this — it
+/// resolves a per-app icon (see `icons::resolve_mute`) rather than a fixed
+/// pair.
+fn show_mute_status(label: &str, muted: bool, muted_icon: &str, unmuted_icon: &str) {
+    let icon = if muted { muted_icon } else { unmuted_icon };
+    let status = if muted { "Muted" } else { "Unmuted" };
+    show_text(icon, &format!("{label}: {status}"));
+}
+
 /// Show mute status via OSD.
 pub fn show_mute(name: &str, muted: bool) {
-    let icon = if muted {
-        "audio-volume-muted"
-    } else {
-        "audio-volume-high"
-    };
-    let status = if muted { "Muted" } else { "Unmuted" };
-    show_text(icon, &format!("{name}: {status}"));
+    show_mute_status(name, muted, "audio-volume-muted", "audio-volume-high");
 }
 
 /// Show mic mute status via OSD.
 pub fn show_mic_mute(muted: bool) {
-    let icon = if muted {
-        "microphone-sensitivity-muted"
-    } else {
-        "microphone-sensitivity-high"
-    };
-    let status = if muted { "Muted" } else { "Unmuted" };
-    show_text(icon, &format!("Microphone: {status}"));
+    show_mute_status(
+        "Microphone",
+        muted,
+        "microphone-sensitivity-muted",
+        "microphone-sensitivity-high",
+    );
 }
