@@ -221,7 +221,48 @@ pub fn default_config_path() -> Option<PathBuf> {
 pub fn load_config(path: &Path) -> Result<Config> {
     let content = fs::read_to_string(path)
         .with_context(|| format!("failed to read config file: {}", path.display()))?;
-    parse_config(&content)
+    let config = parse_config(&content)?;
+    warn_if_obs_password_world_readable(path, &content);
+    Ok(config)
+}
+
+/// True if the config text carries a non-empty `[obs].password`. Keyed off
+/// the file contents (not the resolved password) so a secret supplied only
+/// via `$PCPANEL_OBS_PASSWORD` — with nothing in the file — doesn't trip the
+/// permissions warning. Mirrors the `!s.is_empty()` filter in
+/// `parse_obs_section`. Pure so it can be unit-tested.
+fn file_has_obs_password(content: &str) -> bool {
+    toml::from_str::<toml::value::Table>(content)
+        .ok()
+        .and_then(|t| t.get("obs").and_then(|v| v.as_table()).cloned())
+        .and_then(|obs| obs.get("password").and_then(|v| v.as_str()).map(str::to_string))
+        .is_some_and(|s| !s.is_empty())
+}
+
+/// obs-websocket passwords are stored in cleartext (see README). If the
+/// config holds one and is readable by group/other, every local user can
+/// read it. Warn (don't fail) — the user may have loosened perms on
+/// purpose, and the warning leaks nothing (just the path + octal mode).
+/// Best-effort: a stat failure is silently ignored.
+fn warn_if_obs_password_world_readable(path: &Path, content: &str) {
+    use std::os::unix::fs::PermissionsExt;
+
+    if !file_has_obs_password(content) {
+        return;
+    }
+    let Ok(meta) = fs::metadata(path) else {
+        return;
+    };
+    let mode = meta.permissions().mode();
+    if mode & 0o077 != 0 {
+        warn!(
+            "config file {} contains a plaintext [obs] password but is readable \
+             by group/other (mode {:o}). Restrict it with: chmod 600 {}",
+            path.display(),
+            mode & 0o7777,
+            path.display()
+        );
+    }
 }
 
 /// Keys present in `table` that aren't in `known`. Pure so it can be
@@ -1349,5 +1390,13 @@ mod tests {
         );
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("port"));
+    }
+
+    #[test]
+    fn file_has_obs_password_detects_only_nonempty_file_value() {
+        assert!(file_has_obs_password("[obs]\npassword = \"secret\"\n"));
+        assert!(!file_has_obs_password("[obs]\npassword = \"\"\n")); // empty
+        assert!(!file_has_obs_password("[obs]\n")); // absent
+        assert!(!file_has_obs_password("")); // no [obs]
     }
 }
