@@ -13,7 +13,7 @@ libc = "0.2"
 libpulse-binding = "2"
 log = "0.4"
 env_logger = "0.11"
-serde = { version = "1", features = ["derive"] }
+serde = "1"
 toml = "0.8"
 # OBS Studio integration via obs-websocket v5
 obws = { version = "0.14", features = ["events"] }
