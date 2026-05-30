@@ -552,8 +552,14 @@ impl AudioController {
         // miss those incur a PA client-PID query + /proc/comm read.
         let mut matched: Vec<(u32, u8)> = Vec::new(); // (index, channels)
         for entry in &entries {
-            if self.entry_matches(entry, &target)? {
-                matched.push((entry.index, entry.channels));
+            // Skip (don't abort) a stream whose match status can't be
+            // determined — a single stream's client-PID query failing
+            // shouldn't drop the volume change for apps that already
+            // matched cheaply by name/binary.
+            match self.entry_matches(entry, &target) {
+                Ok(true) => matched.push((entry.index, entry.channels)),
+                Ok(false) => {}
+                Err(e) => debug!("match check failed for sink-input {}: {e}", entry.index),
             }
         }
 
@@ -704,8 +710,12 @@ impl AudioController {
         // miss) so the slider and the button match an app identically.
         let mut matched: Vec<(u32, bool)> = Vec::new(); // (index, muted)
         for entry in &entries {
-            if self.entry_matches(entry, &target)? {
-                matched.push((entry.index, entry.muted));
+            // Skip (don't abort) a stream we can't classify — see the
+            // matching note in set_app_volume.
+            match self.entry_matches(entry, &target) {
+                Ok(true) => matched.push((entry.index, entry.muted)),
+                Ok(false) => {}
+                Err(e) => debug!("match check failed for sink-input {}: {e}", entry.index),
             }
         }
 
