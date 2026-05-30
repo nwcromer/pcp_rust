@@ -85,7 +85,7 @@ struct SinkInputEntry {
 pub struct AudioController {
     mainloop: Rc<RefCell<Mainloop>>,
     context: Rc<RefCell<context::Context>>,
-    /// Per-app deferred stream-restore writes. `set_app_volume` updates
+    /// Per-app deferred stream-restore writes. `set_app_volumes` updates
     /// the entry on every tick; `flush_persist_writes` (called from the
     /// main loop) actually writes to PA once the entry has been idle for
     /// `PERSIST_IDLE`.
@@ -548,16 +548,6 @@ impl AudioController {
         self.set_default_volume(Target::DefaultSource, value)
     }
 
-    /// Set volume for a single named app. Thin wrapper over `set_app_volumes`.
-    /// Returns true if any matching stream was found.
-    pub fn set_app_volume(&mut self, app_name: &str, value: u8) -> Result<bool> {
-        Ok(self
-            .set_app_volumes(&[app_name], value)?
-            .first()
-            .copied()
-            .unwrap_or(false))
-    }
-
     /// Set volume for several named apps in ONE sink-input enumeration.
     /// Returns, per input name (same order), whether at least one stream
     /// matched. Each stream's `/proc/comm` is resolved at most once and tested
@@ -751,12 +741,12 @@ impl AudioController {
         let target = app_name.to_lowercase();
         let entries = self.collect_sink_inputs()?;
 
-        // Same lazy match as set_app_volume (name/binary free, comm only on
+        // Same lazy match as set_app_volumes (name/binary free, comm only on
         // miss) so the slider and the button match an app identically.
         let mut matched: Vec<(u32, bool)> = Vec::new(); // (index, muted)
         for entry in &entries {
             // Skip (don't abort) a stream we can't classify — see the
-            // matching note in set_app_volume.
+            // matching note in set_app_volumes.
             match self.entry_matches(entry, &target) {
                 Ok(true) => matched.push((entry.index, entry.muted)),
                 Ok(false) => {}
@@ -781,7 +771,7 @@ impl AudioController {
 
         // Persist the mute state to the stream-restore database so that new
         // streams for this app pick it up automatically — mirrors the
-        // volume-persist behavior in set_app_volume.
+        // volume-persist behavior in set_app_volumes.
         let result = self.update_stream_restore(&target, |entry| SrInfo {
             name: entry.name.clone(),
             channel_map: entry.channel_map,

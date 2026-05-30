@@ -400,17 +400,23 @@ fn run(cli: Cli) -> Result<()> {
     }
 }
 
-/// Apply a volume slider/knob change to one configured target. Dispatches
-/// by `AppTarget` variant. Returns `true` if the change matched something
-/// (always true for `System`/`Mic`, only true for `Named` when at least
-/// one sink-input matched). PA failures are logged and treated as no-match.
+/// Apply a volume slider/knob change to a default-device target (`System`
+/// or `Mic`). Returns `true` on success (these always drive a single
+/// default device, so a success is a match). PA failures are logged and
+/// treated as no-match.
+///
+/// `Named` targets are deliberately NOT handled here — they're batched into
+/// one sink-input enumeration by `set_app_volumes` at the call site, so this
+/// helper only ever sees the two default-device variants.
 fn apply_volume_to(audio: &mut audio::AudioController, target: &AppTarget, value: u8) -> bool {
     let result = match target {
-        AppTarget::System => audio.set_system_volume(value).map(|()| true),
-        AppTarget::Mic => audio.set_mic_volume(value).map(|()| true),
-        AppTarget::Named(name) => audio.set_app_volume(name, value),
+        AppTarget::System => audio.set_system_volume(value),
+        AppTarget::Mic => audio.set_mic_volume(value),
+        AppTarget::Named(_) => {
+            unreachable!("Named volume targets are batched via set_app_volumes")
+        }
     };
-    result.unwrap_or_else(|e| {
+    result.map(|()| true).unwrap_or_else(|e| {
         warn!("audio: set volume for {} failed: {e}", target.label());
         false
     })
