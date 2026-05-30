@@ -79,28 +79,29 @@ pub enum LogoMode {
     Breath { hue: u8, brightness: u8, speed: u8 },
 }
 
-pub fn set_knob_colors(device: &PcPanelPro, knobs: &[LedMode; 5]) -> Result<()> {
-    let mut packet = vec![PRO_PREFIX, CMD_KNOBS];
-    for mode in knobs {
+/// Write a per-LED color packet for one panel region: `[PRO_PREFIX, cmd]`
+/// followed by 7 bytes per `LedMode`. The knob/slider/label setters differ
+/// only in the command byte and the LED count, so they share this. Takes a
+/// slice; the public wrappers keep fixed-size array params so callers retain
+/// the compile-time count guarantee (5 knobs, 4 sliders/labels).
+fn set_region_colors(device: &PcPanelPro, cmd: u8, modes: &[LedMode]) -> Result<()> {
+    let mut packet = vec![PRO_PREFIX, cmd];
+    for mode in modes {
         packet.extend_from_slice(&mode.to_bytes());
     }
     device.set_led(&packet)
+}
+
+pub fn set_knob_colors(device: &PcPanelPro, knobs: &[LedMode; 5]) -> Result<()> {
+    set_region_colors(device, CMD_KNOBS, knobs)
 }
 
 pub fn set_slider_colors(device: &PcPanelPro, sliders: &[LedMode; 4]) -> Result<()> {
-    let mut packet = vec![PRO_PREFIX, CMD_SLIDERS];
-    for mode in sliders {
-        packet.extend_from_slice(&mode.to_bytes());
-    }
-    device.set_led(&packet)
+    set_region_colors(device, CMD_SLIDERS, sliders)
 }
 
 pub fn set_slider_label_colors(device: &PcPanelPro, labels: &[LedMode; 4]) -> Result<()> {
-    let mut packet = vec![PRO_PREFIX, CMD_SLIDER_LABELS];
-    for mode in labels {
-        packet.extend_from_slice(&mode.to_bytes());
-    }
-    device.set_led(&packet)
+    set_region_colors(device, CMD_SLIDER_LABELS, labels)
 }
 
 pub fn set_logo(device: &PcPanelPro, mode: LogoMode) -> Result<()> {
