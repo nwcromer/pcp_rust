@@ -769,6 +769,15 @@ impl Drop for AudioController {
 /// stale comm, but the only consequence is an app-name *match* decision for
 /// a volume/mute change — low-stakes and self-correcting once that stream
 /// goes away. Mirrors the process-lifetime icon-resolution cache.
+///
+/// Unbounded-growth note (reviewed, accepted): unlike the icon cache —
+/// which is keyed by the small, bounded set of distinct app *names* — this
+/// one is keyed by PID and never evicts, so a long-lived daemon accrues one
+/// entry per distinct PID ever seen on a non-name/binary-matched stream.
+/// In practice that's just the audio apps that aren't the configured
+/// target: dozens to low hundreds of ~70-byte entries, and single-digit MB
+/// even under pathological PID churn (something spawning a fresh PID per
+/// sound). Not worth an eviction scheme for that ceiling; left as-is.
 fn comm_for_pid(pid: &str) -> Option<String> {
     static CACHE: LazyLock<Mutex<HashMap<String, Option<String>>>> =
         LazyLock::new(|| Mutex::new(HashMap::new()));
