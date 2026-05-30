@@ -31,10 +31,12 @@ fn binary_path() -> Result<String> {
     //   "  closes the quoted string
     //   \  is the escape character
     //   $  triggers variable expansion
-    if let Some(bad) = path.chars().find(|c| matches!(c, '"' | '\\' | '$')) {
+    //   %  introduces a systemd specifier (e.g. %h); expanded even inside
+    //      double quotes, so a literal % would have to be written %%
+    if let Some(bad) = path.chars().find(|c| matches!(c, '"' | '\\' | '$' | '%')) {
         bail!(
             "binary path contains the special character `{bad}` ({path:?}); \
-             move or rename the binary to a path without `\"`, `\\`, or `$`"
+             move or rename the binary to a path without `\"`, `\\`, `$`, or `%`"
         );
     }
     Ok(path)
