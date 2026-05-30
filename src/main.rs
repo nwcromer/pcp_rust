@@ -294,8 +294,15 @@ fn run(cli: Cli) -> Result<()> {
         // While the mic indicator is in its "unknown" state, force a
         // repaint each iteration so the logo's blink renders. The blink
         // phase is time-driven inside runtime, so just keeping led_dirty
-        // true is enough.
-        led_dirty |= obs.mic_indicator_needs_repaint();
+        // true is enough. Gate on logo_indicator_visible: if the current
+        // appearance can't show the indicator (a flash owns the panel, or
+        // a global animation owns the logo), forcing a repaint would only
+        // restart that animation every iteration without rendering any
+        // blink. Recovery/state-change repaints still happen via the
+        // poll/resume paths below, so suppressing the blink-only repaint
+        // here can't strand a stale frame.
+        led_dirty |= obs.mic_indicator_needs_repaint()
+            && paint::logo_indicator_visible(&obs, config.rgb);
 
         // Check for resume signal — re-poll mic so the post-resume paint
         // doesn't show stale state if the mic was toggled during suspend.

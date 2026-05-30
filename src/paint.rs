@@ -177,6 +177,30 @@ fn logo_is_independent(idle_rgb: Option<RgbMode>) -> bool {
     )
 }
 
+/// Whether the configured logo indicator is actually rendered on the logo
+/// in the current runtime state — i.e. whether a repaint right now would
+/// show it. Mirrors the logo routing in `paint_leds`.
+///
+/// The main loop uses this to decide whether to force continuous repaints
+/// for a blinking (stale-mic) indicator. When the indicator can't be shown
+/// — a flash owns the whole panel, or a global animation (rainbow / wave /
+/// breath, including the paused-breath effect) owns the logo — forcing a
+/// repaint every iteration would only restart the animation from phase 0
+/// without ever displaying the blink, making the animation visibly stutter
+/// for the duration of the outage.
+pub fn logo_indicator_visible(obs: &ObsRuntime, idle_rgb: Option<RgbMode>) -> bool {
+    if obs.flash().is_some() {
+        // A flash takes the whole panel including the logo.
+        return false;
+    }
+    match obs.state() {
+        ObsState::Idle if obs.connected() => true,
+        ObsState::Idle => logo_is_independent(idle_rgb),
+        ObsState::Recording => true,
+        ObsState::RecordingPaused => !obs.paused_use_breath(),
+    }
+}
+
 /// Paint the logo with the selected indicator's color, falling back to the
 /// panel `fallback` color when no indicator is configured (or the selected
 /// one has nothing meaningful to show — e.g. replay with OBS disconnected).
@@ -235,5 +259,58 @@ mod tests {
         assert!(!logo_is_independent(Some(RgbMode::Breath {
             hue: 0, brightness: 0, speed: 0
         })));
+    }
+
+    #[test]
+    fn logo_indicator_visible_matches_paint_routing() {
+        use crate::config::{LogoConfig, ObsColors};
+        use crate::obs::{ObsCommand, ObsEvent};
+
+        let solid = Some(RgbMode::Solid { r: 0, g: 0, b: 0 });
+        let wave = Some(RgbMode::Wave {
+            hue: 0, brightness: 0, speed: 0, reverse: false, bounce: false,
+        });
+        let new = |paused_breath| {
+            ObsRuntime::new(None, ObsColors::default(), paused_breath, LogoConfig::default())
+        };
+
+        // Disconnected idle: shown under static modes (and no [rgb]),
+        // hidden under a global animation that owns the logo.
+        let obs = new(false);
+        assert!(logo_indicator_visible(&obs, solid));
+        assert!(logo_indicator_visible(&obs, None));
+        assert!(!logo_indicator_visible(&obs, wave));
+
+        // Connected idle: solid idle panel, logo writable even if [rgb] is
+        // an animation (the animation isn't active while OBS-connected).
+        let mut obs = new(false);
+        obs.apply_event(ObsEvent::Connected);
+        assert!(logo_indicator_visible(&obs, wave));
+
+        // Recording: solid panel, indicator shown.
+        let mut obs = new(false);
+        obs.apply_event(ObsEvent::Connected);
+        obs.apply_event(ObsEvent::RecordingActive);
+        assert!(logo_indicator_visible(&obs, wave));
+
+        // Paused with breath → global animation owns the logo, hidden.
+        let mut obs = new(true);
+        obs.apply_event(ObsEvent::Connected);
+        obs.apply_event(ObsEvent::RecordingPaused);
+        assert!(!logo_indicator_visible(&obs, solid));
+
+        // Paused without breath → solid panel, indicator shown.
+        let mut obs = new(false);
+        obs.apply_event(ObsEvent::Connected);
+        obs.apply_event(ObsEvent::RecordingPaused);
+        assert!(logo_indicator_visible(&obs, solid));
+
+        // A flash owns the whole panel including the logo → hidden, even in
+        // an otherwise-writable state.
+        let mut obs = new(false);
+        obs.apply_event(ObsEvent::Connected);
+        obs.apply_event(ObsEvent::CommandFailed(ObsCommand::SaveReplay, "boom".into()));
+        assert!(obs.flash().is_some());
+        assert!(!logo_indicator_visible(&obs, solid));
     }
 }
