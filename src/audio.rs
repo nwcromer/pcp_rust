@@ -468,15 +468,23 @@ impl AudioController {
         if entry_matches_target(entry, target, None) {
             return Ok(true);
         }
-        // Fallback: resolve the stream's PID (possibly a PA round-trip) and
-        // test its lower-cased /proc/<pid>/comm.
+        // Fallback: the stream's lower-cased /proc/<pid>/comm.
+        Ok(entry_matches_target(entry, target, self.resolve_comm(entry)?.as_deref()))
+    }
+
+    /// Resolve the lower-cased `/proc/<pid>/comm` for a sink input, if
+    /// available — possibly via a PA client-PID query. `Ok(None)` when the
+    /// stream has no usable numeric PID or its comm can't be read. Factored
+    /// out so the per-stream comm can be resolved once and reused across
+    /// multiple match targets (see `set_app_volumes`).
+    fn resolve_comm(&self, entry: &SinkInputEntry) -> Result<Option<String>> {
         let Some(pid) = self.resolve_pid(entry)? else {
-            return Ok(false);
+            return Ok(None);
         };
         if !pid.chars().all(|c| c.is_ascii_digit()) {
-            return Ok(false);
+            return Ok(None);
         }
-        Ok(entry_matches_target(entry, target, comm_for_pid(&pid).as_deref()))
+        Ok(comm_for_pid(&pid))
     }
 
     /// The PID for a sink input: the inline proplist value if present, else
@@ -540,49 +548,88 @@ impl AudioController {
         self.set_default_volume(Target::DefaultSource, value)
     }
 
-    /// Returns true if any matching app was found.
+    /// Set volume for a single named app. Thin wrapper over `set_app_volumes`.
+    /// Returns true if any matching stream was found.
     pub fn set_app_volume(&mut self, app_name: &str, value: u8) -> Result<bool> {
+        Ok(self
+            .set_app_volumes(&[app_name], value)?
+            .first()
+            .copied()
+            .unwrap_or(false))
+    }
+
+    /// Set volume for several named apps in ONE sink-input enumeration.
+    /// Returns, per input name (same order), whether at least one stream
+    /// matched. Each stream's `/proc/comm` is resolved at most once and tested
+    /// against every target, so a control mapped to multiple apps no longer
+    /// re-enumerates (and re-resolves PIDs) once per target on every tick.
+    pub fn set_app_volumes(&mut self, app_names: &[&str], value: u8) -> Result<Vec<bool>> {
+        if app_names.is_empty() {
+            return Ok(Vec::new());
+        }
         let volume = volume_from_u8(value);
-        let target = app_name.to_lowercase();
+        let targets: Vec<String> = app_names.iter().map(|n| n.to_lowercase()).collect();
         let entries = self.collect_sink_inputs()?;
 
-        // Match lazily: the name/binary checks are free; only streams that
-        // miss those incur a PA client-PID query + /proc/comm read.
-        let mut matched: Vec<(u32, u8)> = Vec::new(); // (index, channels)
+        // Match every stream against every target. The name/binary legs are
+        // free; a stream only incurs a PA client-PID query + /proc/comm read
+        // if some target misses those — and then the comm is resolved once and
+        // reused for the remaining targets.
+        let mut matched = vec![false; targets.len()];
+        let mut to_set: Vec<(u32, u8)> = Vec::new(); // streams to write, one per matched stream
         for entry in &entries {
-            // Skip (don't abort) a stream whose match status can't be
-            // determined — a single stream's client-PID query failing
-            // shouldn't drop the volume change for apps that already
-            // matched cheaply by name/binary.
-            match self.entry_matches(entry, &target) {
-                Ok(true) => matched.push((entry.index, entry.channels)),
-                Ok(false) => {}
-                Err(e) => debug!("match check failed for sink-input {}: {e}", entry.index),
+            let mut comm: Option<Option<String>> = None; // outer None = not yet resolved
+            let mut entry_hit = false;
+            for (i, target) in targets.iter().enumerate() {
+                let hit = if entry_matches_target(entry, target, None) {
+                    true
+                } else {
+                    // Resolve (once) and reuse this stream's comm. A failed
+                    // client-PID query is logged and treated as "no comm" so
+                    // it doesn't drop apps matched cheaply by name/binary.
+                    let comm = comm.get_or_insert_with(|| match self.resolve_comm(entry) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            debug!("match check failed for sink-input {}: {e}", entry.index);
+                            None
+                        }
+                    });
+                    entry_matches_target(entry, target, comm.as_deref())
+                };
+                if hit {
+                    matched[i] = true;
+                    entry_hit = true;
+                }
+            }
+            if entry_hit {
+                to_set.push((entry.index, entry.channels));
             }
         }
 
         let mut introspect = self.context.borrow().introspect();
-        for &(index, channels) in &matched {
+        for &(index, channels) in &to_set {
             let mut cv = ChannelVolumes::default();
             cv.set(channels, volume);
             let _op = introspect.set_sink_input_volume(index, &cv, None);
         }
+        drop(introspect);
         self.drain();
 
-        if matched.is_empty() {
-            debug!("app not found: {app_name}");
-        } else {
-            // Stash the new volume for deferred stream-restore persistence —
-            // a burst of slider ticks coalesces to a single DB write once
-            // the user stops moving the slider for `PERSIST_IDLE`. The
-            // actual playback volume above is set on every tick.
-            self.pending_persist.insert(
-                target,
-                PendingPersist { volume, last_update: Instant::now() },
-            );
+        // Per matched target: stash the new volume for deferred stream-restore
+        // persistence (a slider burst coalesces to one DB write per app once
+        // idle for PERSIST_IDLE). The playback volume above is set every tick.
+        for (i, target) in targets.iter().enumerate() {
+            if matched[i] {
+                self.pending_persist.insert(
+                    target.clone(),
+                    PendingPersist { volume, last_update: Instant::now() },
+                );
+            } else {
+                debug!("app not found: {}", app_names[i]);
+            }
         }
 
-        Ok(!matched.is_empty())
+        Ok(matched)
     }
 
     /// Flush any per-app volume persistence writes that have been idle for

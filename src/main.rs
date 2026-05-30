@@ -461,13 +461,46 @@ fn handle_panel_event(
 
             if let Some(Action::Volume(action)) = config.mappings.get(&control_id) {
                 let pct = (value as f32 / 255.0 * 100.0) as u8;
+
+                // Batch all named targets into ONE sink-input enumeration
+                // (one PA round-trip for the whole control rather than one per
+                // app). System/Mic each drive a single default device, so they
+                // stay individual.
+                let named: Vec<&str> = action
+                    .targets
+                    .iter()
+                    .filter_map(|t| match t {
+                        AppTarget::Named(s) => Some(s.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                let named_matched = if named.is_empty() {
+                    Vec::new()
+                } else {
+                    audio.set_app_volumes(&named, value).unwrap_or_else(|e| {
+                        warn!("audio: set volume for [{}] failed: {e}", named.join(", "));
+                        vec![false; named.len()]
+                    })
+                };
+
+                // Walk targets in config order so the verbose log and the OSD
+                // label keep that order; named results come from the batch.
                 let mut matched: Vec<&AppTarget> = Vec::new();
+                let mut named_i = 0;
                 for target in &action.targets {
-                    // Only trace targets that actually changed — a miss
-                    // (app not running) or PA error is already logged at
-                    // debug!/warn! in the audio layer, so printing here too
-                    // would falsely claim a change happened.
-                    if apply_volume_to(audio, target, value) {
+                    let hit = match target {
+                        AppTarget::System | AppTarget::Mic => apply_volume_to(audio, target, value),
+                        AppTarget::Named(_) => {
+                            let h = named_matched.get(named_i).copied().unwrap_or(false);
+                            named_i += 1;
+                            h
+                        }
+                    };
+                    // Only trace targets that actually changed — a miss (app
+                    // not running) or PA error is already logged at debug!/warn!
+                    // in the audio layer, so printing here too would falsely
+                    // claim a change happened.
+                    if hit {
                         matched.push(target);
                         if cli.verbose {
                             println!("{} volume: {pct}%", target.label());
