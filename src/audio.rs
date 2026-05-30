@@ -464,21 +464,19 @@ impl AudioController {
     /// and reading /proc for every stream on every slider tick; the comm
     /// read is additionally memoized by `comm_for_pid`.
     fn entry_matches(&self, entry: &SinkInputEntry, target: &str) -> Result<bool> {
-        if entry.name_lower.contains(target)
-            || entry
-                .binary_lower
-                .as_deref()
-                .is_some_and(|b| b.contains(target))
-        {
+        // Cheap legs first (name/binary), so a hit avoids resolving the PID.
+        if entry_matches_target(entry, target, None) {
             return Ok(true);
         }
+        // Fallback: resolve the stream's PID (possibly a PA round-trip) and
+        // test its lower-cased /proc/<pid>/comm.
         let Some(pid) = self.resolve_pid(entry)? else {
             return Ok(false);
         };
         if !pid.chars().all(|c| c.is_ascii_digit()) {
             return Ok(false);
         }
-        Ok(comm_for_pid(&pid).is_some_and(|c| c.contains(target)))
+        Ok(entry_matches_target(entry, target, comm_for_pid(&pid).as_deref()))
     }
 
     /// The PID for a sink input: the inline proplist value if present, else
@@ -759,6 +757,19 @@ impl Drop for AudioController {
     }
 }
 
+/// Whether a sink-input entry matches `target`. Pure: operates only on the
+/// entry's already-resolved fields plus an optional pre-resolved `comm` (the
+/// lower-cased `/proc/<pid>/comm`), which the caller fetches separately
+/// because it can require a PA round-trip. `target` must already be
+/// lower-cased; `name_lower`, `binary_lower`, and `comm` are all lower-case,
+/// so this is a case-insensitive substring test with name → binary → comm
+/// precedence. Passing `comm = None` checks only the cheap name/binary legs.
+fn entry_matches_target(entry: &SinkInputEntry, target: &str, comm: Option<&str>) -> bool {
+    entry.name_lower.contains(target)
+        || entry.binary_lower.as_deref().is_some_and(|b| b.contains(target))
+        || comm.is_some_and(|c| c.contains(target))
+}
+
 /// Lower-cased `/proc/<pid>/comm`, memoized process-wide. A PID's comm is
 /// stable for that process's lifetime, so caching turns the repeated
 /// filesystem reads on the ~10 Hz slider hot path into one read per PID.
@@ -833,5 +844,59 @@ mod tests {
         // 254 must be strictly below NORMAL (255 = NORMAL); the cast
         // shouldn't overshoot.
         assert!(volume_from_u8(254).0 < Volume::NORMAL.0);
+    }
+
+    /// Build a SinkInputEntry with the fields `entry_matches_target` reads;
+    /// the rest are filler. `name`/`binary` are lower-cased here the same way
+    /// `collect_sink_inputs` does.
+    fn entry(name: &str, binary: Option<&str>) -> SinkInputEntry {
+        SinkInputEntry {
+            index: 0,
+            name: name.to_string(),
+            name_lower: name.to_lowercase(),
+            binary: binary.map(String::from),
+            binary_lower: binary.map(|b| b.to_lowercase()),
+            pid: None,
+            client_index: u32::MAX,
+            channels: 2,
+            muted: false,
+        }
+    }
+
+    #[test]
+    fn entry_matches_target_by_name_substring_case_insensitive() {
+        let e = entry("Firefox", Some("firefox-bin"));
+        // target is lower-cased by the caller; name_lower contains it.
+        assert!(entry_matches_target(&e, "fire", None));
+        assert!(entry_matches_target(&e, "firefox", None));
+    }
+
+    #[test]
+    fn entry_matches_target_by_binary() {
+        // Generic display name, but the binary identifies the app.
+        let e = entry("AudioStream", Some("dota2"));
+        assert!(entry_matches_target(&e, "dota2", None));
+    }
+
+    #[test]
+    fn entry_matches_target_no_match_on_name_or_binary() {
+        let e = entry("AudioStream", Some("dota2"));
+        assert!(!entry_matches_target(&e, "mumble", None));
+    }
+
+    #[test]
+    fn entry_matches_target_comm_fallback_only_when_provided() {
+        // Name and binary don't match; the comm does. With comm = None
+        // (cheap legs only) it must miss; with the comm supplied it matches.
+        let e = entry("pipewire stream", None);
+        assert!(!entry_matches_target(&e, "dota", None));
+        assert!(entry_matches_target(&e, "dota", Some("dota2")));
+    }
+
+    #[test]
+    fn entry_matches_target_no_binary_is_safe() {
+        let e = entry("Mumble", None);
+        assert!(entry_matches_target(&e, "mumble", None));
+        assert!(!entry_matches_target(&e, "nope", None));
     }
 }
