@@ -2,6 +2,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ops::Deref;
 use std::rc::Rc;
+use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
@@ -62,10 +63,12 @@ impl Target {
 }
 
 /// Info collected from a sink input for matching and display. The lower-
-/// cased forms of `name`, `binary`, and `comm` are computed once during
-/// `collect_sink_inputs` so `matches()` is a pure `&str::contains` —
-/// sliders fire ~10 Hz × multiple configured apps and the per-call
-/// `to_lowercase()` was real work.
+/// cased forms of `name` and `binary` are computed once during
+/// `collect_sink_inputs` so the cheap leg of a match is a pure
+/// `&str::contains` — sliders fire ~10 Hz × multiple configured apps and
+/// the per-call `to_lowercase()` was real work. The `/proc/<pid>/comm`
+/// fallback is resolved lazily in `AudioController::entry_matches` rather
+/// than eagerly here, so it isn't read for every stream on every tick.
 #[derive(Clone)]
 struct SinkInputEntry {
     index: u32,
@@ -74,27 +77,9 @@ struct SinkInputEntry {
     binary: Option<String>,
     binary_lower: Option<String>,
     pid: Option<String>,
-    /// Cached lower-cased `/proc/<pid>/comm`. Populated once during
-    /// `collect_sink_inputs` so `matches()` doesn't re-read /proc per
-    /// match attempt.
-    comm: Option<String>,
     client_index: u32,
     channels: u8,
     muted: bool,
-}
-
-impl SinkInputEntry {
-    /// Check if this entry matches a target app name (case-insensitive
-    /// substring). `target` is expected to already be lower-cased by the
-    /// caller — `matches` does no per-call allocation.
-    fn matches(&self, target: &str) -> bool {
-        self.name_lower.contains(target)
-            || self
-                .binary_lower
-                .as_deref()
-                .is_some_and(|b| b.contains(target))
-            || self.comm.as_deref().is_some_and(|c| c.contains(target))
-    }
 }
 
 pub struct AudioController {
@@ -429,9 +414,14 @@ impl AudioController {
         }
     }
 
-    /// Collect all sink inputs with their properties.
+    /// Enumerate all sink inputs with the fields PA gives us directly.
+    /// Deliberately does NOT resolve PIDs via the client (a PA round-trip)
+    /// or read `/proc/<pid>/comm`: those are deferred to `entry_matches`
+    /// (lazy, only for non-name/binary matches) and `list_apps` (cold
+    /// path), so the ~10 Hz volume hot path doesn't pay for them on every
+    /// stream every tick.
     fn collect_sink_inputs(&self) -> Result<Vec<SinkInputEntry>> {
-        let mut result: Vec<SinkInputEntry> = self.pa_collect(|entries, done| {
+        self.pa_collect(|entries, done| {
             let introspect = self.context.borrow().introspect();
             let _op = introspect.get_sink_input_info_list(move |result| match result {
                 ListResult::Item(info) => {
@@ -454,7 +444,6 @@ impl AudioController {
                         binary,
                         binary_lower,
                         pid,
-                        comm: None, // populated after PID resolution below
                         client_index: info.client.unwrap_or(u32::MAX),
                         channels: info.volume.len(),
                         muted: info.mute,
@@ -464,27 +453,42 @@ impl AudioController {
                     *done.borrow_mut() = true;
                 }
             });
-        })?;
+        })
+    }
 
-        // Resolve PIDs via client lookup for entries missing a PID
-        for entry in &mut result {
-            if entry.pid.is_none() && entry.client_index != u32::MAX {
-                entry.pid = self.get_client_pid(entry.client_index)?;
-            }
+    /// Whether a sink input matches `target` (already lower-cased by the
+    /// caller). Checks the cheap `name`/`binary` fields first — both are
+    /// available straight from the enumeration — and only falls back to the
+    /// PA client-PID query + `/proc/comm` read for streams that didn't
+    /// already match. This keeps the volume hot path from resolving a PID
+    /// and reading /proc for every stream on every slider tick; the comm
+    /// read is additionally memoized by `comm_for_pid`.
+    fn entry_matches(&self, entry: &SinkInputEntry, target: &str) -> Result<bool> {
+        if entry.name_lower.contains(target)
+            || entry
+                .binary_lower
+                .as_deref()
+                .is_some_and(|b| b.contains(target))
+        {
+            return Ok(true);
         }
-
-        // Cache /proc/<pid>/comm (lower-cased) so matches() doesn't read it
-        // per match attempt.
-        for entry in &mut result {
-            if let Some(ref pid) = entry.pid
-                && pid.chars().all(|c| c.is_ascii_digit())
-                    && let Ok(raw) = std::fs::read_to_string(format!("/proc/{pid}/comm"))
-                {
-                    entry.comm = Some(raw.trim().to_lowercase());
-                }
+        let Some(pid) = self.resolve_pid(entry)? else {
+            return Ok(false);
+        };
+        if !pid.chars().all(|c| c.is_ascii_digit()) {
+            return Ok(false);
         }
+        Ok(comm_for_pid(&pid).is_some_and(|c| c.contains(target)))
+    }
 
-        Ok(result)
+    /// The PID for a sink input: the inline proplist value if present, else
+    /// a PA client-info query (pipewire.sec.pid / application.process.id).
+    fn resolve_pid(&self, entry: &SinkInputEntry) -> Result<Option<String>> {
+        match &entry.pid {
+            Some(p) => Ok(Some(p.clone())),
+            None if entry.client_index != u32::MAX => self.get_client_pid(entry.client_index),
+            None => Ok(None),
+        }
     }
 
     /// Look up a client's PID via pipewire.sec.pid property.
@@ -510,7 +514,15 @@ impl AudioController {
     }
 
     pub fn list_apps(&self) -> Result<Vec<AppInfo>> {
-        let entries = self.collect_sink_inputs()?;
+        let mut entries = self.collect_sink_inputs()?;
+        // Resolve PIDs via the client for streams whose sink-input proplist
+        // didn't carry one. Only done here, on the cold `--list-apps` path —
+        // never on the volume hot path.
+        for entry in &mut entries {
+            if entry.pid.is_none() && entry.client_index != u32::MAX {
+                entry.pid = self.get_client_pid(entry.client_index)?;
+            }
+        }
         let apps = entries
             .into_iter()
             .map(|e| AppInfo {
@@ -536,13 +548,20 @@ impl AudioController {
         let target = app_name.to_lowercase();
         let entries = self.collect_sink_inputs()?;
 
-        let matched: Vec<_> = entries.iter().filter(|e| e.matches(&target)).collect();
+        // Match lazily: the name/binary checks are free; only streams that
+        // miss those incur a PA client-PID query + /proc/comm read.
+        let mut matched: Vec<(u32, u8)> = Vec::new(); // (index, channels)
+        for entry in &entries {
+            if self.entry_matches(entry, &target)? {
+                matched.push((entry.index, entry.channels));
+            }
+        }
 
         let mut introspect = self.context.borrow().introspect();
-        for entry in &matched {
+        for &(index, channels) in &matched {
             let mut cv = ChannelVolumes::default();
-            cv.set(entry.channels, volume);
-            let _op = introspect.set_sink_input_volume(entry.index, &cv, None);
+            cv.set(channels, volume);
+            let _op = introspect.set_sink_input_volume(index, &cv, None);
         }
         self.drain();
 
@@ -681,7 +700,14 @@ impl AudioController {
         let target = app_name.to_lowercase();
         let entries = self.collect_sink_inputs()?;
 
-        let matched: Vec<_> = entries.iter().filter(|e| e.matches(&target)).collect();
+        // Same lazy match as set_app_volume (name/binary free, comm only on
+        // miss) so the slider and the button match an app identically.
+        let mut matched: Vec<(u32, bool)> = Vec::new(); // (index, muted)
+        for entry in &entries {
+            if self.entry_matches(entry, &target)? {
+                matched.push((entry.index, entry.muted));
+            }
+        }
 
         if matched.is_empty() {
             debug!("app not found for mute toggle: {app_name}");
@@ -689,12 +715,12 @@ impl AudioController {
         }
 
         // If any are unmuted, mute all. If all are muted, unmute all.
-        let any_unmuted = matched.iter().any(|e| !e.muted);
+        let any_unmuted = matched.iter().any(|&(_, muted)| !muted);
         let new_mute = any_unmuted;
 
         let mut introspect = self.context.borrow().introspect();
-        for entry in &matched {
-            let _op = introspect.set_sink_input_mute(entry.index, new_mute, None);
+        for &(index, _) in &matched {
+            let _op = introspect.set_sink_input_mute(index, new_mute, None);
         }
         self.drain();
 
@@ -721,6 +747,32 @@ impl Drop for AudioController {
     fn drop(&mut self) {
         self.context.borrow_mut().disconnect();
     }
+}
+
+/// Lower-cased `/proc/<pid>/comm`, memoized process-wide. A PID's comm is
+/// stable for that process's lifetime, so caching turns the repeated
+/// filesystem reads on the ~10 Hz slider hot path into one read per PID.
+/// `None` (no such process / unreadable) is cached too, so a stream that
+/// never matches by comm isn't re-read every tick.
+///
+/// PID reuse after the original process exits could in principle return a
+/// stale comm, but the only consequence is an app-name *match* decision for
+/// a volume/mute change — low-stakes and self-correcting once that stream
+/// goes away. Mirrors the process-lifetime icon-resolution cache.
+fn comm_for_pid(pid: &str) -> Option<String> {
+    static CACHE: LazyLock<Mutex<HashMap<String, Option<String>>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+    if let Some(cached) = CACHE.lock().unwrap_or_else(|e| e.into_inner()).get(pid) {
+        return cached.clone();
+    }
+    let comm = std::fs::read_to_string(format!("/proc/{pid}/comm"))
+        .ok()
+        .map(|raw| raw.trim().to_lowercase());
+    CACHE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(pid.to_string(), comm.clone());
+    comm
 }
 
 fn volume_from_u8(value: u8) -> Volume {
