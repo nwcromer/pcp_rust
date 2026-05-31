@@ -24,22 +24,36 @@ fn binary_path() -> Result<String> {
         .to_str()
         .map(String::from)
         .context("binary path is not valid UTF-8")?;
-    // We embed the path inside double-quotes in the systemd unit file.
-    // Reject characters that have special meaning inside systemd's
-    // double-quoted values rather than attempting to escape them; no
-    // real-world Linux install puts these in a binary path.
-    //   "  closes the quoted string
-    //   \  is the escape character
-    //   $  triggers variable expansion
-    //   %  introduces a systemd specifier (e.g. %h); expanded even inside
-    //      double quotes, so a literal % would have to be written %%
-    if let Some(bad) = path.chars().find(|c| matches!(c, '"' | '\\' | '$' | '%')) {
+    check_path_for_unit_file(&path)?;
+    Ok(path)
+}
+
+/// Reject binary paths that can't be safely embedded in the double-quoted
+/// `ExecStart="{bin_path}"` of the generated unit file. We refuse rather
+/// than escape — no real-world Linux install puts these in a binary path.
+/// Pure so it can be unit-tested.
+///
+///   "  closes the quoted string
+///   \  is the escape character
+///   $  triggers variable expansion
+///   %  introduces a systemd specifier (e.g. %h); expanded even inside
+///      double quotes, so a literal % would have to be written %%
+///   control chars (especially newline) terminate the value / line
+///      entirely, so a path containing one could inject arbitrary unit
+///      directives after ExecStart — strictly more dangerous than the
+///      quoting characters above, which only break out of the string.
+fn check_path_for_unit_file(path: &str) -> Result<()> {
+    if let Some(bad) = path
+        .chars()
+        .find(|c| matches!(c, '"' | '\\' | '$' | '%') || c.is_control())
+    {
         bail!(
-            "binary path contains the special character `{bad}` ({path:?}); \
-             move or rename the binary to a path without `\"`, `\\`, `$`, or `%`"
+            "binary path contains the disallowed character {bad:?} ({path:?}); \
+             move or rename the binary to a path without `\"`, `\\`, `$`, `%`, \
+             or control characters"
         );
     }
-    Ok(path)
+    Ok(())
 }
 
 fn generate_service_file(bin_path: &str) -> String {
@@ -165,4 +179,33 @@ pub fn remove() -> Result<()> {
     println!("Service stopped, disabled, and removed.");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accepts_normal_paths() {
+        assert!(check_path_for_unit_file("/home/wil/.local/bin/pcp_rust").is_ok());
+        assert!(check_path_for_unit_file("/usr/bin/pcp_rust").is_ok());
+        // Spaces are fine inside the quoted value.
+        assert!(check_path_for_unit_file("/home/My User/bin/pcp_rust").is_ok());
+    }
+
+    #[test]
+    fn rejects_systemd_quoting_specials() {
+        for p in ["/tmp/a\"b", "/tmp/a\\b", "/tmp/a$b", "/tmp/a%b"] {
+            assert!(check_path_for_unit_file(p).is_err(), "{p:?} should be rejected");
+        }
+    }
+
+    #[test]
+    fn rejects_control_chars() {
+        // The newline is the dangerous one: it terminates the ExecStart line,
+        // so the rest of the path would be parsed as fresh unit directives.
+        assert!(check_path_for_unit_file("/tmp/x\nExecStartPre=/evil").is_err());
+        assert!(check_path_for_unit_file("/tmp/x\ty").is_err());
+        assert!(check_path_for_unit_file("/tmp/x\0y").is_err());
+    }
 }
