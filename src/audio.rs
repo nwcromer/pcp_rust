@@ -31,6 +31,17 @@ struct PendingPersist {
 /// output (sink) and mic input (source). Used to deduplicate the
 /// per-system/per-mic methods which were near-identical except for which
 /// PA API they called.
+///
+/// Review-accepted: this centralizes the *data* differences (pa_name, label,
+/// default_channels), but four methods (query_default_channels,
+/// query_default_mute, set_default_volume, toggle_default_mute) still carry a
+/// sink/source match whose arms differ only in the libpulse method name
+/// (get_sink_info_by_name vs get_source_info_by_name, etc.). Left as-is:
+/// libpulse exposes those as distinct non-generic methods over distinct
+/// SinkInfo/SourceInfo payload types, so collapsing the arms needs a macro or
+/// a bridging trait — more indirection than two shallow, side-by-side arms are
+/// worth for a fixed 2-variant set that the hardware won't grow. The drift-
+/// prone bits (name/label/channels) are already centralized here.
 #[derive(Clone, Copy)]
 enum Target {
     DefaultSink,
