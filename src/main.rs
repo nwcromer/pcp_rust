@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
-use log::{info, warn};
+use log::{debug, info, warn};
 
 use config::{Action, AppTarget, ControlId, ObsColors};
 use device::{Control, Event, PcPanelPro};
@@ -282,6 +282,34 @@ impl MicPoller {
 }
 
 
+/// Re-open the PCPanel after a read error (USB unplug / hub power-cycle /
+/// suspend), retrying forever with exponential backoff. Blocks the main loop
+/// while it runs — there's no panel to service until it returns, so OBS/mic
+/// updates simply pause (and resume on the next iteration once a panel is
+/// back). Mirrors the OBS reconnect backoff in `obs.rs`.
+///
+/// The backoff sleep runs before every attempt, including the first, so even a
+/// device that accepts open() but immediately fails the next read can't spin
+/// the loop — the worst case is a 2s-paced retry, never a busy wait.
+fn reconnect_panel() -> PcPanelPro {
+    const INITIAL_BACKOFF: Duration = Duration::from_secs(2);
+    const MAX_BACKOFF: Duration = Duration::from_secs(30);
+    let mut backoff = INITIAL_BACKOFF;
+    loop {
+        std::thread::sleep(backoff);
+        match PcPanelPro::open() {
+            Ok(panel) => {
+                info!("PCPanel reconnected");
+                return panel;
+            }
+            Err(e) => {
+                debug!("PCPanel reconnect failed ({e}); retrying in {backoff:?}");
+                backoff = (backoff * 2).min(MAX_BACKOFF);
+            }
+        }
+    }
+}
+
 fn run(cli: Cli) -> Result<()> {
     let config_path = cli
         .config
@@ -395,8 +423,29 @@ fn run(cli: Cli) -> Result<()> {
         // Read a panel event (may block ~100ms). Process before painting so
         // any button-triggered state changes (e.g., a local error flash from
         // a dispatch when OBS is disconnected) get painted this iteration.
-        if let Some(event) = panel.read_event()? {
-            led_dirty |= handle_panel_event(event, &cli, &config, &mut audio, &mut obs);
+        //
+        // A read error means the HID device went away (USB unplug, hub
+        // power-cycle, suspend transition). Rather than propagate it and let
+        // systemd respawn us — losing OBS/PA state and any in-flight flash —
+        // reconnect in place with backoff. PcPanelPro::open() re-runs init()
+        // (absorbing the calibration burst), and forcing led_dirty makes the
+        // repaint below restore the configured appearance from `obs` state,
+        // exactly like the resume-from-sleep path above.
+        match panel.read_event() {
+            Ok(Some(event)) => {
+                led_dirty |= handle_panel_event(event, &cli, &config, &mut audio, &mut obs);
+            }
+            Ok(None) => {}
+            Err(e) => {
+                warn!("panel read failed ({e}); attempting to reconnect");
+                // While reconnect_panel sleeps, the main loop doesn't drain
+                // OBS events — they queue in the bounded channel and the OBS
+                // thread parks on a full send. apply_event is last-write-wins,
+                // so drain_events collapses the backlog to the current state on
+                // the next iteration; no events are lost meaningfully.
+                panel = reconnect_panel();
+                led_dirty = true;
+            }
         }
 
         // Repaint LEDs if anything changed (OBS event, flash expiry, resume,
