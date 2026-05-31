@@ -461,28 +461,14 @@ fn parse_app_strings(key: &str, table: &toml::value::Table) -> Result<Vec<String
         .with_context(|| format!("[{key}] missing \"app\" field"))?;
 
     match value {
-        toml::Value::String(s) => {
-            // A blank app name would become Named("") and match every
-            // stream (contains("") is always true), so a slider/button with
-            // app = "" would silently control/mute every app — including
-            // persisting mute to the whole stream-restore DB. Reject it.
-            if s.trim().is_empty() {
-                bail!("[{key}] \"app\" cannot be empty");
-            }
-            Ok(vec![s.clone()])
-        }
+        toml::Value::String(s) => Ok(vec![clean_app_name(key, s)?]),
         toml::Value::Array(arr) => {
             let mut apps = Vec::new();
             for item in arr {
                 let s = item
                     .as_str()
                     .with_context(|| format!("[{key}] app array entries must be strings"))?;
-                // Guard each entry too: one blank element would reintroduce
-                // the match-everything wildcard for the whole control.
-                if s.trim().is_empty() {
-                    bail!("[{key}] \"app\" entries cannot be empty");
-                }
-                apps.push(s.to_string());
+                apps.push(clean_app_name(key, s)?);
             }
             if apps.is_empty() {
                 bail!("[{key}] app list cannot be empty");
@@ -491,6 +477,25 @@ fn parse_app_strings(key: &str, table: &toml::value::Table) -> Result<Vec<String
         }
         _ => bail!("[{key}] \"app\" must be a string or array of strings"),
     }
+}
+
+/// Trim surrounding whitespace from a configured app name and reject it if
+/// nothing remains.
+///
+/// Trimming matters because matching is a substring test that never trims
+/// (`set_app_volumes` / `entry_matches_target`): a stray leading/trailing
+/// space (`app = "firefox "`) would otherwise silently match no stream, and
+/// `" system "` would miss the `System` special target and fall through to a
+/// never-matching `Named`. Rejecting the empty result matters because a blank
+/// name becomes `Named("")` and matches every stream (`contains("")` is always
+/// true), so the control would silently drive/mute every app — including
+/// persisting mute across the whole stream-restore DB.
+fn clean_app_name(key: &str, s: &str) -> Result<String> {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        bail!("[{key}] \"app\" cannot be empty");
+    }
+    Ok(trimmed.to_string())
 }
 
 fn parse_action(key: &str, table: &toml::value::Table) -> Result<Action> {
@@ -843,6 +848,60 @@ mod tests {
         );
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("cannot be empty"));
+    }
+
+    #[test]
+    fn test_app_name_whitespace_trimmed() {
+        // Surrounding whitespace must be stripped: matching is a substring
+        // test that never trims, so a stored "firefox " would match nothing.
+        let config = parse_config(
+            r#"
+            [slider1]
+            action = "volume"
+            app = "  firefox  "
+
+            [slider2]
+            action = "volume"
+            app = ["  spotify  ", "Dota 2"]
+            "#,
+        )
+        .unwrap();
+
+        match config.mappings.get(&ControlId::Slider(0)) {
+            Some(Action::Volume(action)) => {
+                let labels: Vec<&str> = action.targets.iter().map(|t| t.label()).collect();
+                assert_eq!(labels, vec!["firefox"]);
+            }
+            other => panic!("expected Volume, got {other:?}"),
+        }
+        match config.mappings.get(&ControlId::Slider(1)) {
+            Some(Action::Volume(action)) => {
+                let labels: Vec<&str> = action.targets.iter().map(|t| t.label()).collect();
+                // Internal whitespace ("Dota 2") is preserved; only the ends trim.
+                assert_eq!(labels, vec!["spotify", "Dota 2"]);
+            }
+            other => panic!("expected Volume, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_app_name_whitespace_trims_to_special_target() {
+        // "  system  " must resolve to the System special target, not a
+        // never-matching Named("  system  ").
+        let config = parse_config(
+            r#"
+            [slider1]
+            action = "volume"
+            app = "  system  "
+            "#,
+        )
+        .unwrap();
+        match config.mappings.get(&ControlId::Slider(0)) {
+            Some(Action::Volume(action)) => {
+                assert!(matches!(action.targets.as_slice(), [AppTarget::System]));
+            }
+            other => panic!("expected Volume, got {other:?}"),
+        }
     }
 
     #[test]
