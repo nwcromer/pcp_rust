@@ -642,6 +642,14 @@ fn parse_section_color(
     }
 }
 
+/// Upper bound on flash_duration_ms. The flash is brief command feedback
+/// that briefly takes over the LED display; 30s is far longer than any
+/// real "make the error linger" intent, so anything past it is a typo.
+/// Bounding here also keeps `Instant::now() + Duration::from_millis(_)` in
+/// Flash::new_* (runtime.rs) from overflowing and panicking the daemon on
+/// the first flash.
+const MAX_FLASH_DURATION_MS: i64 = 30_000;
+
 fn parse_flash_duration(table: &toml::value::Table, default: u64) -> Result<u64> {
     match table.get("flash_duration_ms") {
         None => Ok(default),
@@ -649,8 +657,10 @@ fn parse_flash_duration(table: &toml::value::Table, default: u64) -> Result<u64>
             let n = v
                 .as_integer()
                 .context("[obs.colors] \"flash_duration_ms\" must be a non-negative integer")?;
-            if n < 0 {
-                bail!("[obs.colors] \"flash_duration_ms\" must be non-negative, got {n}");
+            if !(0..=MAX_FLASH_DURATION_MS).contains(&n) {
+                bail!(
+                    "[obs.colors] \"flash_duration_ms\" must be in 0-{MAX_FLASH_DURATION_MS}, got {n}"
+                );
             }
             Ok(n as u64)
         }
@@ -1452,6 +1462,42 @@ mod tests {
         );
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("port"));
+    }
+
+    #[test]
+    fn test_flash_duration_out_of_range_rejected() {
+        // An absurd value must be rejected at parse time, not flow through to
+        // `Instant::now() + Duration::from_millis(_)` and panic on the first
+        // flash. The message names the field so the user can find it.
+        let result = parse_config(
+            "[obs]\n\n[obs.colors]\nflash_duration_ms = 99999999999\n",
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("flash_duration_ms"));
+    }
+
+    #[test]
+    fn test_flash_duration_at_bound_accepted() {
+        // Exactly MAX_FLASH_DURATION_MS is allowed; one past it is not.
+        let ok = parse_config(
+            "[obs]\n\n[obs.colors]\nflash_duration_ms = 30000\n",
+        )
+        .unwrap();
+        assert_eq!(ok.obs.unwrap().colors.flash_duration_ms, 30_000);
+
+        let bad = parse_config(
+            "[obs]\n\n[obs.colors]\nflash_duration_ms = 30001\n",
+        );
+        assert!(bad.is_err());
+    }
+
+    #[test]
+    fn test_flash_duration_negative_rejected() {
+        let result = parse_config(
+            "[obs]\n\n[obs.colors]\nflash_duration_ms = -1\n",
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("flash_duration_ms"));
     }
 
     #[test]
