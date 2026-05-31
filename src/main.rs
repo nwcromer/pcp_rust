@@ -495,6 +495,8 @@ fn run(cli: Cli) -> Result<()> {
         // Reconnect PulseAudio if it dropped. On a fresh reconnect, re-seed
         // the mic state and repaint so the logo doesn't linger on the stale
         // "unknown" blink it fell into during the outage.
+        // Review-accepted: tick() can block this loop up to CONNECT_DEADLINE
+        // (~3s) per attempt, delaying HID — but only while PA is down.
         if audio_reconnect.tick(&mut audio) {
             mic_poller.refresh_now(&audio, &mut obs);
             led_dirty = true;

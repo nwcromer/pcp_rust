@@ -413,6 +413,9 @@ impl AudioController {
         let volume = volume_from_u8(value);
         let channels = self.query_default_channels(target)?;
         let mut cv = ChannelVolumes::default();
+        // Review-accepted: cv.set writes one level to all channels, so a slider
+        // move flattens L/R balance to center (vs. pavucontrol's proportional
+        // scale). Intended — a hardware fader sets an absolute per-channel level.
         cv.set(channels, volume);
 
         let mut introspect = self.context.borrow().introspect();
@@ -658,6 +661,7 @@ impl AudioController {
         let mut introspect = self.context.borrow().introspect();
         for &(index, channels) in &to_set {
             let mut cv = ChannelVolumes::default();
+            // Review-accepted: flattens L/R balance by design — see set_default_volume.
             cv.set(channels, volume);
             let _op = introspect.set_sink_input_volume(index, &cv, None);
         }
