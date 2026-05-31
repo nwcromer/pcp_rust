@@ -208,24 +208,32 @@ impl AudioController {
 
     /// Drive the PulseAudio mainloop until `is_done` returns true, or fail
     /// with an error if the PA context disconnects, the mainloop quits, or
-    /// the operation exceeds the wall-clock deadline / iteration cap.
+    /// the operation exceeds the wall-clock deadline.
     ///
     /// Surfacing a real error rather than silently breaking out is the
     /// "practical fallback" for the absent reconnect path: callers now see
     /// the failure and propagate it; the user gets a visible error in the
     /// journal instead of stale defaults from an apparently-successful call.
     fn wait_until<F: Fn() -> bool>(&self, is_done: F) -> Result<()> {
-        const MAX_ITERATIONS: usize = 1000;
         const DEADLINE: std::time::Duration = std::time::Duration::from_millis(250);
         let started = std::time::Instant::now();
-        for _ in 0..MAX_ITERATIONS {
+        loop {
             if is_done() {
                 return Ok(());
             }
             if started.elapsed() >= DEADLINE {
                 bail!("PulseAudio call exceeded {:?} deadline", DEADLINE);
             }
-            match self.mainloop.borrow_mut().iterate(true) {
+            // Non-blocking iterate, mirroring connect(): a blocking
+            // `iterate(true)` can park inside poll() indefinitely if the peer
+            // accepted the socket but sends nothing and never closes, so the
+            // elapsed() deadline check above would never be reached. Polling
+            // non-blocking keeps the deadline a hard ceiling. The short sleep
+            // when no events were dispatched caps the spin at ~200 wakeups/sec.
+            match self.mainloop.borrow_mut().iterate(false) {
+                IterateResult::Success(0) => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
                 IterateResult::Success(_) => {}
                 IterateResult::Err(e) => bail!("PulseAudio mainloop error: {e}"),
                 IterateResult::Quit(_) => bail!("PulseAudio mainloop quit"),
@@ -239,10 +247,6 @@ impl AudioController {
                 other => bail!("PulseAudio context not ready: {other:?}"),
             }
         }
-        if !is_done() {
-            bail!("PulseAudio call exceeded {MAX_ITERATIONS} iterations");
-        }
-        Ok(())
     }
 
     fn drain(&self) {
