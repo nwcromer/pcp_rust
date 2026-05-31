@@ -411,6 +411,8 @@ impl AudioController {
 
     fn set_default_volume(&self, target: Target, value: u8) -> Result<()> {
         let volume = volume_from_u8(value);
+        // Review-accepted: re-queried every tick (not cached like the app path)
+        // so a default-device switch picks up the new channel count.
         let channels = self.query_default_channels(target)?;
         let mut cv = ChannelVolumes::default();
         // Review-accepted: cv.set writes one level to all channels, so a slider
