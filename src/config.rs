@@ -244,6 +244,22 @@ fn file_has_obs_password(content: &str) -> bool {
 /// read it. Warn (don't fail) — the user may have loosened perms on
 /// purpose, and the warning leaks nothing (just the path + octal mode).
 /// Best-effort: a stat failure is silently ignored.
+///
+/// Review-accepted: two non-issues here, both deliberately left as-is.
+///   1. `file_has_obs_password` re-parses the TOML that `parse_config`
+///      already parsed in `load_config`. Kept separate so it stays a pure
+///      `&str -> bool` (unit-tested) and so it keys off the *file* contents
+///      rather than the resolved password — a secret from
+///      `$PCPANEL_OBS_PASSWORD` with nothing in the file must NOT trip the
+///      perms warning. Both parses run on the same in-memory `content`
+///      (one disk read), so there is no race between them.
+///   2. There is a benign read-vs-stat TOCTOU window: `content` is read in
+///      `load_config` (T1) and `fs::metadata` re-stats `path` here (T2), so
+///      a swap/chmod/symlink-repoint in between could pair content from one
+///      file with mode bits from another. Consequence is nil — this is a
+///      one-shot startup advisory; the config actually in use is the T1
+///      snapshot, and the worst case is a spurious or missed warning printed
+///      once. Not worth an open-once-then-fstat rework for a perms hint.
 fn warn_if_obs_password_world_readable(path: &Path, content: &str) {
     use std::os::unix::fs::PermissionsExt;
 
