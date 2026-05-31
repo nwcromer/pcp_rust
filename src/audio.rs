@@ -826,6 +826,10 @@ fn entry_matches_target(entry: &SinkInputEntry, target: &str, comm: Option<&str>
 /// Lower-cased `/proc/<pid>/comm`, memoized process-wide. A PID's comm is
 /// stable for that process's lifetime, so caching turns the repeated
 /// filesystem reads on the ~10 Hz slider hot path into one read per PID.
+///
+/// Review-accepted: `main.rs` `list_apps` reads `/proc/<pid>/comm` too, but
+/// that cold display path keeps original case and skips this cache on
+/// purpose, so the small read+trim overlap is left un-factored.
 /// `None` (no such process / unreadable) is cached too, so a stream that
 /// never matches by comm isn't re-read every tick.
 ///

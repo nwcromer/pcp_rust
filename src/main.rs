@@ -90,7 +90,12 @@ fn list_apps() -> Result<()> {
     for app in &apps {
         let pid = app.pid.as_deref().unwrap_or("?");
 
-        // Try to find a useful extra identifier: binary name or /proc/comm
+        // Try to find a useful extra identifier: binary name or /proc/comm.
+        // Review-accepted: the /proc/comm read below duplicates the one in
+        // audio.rs `comm_for_pid`, but deliberately — this cold display path
+        // keeps original case and skips the match-cache, where the hot-path
+        // matcher lower-cases and memoizes. A shared helper would be net
+        // worse. See the matching note in `comm_for_pid`.
         let extra = app
             .binary
             .as_deref()
