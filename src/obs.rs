@@ -283,10 +283,14 @@ async fn run_session(
     }
 
     loop {
-        // `biased` polls cmd_rx first every iteration so button presses
-        // can't get starved when the events arm is parked on
-        // `event_tx.send(...).await` (which happens if the main thread
-        // can't drain the bounded events channel fast enough).
+        // `biased` polls the arms in written order, so when both cmd_rx and
+        // the event stream are ready at the same select point, a button
+        // command wins over an OBS event instead of tokio picking randomly.
+        // (This only governs the choice at the select point — it does not
+        // preempt an arm body already awaiting, e.g. handle_obs_event parked
+        // on a full event_tx.send(). In practice the main thread drains the
+        // bounded events channel every loop iteration, so that send rarely
+        // parks for long.)
         tokio::select! {
             biased;
             cmd = cmd_rx.recv() => {
