@@ -119,7 +119,18 @@ const STABLE_SESSION_DWELL: Duration = Duration::from_secs(30);
 /// cleartext. We warn once at startup rather than refuse — the user may
 /// have a secure tunnel (SSH, VPN, etc.) the program can't see.
 fn host_is_local(host: &str) -> bool {
-    matches!(host, "localhost" | "127.0.0.1" | "::1" | "[::1]")
+    // Tolerate an FQDN trailing dot ("localhost.") and IPv6 brackets
+    // ("[::1]"), then accept a case-insensitive "localhost" (hostnames are
+    // case-insensitive) or any address std considers loopback — which covers
+    // the whole 127.0.0.0/8 block, not just 127.0.0.1, plus ::1. This is a
+    // best-effort string heuristic, not name resolution: a custom /etc/hosts
+    // alias pointing at loopback still reads as non-local and warns. That
+    // false positive is harmless (a spurious one-shot advisory), so we don't
+    // pay a startup DNS lookup to chase it.
+    let h = host.trim_end_matches('.');
+    let h = h.strip_prefix('[').and_then(|s| s.strip_suffix(']')).unwrap_or(h);
+    h.eq_ignore_ascii_case("localhost")
+        || h.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
 }
 
 async fn obs_main_loop(
@@ -359,5 +370,37 @@ async fn handle_obs_event(event: obws::events::Event, event_tx: &Sender<ObsEvent
         // react to stream state, add match arms here and map them to new
         // ObsEvent variants.
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn host_is_local_accepts_loopback_forms() {
+        // Case-insensitive localhost (hostnames are case-insensitive).
+        assert!(host_is_local("localhost"));
+        assert!(host_is_local("LOCALHOST"));
+        assert!(host_is_local("Localhost"));
+        // FQDN trailing dot.
+        assert!(host_is_local("localhost."));
+        // Any 127.0.0.0/8 address, not just 127.0.0.1.
+        assert!(host_is_local("127.0.0.1"));
+        assert!(host_is_local("127.0.0.2"));
+        assert!(host_is_local("127.1.2.3"));
+        // IPv6 loopback, bracketed or bare.
+        assert!(host_is_local("::1"));
+        assert!(host_is_local("[::1]"));
+    }
+
+    #[test]
+    fn host_is_local_rejects_remote_hosts() {
+        assert!(!host_is_local("192.168.1.10"));
+        assert!(!host_is_local("10.0.0.5"));
+        assert!(!host_is_local("obs.example.com"));
+        assert!(!host_is_local("example.com"));
+        // Not loopback, just shares a leading digit pattern.
+        assert!(!host_is_local("128.0.0.1"));
     }
 }
