@@ -77,15 +77,28 @@ impl PcPanelPro {
         // forward any button frames into a pending queue so a user press
         // during startup isn't silently dropped.
         let mut read_buf = [0u8; PACKET_SIZE];
+        let mut got_frame = false;
         for i in 0..CALIBRATION_READS {
             match self.device.read_timeout(&mut read_buf, 250) {
                 Ok(n) if n >= 3 => {
+                    got_frame = true;
                     debug!("calibration read {}: {:02x?}", i, &read_buf[..3]);
                     if read_buf[0] != MSG_ANALOG {
                         // Non-analog (button) frame — preserve it.
                         self.pending.push_back(read_buf);
                     }
                 }
+                // A read that yields no frame (the 250ms timeout elapsed) once
+                // the burst has started means the burst is drained — the device
+                // emits it as one contiguous, sub-millisecond-spaced block right
+                // after init. Stop early rather than spending the remaining
+                // iterations blocking on 250ms timeouts (~2.75s of dead startup
+                // when the burst is ~9 frames). The CALIBRATION_READS cap still
+                // bounds the wait if the burst is slow to *start*. Worst case if
+                // a straggler is ever missed: it surfaces as one analog event in
+                // the main loop, which simply applies the control's true current
+                // position — harmless and self-correcting.
+                Ok(_) if got_frame => break,
                 Ok(_) => {}
                 Err(e) => warn!("calibration read {} failed: {}", i, e),
             }
