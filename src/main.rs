@@ -455,15 +455,6 @@ fn named_target_names<'a>(targets: impl IntoIterator<Item = &'a AppTarget>) -> V
         .collect()
 }
 
-/// Map a raw slider/knob value (0-255) to a display percentage (0-100),
-/// rounded to nearest. Mirrors `volume_from_u8`'s rounding so the OSD and
-/// `--verbose` number agree with the volume actually applied to PA — a plain
-/// `as u8` truncation reads up to 1% low at some positions. Endpoints are
-/// exact (0 → 0, 255 → 100).
-fn value_to_percent(value: u8) -> u8 {
-    (value as f32 / 255.0 * 100.0).round() as u8
-}
-
 fn handle_panel_event(
     event: Event,
     cli: &Cli,
@@ -480,7 +471,7 @@ fn handle_panel_event(
             };
 
             if let Some(Action::Volume(action)) = config.mappings.get(&control_id) {
-                let pct = value_to_percent(value);
+                let pct = audio::value_to_percent(value);
 
                 // Batch all named targets into ONE sink-input enumeration
                 // (one PA round-trip for the whole control rather than one per
@@ -608,35 +599,5 @@ fn handle_panel_event(
         Event::ButtonRelease { .. } => {}
     }
     led_dirty
-}
-
-#[cfg(test)]
-mod tests {
-    use super::value_to_percent;
-
-    #[test]
-    fn value_to_percent_endpoints_exact() {
-        assert_eq!(value_to_percent(0), 0);
-        assert_eq!(value_to_percent(255), 100);
-    }
-
-    #[test]
-    fn value_to_percent_rounds_to_nearest() {
-        // 129 is ~50.6%: truncation gave 50, rounding gives 51 to match the
-        // volume actually applied (volume_from_u8 rounds the same way).
-        assert_eq!(value_to_percent(129), 51);
-        // 128 is ~50.2% → 50 either way.
-        assert_eq!(value_to_percent(128), 50);
-    }
-
-    #[test]
-    fn value_to_percent_is_monotonic() {
-        let mut prev = 0;
-        for v in 0..=255u8 {
-            let p = value_to_percent(v);
-            assert!(p >= prev, "percent decreased at value {v}: {p} < {prev}");
-            prev = p;
-        }
-    }
 }
 
