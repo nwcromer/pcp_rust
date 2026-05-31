@@ -147,6 +147,28 @@ impl AudioController {
         Ok(Self { mainloop, context, pending_persist: HashMap::new() })
     }
 
+    /// True while the PA context is `Ready`. Reads the state cached from the
+    /// last mainloop iteration (no I/O), so it reflects a server death only
+    /// after some op has iterated the loop and observed it — which any failed
+    /// op already does via `wait_until`. The main loop polls this to decide
+    /// whether to attempt a reconnect.
+    pub fn is_connected(&self) -> bool {
+        matches!(self.context.borrow().get_state(), context::State::Ready)
+    }
+
+    /// Rebuild the connection after the server dropped (PA/PipeWire restart,
+    /// suspend/resume). Builds a fresh controller first; only on success is
+    /// the old one replaced — so a still-down server leaves `self` (and its
+    /// dead-but-intact context) untouched and the caller can retry later.
+    /// Replacing `self` runs the old controller's `Drop` to disconnect the
+    /// stale context and discards `pending_persist` (those deferred writes
+    /// targeted the old session and may name apps that didn't survive the
+    /// outage).
+    pub fn reconnect(&mut self) -> Result<()> {
+        *self = Self::connect()?;
+        Ok(())
+    }
+
     fn wait_for(&self, done: &RefCell<bool>) -> Result<()> {
         self.wait_until(|| *done.borrow())
     }

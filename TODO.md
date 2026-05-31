@@ -17,5 +17,4 @@ Things planned for future work on pcp_rust.
 
 ## Known limitations
 
-- **PulseAudio auto-reconnect** — `wait_until` now propagates PA errors with a 250ms deadline, and `handle_panel_event` logs + continues so a transient PA hiccup doesn't kill the daemon. But there's no actual reconnect logic: once PA disconnects, all subsequent calls keep failing until pcp_rust is restarted. A real fix would detect `context::State != Ready` and re-run `AudioController::connect()` with backoff — the same shape as the HID reconnect (`reconnect_panel` in `main.rs`), which catches a `read_event` error and re-opens the device with exponential backoff instead of letting the daemon exit.
 - **Icon-resolution cache is process-lifetime** — `freedesktop_icon_resolves` caches lookup results in a static `HashMap` for the life of the process. If the user installs a new icon theme or icon mid-session, pcp_rust won't pick it up (apps that previously had no icon stay no-icon) until restart. Acceptable trade-off because the alternative is doing the full XDG icon spec walk on every slider tick.

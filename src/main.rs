@@ -281,6 +281,70 @@ impl MicPoller {
     }
 }
 
+/// Re-establishes the PulseAudio connection after the server drops (PA/
+/// PipeWire restart, suspend/resume). Unlike the HID reconnect — which blocks
+/// the loop because there's nothing to do without a panel — this is
+/// non-blocking and throttled: PA being down must not freeze HID input, OBS
+/// LED updates, or flashes, so we attempt at most one reconnect per backoff
+/// interval and let the loop keep running in between.
+///
+/// Detection is on-demand: `audio.is_connected()` reads the state cached from
+/// the last mainloop iteration, so an outage with no audio activity at all
+/// (mic indicator off, no slider movement) isn't noticed until the next op
+/// fails — after which this reconnects. Worst case is one lost action, versus
+/// today's "broken until the daemon is restarted."
+struct AudioReconnector {
+    /// Earliest instant of the next reconnect attempt. `None` means "attempt
+    /// now if disconnected" (no attempt is pending). Set after a failed
+    /// attempt to space out retries.
+    next_attempt: Option<Instant>,
+    backoff: Duration,
+}
+
+impl AudioReconnector {
+    const INITIAL_BACKOFF: Duration = Duration::from_secs(2);
+    // Capped low (5s, vs the HID reconnect's 30s) so that when PA returns after
+    // a long outage the panel notices and re-seeds within ~5s rather than up to
+    // 30s. Each extra attempt against a still-dead server is a cheap fast `Err`,
+    // so the tighter ceiling costs little.
+    const MAX_BACKOFF: Duration = Duration::from_secs(5);
+
+    fn new() -> Self {
+        Self { next_attempt: None, backoff: Self::INITIAL_BACKOFF }
+    }
+
+    /// Called every loop iteration. Returns `true` only on the iteration where
+    /// a reconnect just succeeded, so the caller can re-seed mic state and
+    /// force a repaint. A no-op (returning `false`) while PA is healthy.
+    fn tick(&mut self, audio: &mut audio::AudioController) -> bool {
+        if audio.is_connected() {
+            // Healthy — clear any armed backoff so the next outage retries
+            // immediately rather than inheriting a stale interval.
+            self.next_attempt = None;
+            self.backoff = Self::INITIAL_BACKOFF;
+            return false;
+        }
+        let now = Instant::now();
+        if self.next_attempt.is_some_and(|t| now < t) {
+            return false; // still within the backoff window
+        }
+        match audio.reconnect() {
+            Ok(()) => {
+                info!("audio: reconnected to PulseAudio");
+                self.next_attempt = None;
+                self.backoff = Self::INITIAL_BACKOFF;
+                true
+            }
+            Err(e) => {
+                warn!("audio: reconnect failed ({e}); retrying in {:?}", self.backoff);
+                self.next_attempt = Some(now + self.backoff);
+                self.backoff = (self.backoff * 2).min(Self::MAX_BACKOFF);
+                false
+            }
+        }
+    }
+}
+
 
 /// Re-open the PCPanel after a read error (USB unplug / hub power-cycle /
 /// suspend), retrying forever with exponential backoff. Blocks the main loop
@@ -388,6 +452,11 @@ fn run(cli: Cli) -> Result<()> {
     // presses bypass the cadence by updating the cached state directly.
     let mut mic_poller = MicPoller::new();
 
+    // Re-establish the PulseAudio connection if the server drops (PA/PipeWire
+    // restart, suspend/resume) instead of failing every audio call until the
+    // daemon is restarted.
+    let mut audio_reconnect = AudioReconnector::new();
+
     info!("listening for events (Ctrl+C to quit)...");
     loop {
         let mut led_dirty = obs.drain_events();
@@ -409,6 +478,14 @@ fn run(cli: Cli) -> Result<()> {
         // doesn't show stale state if the mic was toggled during suspend.
         if resume_rx.try_recv().is_ok() {
             info!("system resumed from sleep, re-applying LED state");
+            mic_poller.refresh_now(&audio, &mut obs);
+            led_dirty = true;
+        }
+
+        // Reconnect PulseAudio if it dropped. On a fresh reconnect, re-seed
+        // the mic state and repaint so the logo doesn't linger on the stale
+        // "unknown" blink it fell into during the outage.
+        if audio_reconnect.tick(&mut audio) {
             mic_poller.refresh_now(&audio, &mut obs);
             led_dirty = true;
         }
