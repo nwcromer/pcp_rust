@@ -608,6 +608,22 @@ impl AudioController {
         // Per matched target: stash the new volume for deferred stream-restore
         // persistence (a slider burst coalesces to one DB write per app once
         // idle for PERSIST_IDLE). The playback volume above is set every tick.
+        //
+        // Only *matched* (currently-running) targets are persisted, and that's
+        // deliberate. Review-accepted: do NOT "fix" this to persist
+        // unmatched/offline targets so a fader move while an app is closed
+        // pre-sets its next-launch volume — it's a verified no-op on
+        // PipeWire/WirePlumber. There are two stream-restore stores: the
+        // libpulse `module-stream-restore` DB we write here, and WirePlumber's
+        // own `stream-properties`. WirePlumber restores a stream's volume at
+        // creation from ITS store, which it updates only by observing a *live*
+        // stream's volume change — it does not consult our pulse-side writes
+        // (confirmed: the write succeeds with no error, WirePlumber's store is
+        // untouched, and the app restores to its prior volume). So persistence
+        // here effectively rides on WirePlumber seeing our live `set` above;
+        // with no live stream there's nothing to observe, and a closed app's
+        // volume cannot be pre-set this way. (On a real PulseAudio server these
+        // writes WOULD govern restoration — hence we keep them.)
         for (i, target) in targets.iter().enumerate() {
             if matched[i] {
                 self.pending_persist.insert(
