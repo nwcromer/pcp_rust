@@ -214,6 +214,13 @@ struct MicPoller {
     /// `None` = never polled, so the first `tick` polls immediately — a failed
     /// startup seed (PA still booting) doesn't leave a stale value visible for
     /// up to one interval.
+    ///
+    /// Review-accepted: because `run()` also seeds the mic state once before
+    /// the loop, that immediate first `tick` is a redundant PA query at
+    /// startup. Left as-is deliberately — the immediate poll is what avoids a
+    /// stale-value window, and seeding `last_poll` to defer it would
+    /// reintroduce exactly that window when the startup seed fails. One extra
+    /// query, once, is the cheaper trade.
     last_poll: Option<Instant>,
     /// Consecutive failed polls. Used to warn once at the start of an outage
     /// and report the recovery duration when it clears. Reset to 0 on success.
