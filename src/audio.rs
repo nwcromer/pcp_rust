@@ -126,9 +126,26 @@ impl AudioController {
             .connect(None, FlagSet::NOFLAGS, None)
             .context("failed to connect to PulseAudio")?;
 
-        // Wait for connection
+        // Wait for the context to reach Ready, bounded by a wall-clock
+        // deadline. This bounds the full handshake (socket connect → auth →
+        // negotiation → Ready), which is a different, slower operation than the
+        // per-op `wait_until` (that one runs against an already-Ready context,
+        // hence its tighter 250ms). A cold or resuming server legitimately
+        // takes a moment, so the deadline is seconds-scale; CONNECT_DEADLINE is
+        // kept under AudioReconnector's MAX_BACKOFF so a wedged server can't
+        // freeze the main-thread reconnect path for longer than a backoff gap.
+        //
+        // We poll non-blocking (`iterate(false)`) plus a short sleep rather
+        // than `iterate(true)`: a blocking iterate can park inside poll()
+        // indefinitely if the peer accepted the socket but sends nothing and
+        // never closes — exactly the wedged-handshake case this deadline
+        // defends against — so the elapsed() check would never be reached. The
+        // sleep caps the spin at ~100 wakeups/sec while keeping the deadline
+        // check live every pass.
+        const CONNECT_DEADLINE: Duration = Duration::from_secs(3);
+        let started = Instant::now();
         loop {
-            match mainloop.borrow_mut().iterate(true) {
+            match mainloop.borrow_mut().iterate(false) {
                 IterateResult::Success(_) => {}
                 IterateResult::Err(e) => bail!("mainloop iterate error: {e}"),
                 IterateResult::Quit(_) => bail!("mainloop quit unexpectedly"),
@@ -138,7 +155,12 @@ impl AudioController {
                 context::State::Failed | context::State::Terminated => {
                     bail!("PulseAudio connection failed");
                 }
-                _ => {}
+                _ => {
+                    if started.elapsed() >= CONNECT_DEADLINE {
+                        bail!("PulseAudio connect did not reach Ready within {CONNECT_DEADLINE:?}");
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
             }
         }
 
