@@ -471,6 +471,16 @@ fn run(cli: Cli) -> Result<()> {
         // blink. Recovery/state-change repaints still happen via the
         // poll/resume paths below, so suppressing the blink-only repaint
         // here can't strand a stale frame.
+        //
+        // Review-accepted: each forced repaint runs paint_leds, which rewrites
+        // all four LED regions (knobs/sliders/labels/logo) even though only the
+        // logo color changes during the blink — 4 USB writes ~10x/sec where 1
+        // would do. Left as-is: it's bounded to the PA-outage duration (steady
+        // 250ms polling keeps the indicator fresh otherwise), each write is
+        // microseconds of HID traffic, and it mirrors the blinking-flash path's
+        // accepted "repaint every iteration" trade (see expire_flash in
+        // runtime.rs). A logo-only repaint path would add dirty-region state to
+        // paint_leds for no user-visible gain.
         led_dirty |= obs.mic_indicator_needs_repaint()
             && paint::logo_indicator_visible(&obs, config.rgb);
 
