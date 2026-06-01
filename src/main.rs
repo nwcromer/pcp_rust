@@ -338,6 +338,8 @@ impl AudioReconnector {
             Err(e) => {
                 warn!("audio: reconnect failed ({e}); retrying in {:?}", self.backoff);
                 self.next_attempt = Some(now + self.backoff);
+                // Review-accepted: same `(x*2).min(MAX)` backoff as reconnect_panel and
+                // obs_main_loop; one shared line across 3 sleep mechanisms isn't worth a helper.
                 self.backoff = (self.backoff * 2).min(Self::MAX_BACKOFF);
                 false
             }
@@ -368,6 +370,7 @@ fn reconnect_panel() -> PcPanelPro {
             }
             Err(e) => {
                 debug!("PCPanel reconnect failed ({e}); retrying in {backoff:?}");
+                // Review-accepted: duplicated backoff arithmetic — see AudioReconnector::tick.
                 backoff = (backoff * 2).min(MAX_BACKOFF);
             }
         }

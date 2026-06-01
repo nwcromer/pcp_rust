@@ -188,6 +188,8 @@ async fn obs_main_loop(
                         dwell.as_secs()
                     );
                     sleep(Duration::from_secs(backoff)).await;
+                    // Review-accepted: duplicated backoff arithmetic (both retry paths) —
+                    // see AudioReconnector::tick.
                     backoff = (backoff * 2).min(BACKOFF_MAX_SECS);
                 }
             }
