@@ -1,12 +1,7 @@
 use std::collections::HashMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
-
-const DESKTOP_DIRS: &[&str] = &[
-    "/usr/share/applications",
-    "/usr/local/share/applications",
-];
 
 // Passing an empty icon name to KDE's mediaPlayerVolumeChanged renders the
 // OSD with no icon, which is what we want when no app icon resolves —
@@ -85,9 +80,42 @@ pub fn resolve_mute(config_icon: Option<&str>, app_names: &[String], muted: bool
     })
 }
 
+/// `.desktop` search dirs in precedence order, per the XDG Base Directory
+/// spec: `$XDG_DATA_HOME` (or `~/.local/share`) first, then `$XDG_DATA_DIRS`
+/// (or the spec default `/usr/local/share:/usr/share`), each with
+/// `applications` appended. The user data dir is what surfaces integrated
+/// AppImages and other user-installed apps; the system dirs cover packaged apps.
+///
+/// Intentionally untested: this reads process env (`XDG_DATA_*`), and a
+/// deterministic test would have to mutate global env vars — `unsafe` in
+/// edition 2024 and racy under parallel tests. The search logic over a given
+/// dir set is what's worth covering, and `find_icon_in_dirs` already is.
+fn desktop_dirs() -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = Vec::new();
+    let mut push = |base: PathBuf| {
+        let dir = base.join("applications");
+        // Skip relative/empty entries (an empty XDG_DATA_DIRS component would
+        // otherwise scan a cwd-relative "applications") and de-dup.
+        if dir.is_absolute() && !paths.contains(&dir) {
+            paths.push(dir);
+        }
+    };
+
+    if let Some(home) = dirs::data_dir() {
+        push(home);
+    }
+    let system = std::env::var_os("XDG_DATA_DIRS")
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "/usr/local/share:/usr/share".into());
+    for base in std::env::split_paths(&system) {
+        push(base);
+    }
+    paths
+}
+
 /// Search .desktop files for an app and return its Icon= value.
 fn find_icon_in_desktop_files(app_name: &str) -> Option<String> {
-    find_icon_in_dirs(app_name, DESKTOP_DIRS.iter().map(Path::new))
+    find_icon_in_dirs(app_name, desktop_dirs().iter().map(PathBuf::as_path))
 }
 
 /// Inner search loop parameterized over the directories to scan. Extracted
