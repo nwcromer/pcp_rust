@@ -14,6 +14,7 @@ use pulse::context::{self, FlagSet};
 use pulse::mainloop::standard::{IterateResult, Mainloop};
 use pulse::operation::Operation;
 use pulse::proplist::{Proplist, UpdateMode};
+use pulse::time::MicroSeconds;
 use pulse::volume::{ChannelVolumes, Volume};
 
 /// How long an app's volume must be stable before we persist it to the
@@ -215,33 +216,61 @@ impl AudioController {
     /// the failure and propagate it; the user gets a visible error in the
     /// journal instead of stale defaults from an apparently-successful call.
     fn wait_until<F: Fn() -> bool>(&self, is_done: F) -> Result<()> {
-        const DEADLINE: std::time::Duration = std::time::Duration::from_millis(250);
-        let started = std::time::Instant::now();
+        const DEADLINE: Duration = Duration::from_millis(250);
+        let started = Instant::now();
         loop {
             if is_done() {
                 return Ok(());
             }
-            if started.elapsed() >= DEADLINE {
-                bail!("PulseAudio call exceeded {:?} deadline", DEADLINE);
+            // Budget left before the hard deadline; bail once it's gone. This
+            // ceiling is what stops a server that holds the socket open but
+            // never replies from hanging the main thread indefinitely.
+            let Some(remaining) = DEADLINE
+                .checked_sub(started.elapsed())
+                .filter(|r| !r.is_zero())
+            else {
+                bail!("PulseAudio call exceeded {DEADLINE:?} deadline");
+            };
+
+            // Block inside poll() for up to `remaining` rather than spinning on
+            // a fixed sleep: we wake the instant PA has data (no added latency
+            // on the volume hot path), yet prepare()'s timeout means poll can
+            // never park past the deadline. This is the canonical pa_mainloop
+            // prepare/poll/dispatch triple — equivalent to iterate(), but with
+            // a bounded poll timeout that iterate(block) doesn't expose.
+            //
+            // Holding the mainloop borrow across the blocking poll is safe: the
+            // controller is single-threaded and the introspect callbacks run
+            // inside dispatch() and only touch the per-op result/done cells,
+            // never the mainloop — so there's no reentrant borrow.
+            let timeout = MicroSeconds(remaining.as_micros().min(i32::MAX as u128) as u64);
+            {
+                let mut ml = self.mainloop.borrow_mut();
+                ml.prepare(Some(timeout))
+                    .map_err(|e| anyhow::anyhow!("PulseAudio mainloop prepare failed: {e:?}"))?;
+                // EINTR: libpulse's pa_mainloop_poll remaps a signal-interrupted
+                // poll to a zero return, so an interrupted wait surfaces here as
+                // Ok(0) — same as a plain timeout. Either way we fall through to
+                // dispatch (a no-op when nothing fired) and loop, which re-polls
+                // for the time remaining. That re-poll IS the EINTR retry, and
+                // the top-of-loop deadline check bounds the total wait.
+                //
+                // Review-accepted: do NOT add an explicit EINTR retry on the Err
+                // arm. EINTR never reaches it (remapped to Ok(0) above), and a
+                // genuine poll Err leaves the mainloop in a failed state where
+                // pa_mainloop_prepare aborts via pa_assert — so looping back to
+                // retry would risk crashing the daemon. Bailing on Err (one
+                // failed op, logged; the next tick retries) is the safe choice.
+                ml.poll()
+                    .map_err(|e| anyhow::anyhow!("PulseAudio mainloop poll failed: {e:?}"))?;
+                ml.dispatch()
+                    .map_err(|e| anyhow::anyhow!("PulseAudio mainloop dispatch failed: {e:?}"))?;
             }
-            // Non-blocking iterate, mirroring connect(): a blocking
-            // `iterate(true)` can park inside poll() indefinitely if the peer
-            // accepted the socket but sends nothing and never closes, so the
-            // elapsed() deadline check above would never be reached. Polling
-            // non-blocking keeps the deadline a hard ceiling. The short sleep
-            // when no events were dispatched caps the spin at ~200 wakeups/sec.
-            match self.mainloop.borrow_mut().iterate(false) {
-                IterateResult::Success(0) => {
-                    std::thread::sleep(Duration::from_millis(5));
-                }
-                IterateResult::Success(_) => {}
-                IterateResult::Err(e) => bail!("PulseAudio mainloop error: {e}"),
-                IterateResult::Quit(_) => bail!("PulseAudio mainloop quit"),
-            }
+
             // PA context can transition out of Ready (server restart, etc.)
-            // mid-operation; iterate() returns Success while the context
-            // becomes unusable. Check explicitly so subsequent calls don't
-            // silently use stale data.
+            // mid-operation; the iteration succeeds while the context becomes
+            // unusable. Check explicitly so subsequent calls don't silently use
+            // stale data.
             match self.context.borrow().get_state() {
                 context::State::Ready => {}
                 other => bail!("PulseAudio context not ready: {other:?}"),
