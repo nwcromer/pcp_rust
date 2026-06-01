@@ -19,7 +19,7 @@ use anyhow::{bail, Context, Result};
 use clap::Parser;
 use log::{debug, info, warn};
 
-use config::{Action, AppTarget, ControlId, ObsColors};
+use config::{Action, AppAction, AppTarget, ControlId, ObsColors};
 use device::{Control, Event, PcPanelPro};
 use obs::{ObsCommand, ObsHandle};
 use paint::{log_rgb_mode, paint_leds};
@@ -603,6 +603,82 @@ fn named_target_names<'a>(targets: impl IntoIterator<Item = &'a AppTarget>) -> V
         .collect()
 }
 
+/// Apply a volume slider/knob change: drive every configured target, then show
+/// a single OSD for the change. Named targets are batched into one sink-input
+/// enumeration; System/Mic each drive a single default device individually.
+/// Volume changes never affect LED state, so this returns nothing.
+fn handle_volume_change(
+    action: &AppAction,
+    value: u8,
+    cli: &Cli,
+    audio: &mut audio::AudioController,
+) {
+    let pct = audio::value_to_percent(value);
+
+    // Batch all named targets into ONE sink-input enumeration (one PA
+    // round-trip for the whole control rather than one per app). System/Mic
+    // each drive a single default device, so they stay individual.
+    let named: Vec<&str> = action
+        .targets
+        .iter()
+        .filter_map(|t| match t {
+            AppTarget::Named(s) => Some(s.as_str()),
+            _ => None,
+        })
+        .collect();
+    let named_matched = if named.is_empty() {
+        Vec::new()
+    } else {
+        audio.set_app_volumes(&named, value).unwrap_or_else(|e| {
+            warn!("audio: set volume for [{}] failed: {e}", named.join(", "));
+            vec![false; named.len()]
+        })
+    };
+
+    // Walk targets in config order so the verbose log and the OSD label keep
+    // that order; named results come from the batch.
+    let mut matched: Vec<&AppTarget> = Vec::new();
+    let mut named_i = 0;
+    for target in &action.targets {
+        let hit = match target {
+            AppTarget::System | AppTarget::Mic => apply_volume_to(audio, target, value),
+            AppTarget::Named(_) => {
+                let h = named_matched.get(named_i).copied().unwrap_or(false);
+                named_i += 1;
+                h
+            }
+        };
+        // Only trace targets that actually changed — a miss (app not running)
+        // or PA error is already logged at debug!/warn! in the audio layer, so
+        // printing here too would falsely claim a change happened.
+        if hit {
+            matched.push(target);
+            if cli.verbose {
+                println!("{} volume: {pct}%", target.label());
+            }
+        }
+    }
+    // Show OSD once per control event, only if something matched.
+    // Priority: system → mic → media-player (apps).
+    if matched.iter().any(|t| matches!(t, AppTarget::System)) {
+        osd::volume_changed(pct as i32);
+    } else if matched.iter().any(|t| matches!(t, AppTarget::Mic)) {
+        osd::microphone_volume_changed(pct as i32);
+    } else if !matched.is_empty() {
+        // Icon lookup uses only the matched Named targets so the icon
+        // corresponds to apps that actually changed volume (not configured-
+        // but-not-running apps that would otherwise win the .desktop search).
+        let names = named_target_names(matched.iter().copied());
+        let label = matched
+            .iter()
+            .map(|t| t.label())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let icon_name = icons::resolve(action.icon.as_deref(), &names);
+        osd::media_player_volume_changed(pct as i32, &label, &icon_name);
+    }
+}
+
 fn handle_panel_event(
     event: Event,
     cli: &Cli,
@@ -617,75 +693,8 @@ fn handle_panel_event(
                 Control::Knob(i) => ControlId::Knob(i),
                 Control::Slider(i) => ControlId::Slider(i),
             };
-
             if let Some(Action::Volume(action)) = config.mappings.get(&control_id) {
-                let pct = audio::value_to_percent(value);
-
-                // Batch all named targets into ONE sink-input enumeration
-                // (one PA round-trip for the whole control rather than one per
-                // app). System/Mic each drive a single default device, so they
-                // stay individual.
-                let named: Vec<&str> = action
-                    .targets
-                    .iter()
-                    .filter_map(|t| match t {
-                        AppTarget::Named(s) => Some(s.as_str()),
-                        _ => None,
-                    })
-                    .collect();
-                let named_matched = if named.is_empty() {
-                    Vec::new()
-                } else {
-                    audio.set_app_volumes(&named, value).unwrap_or_else(|e| {
-                        warn!("audio: set volume for [{}] failed: {e}", named.join(", "));
-                        vec![false; named.len()]
-                    })
-                };
-
-                // Walk targets in config order so the verbose log and the OSD
-                // label keep that order; named results come from the batch.
-                let mut matched: Vec<&AppTarget> = Vec::new();
-                let mut named_i = 0;
-                for target in &action.targets {
-                    let hit = match target {
-                        AppTarget::System | AppTarget::Mic => apply_volume_to(audio, target, value),
-                        AppTarget::Named(_) => {
-                            let h = named_matched.get(named_i).copied().unwrap_or(false);
-                            named_i += 1;
-                            h
-                        }
-                    };
-                    // Only trace targets that actually changed — a miss (app
-                    // not running) or PA error is already logged at debug!/warn!
-                    // in the audio layer, so printing here too would falsely
-                    // claim a change happened.
-                    if hit {
-                        matched.push(target);
-                        if cli.verbose {
-                            println!("{} volume: {pct}%", target.label());
-                        }
-                    }
-                }
-                // Show OSD once per control event, only if something matched.
-                // Priority: system → mic → media-player (apps).
-                if matched.iter().any(|t| matches!(t, AppTarget::System)) {
-                    osd::volume_changed(pct as i32);
-                } else if matched.iter().any(|t| matches!(t, AppTarget::Mic)) {
-                    osd::microphone_volume_changed(pct as i32);
-                } else if !matched.is_empty() {
-                    // Icon lookup uses only the matched Named targets so the
-                    // icon corresponds to apps that actually changed volume
-                    // (not configured-but-not-running apps that would
-                    // otherwise win the .desktop substring search).
-                    let names = named_target_names(matched.iter().copied());
-                    let label = matched
-                        .iter()
-                        .map(|t| t.label())
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    let icon_name = icons::resolve(action.icon.as_deref(), &names);
-                    osd::media_player_volume_changed(pct as i32, &label, &icon_name);
-                }
+                handle_volume_change(action, value, cli, audio);
             }
         }
         Event::ButtonPress { index } => {

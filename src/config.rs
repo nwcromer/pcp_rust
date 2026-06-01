@@ -718,7 +718,9 @@ fn parse_config(content: &str) -> Result<Config> {
         warn_unknown_keys(table, key, &["action", "app", "icon"]);
         // Resolve the control name first so a mistyped section (e.g.
         // `[slder1]`) reports "unknown control" rather than a downstream
-        // "missing action field" from parsing its contents.
+        // "missing action field". Unknown sections hard-fail here — unlike
+        // unknown keys above, which only warn — because the section namespace
+        // is closed and tiny, so an unrecognized one is almost always a typo.
         let control = parse_control_id(key)?;
         let action = parse_action(key, table)?;
 
