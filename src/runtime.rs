@@ -355,6 +355,11 @@ impl ObsRuntime {
                 self.set_error_flash();
                 true
             }
+            ObsEvent::CanvasMatchFailed(msg) => {
+                warn!("OBS canvas match failed; replay buffer not started: {msg}");
+                self.set_error_flash();
+                true
+            }
         }
     }
 
@@ -611,6 +616,19 @@ mod tests {
         assert_eq!(obs.logo_cfg.indicator, LogoIndicator::None);
         assert!(!obs.mic_indicator_enabled());
         assert_eq!(obs.logo_indicator_color(), None);
+    }
+
+    #[test]
+    fn canvas_match_failed_sets_error_flash() {
+        // The buffer-start canvas-match failure must surface the same error
+        // flash as a failed command (the magenta the user relies on), and
+        // request a repaint.
+        let mut obs = fresh_runtime();
+        assert!(obs.flash().is_none());
+        assert!(obs.apply_event(ObsEvent::CanvasMatchFailed("boom".into())));
+        let flash = obs.flash().expect("error flash set");
+        assert_eq!(flash.color, ObsColors::default().error_flash);
+        assert!(flash.blink.is_some(), "error flash blinks");
     }
 
     #[test]

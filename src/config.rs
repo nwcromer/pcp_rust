@@ -183,6 +183,15 @@ pub struct ObsConfig {
     /// (default), paused renders as a solid color and the logo continues
     /// to show whatever the indicator says.
     pub paused_use_breath: bool,
+    /// If true, pcp_rust matches OBS's canvas (base + output resolution) to
+    /// the current monitor resolution right before starting a recording (via
+    /// the `obs-toggle-recording` start path). Off by default — opt-in. See
+    /// `[obs] match_canvas_to_display` in the README.
+    pub match_canvas_to_display: bool,
+    /// Which display's resolution to match when `match_canvas_to_display` is
+    /// on. The connector name as reported by `kscreen-doctor` (e.g. "DP-1").
+    /// `None` → use the primary display (or the sole enabled one).
+    pub capture_display: Option<String>,
     pub colors: ObsColors,
 }
 
@@ -541,7 +550,10 @@ fn parse_obs_section(table: &toml::value::Table) -> Result<ObsConfig> {
     warn_unknown_keys(
         table,
         "obs",
-        &["host", "port", "password", "start_replay_buffer", "paused_use_breath", "colors"],
+        &[
+            "host", "port", "password", "start_replay_buffer", "paused_use_breath",
+            "match_canvas_to_display", "capture_display", "colors",
+        ],
     );
     let host = table
         .get("host")
@@ -588,13 +600,46 @@ fn parse_obs_section(table: &toml::value::Table) -> Result<ObsConfig> {
             .context("[obs] \"paused_use_breath\" must be a boolean")?,
     };
 
+    let match_canvas_to_display = match table.get("match_canvas_to_display") {
+        None => false,
+        Some(v) => v
+            .as_bool()
+            .context("[obs] \"match_canvas_to_display\" must be a boolean")?,
+    };
+
+    // A blank/whitespace-only display name can never match a real connector,
+    // so reject it the same way `clean_app_name` rejects blank app names —
+    // otherwise the user gets a silent "display not found" at record time.
+    let capture_display = match table.get("capture_display") {
+        None => None,
+        Some(v) => {
+            let s = v
+                .as_str()
+                .context("[obs] \"capture_display\" must be a string")?
+                .trim();
+            if s.is_empty() {
+                bail!("[obs] \"capture_display\" cannot be empty");
+            }
+            Some(s.to_string())
+        }
+    };
+
     let colors = match table.get("colors") {
         None => ObsColors::default(),
         Some(toml::Value::Table(t)) => parse_obs_colors(t)?,
         Some(_) => bail!("[obs.colors] must be a table"),
     };
 
-    Ok(ObsConfig { host, port, password, start_replay_buffer, paused_use_breath, colors })
+    Ok(ObsConfig {
+        host,
+        port,
+        password,
+        start_replay_buffer,
+        paused_use_breath,
+        match_canvas_to_display,
+        capture_display,
+        colors,
+    })
 }
 
 fn parse_obs_colors(table: &toml::value::Table) -> Result<ObsColors> {
@@ -1333,6 +1378,53 @@ mod tests {
         )
         .unwrap();
         assert!(!config.obs.unwrap().start_replay_buffer);
+    }
+
+    #[test]
+    fn test_obs_match_canvas_to_display() {
+        let config = parse_config(
+            r#"
+            [obs]
+            match_canvas_to_display = true
+            capture_display = "DP-1"
+            "#,
+        )
+        .unwrap();
+        let obs = config.obs.unwrap();
+        assert!(obs.match_canvas_to_display);
+        assert_eq!(obs.capture_display.as_deref(), Some("DP-1"));
+
+        // Defaults: off, no display pinned.
+        let obs = parse_config("[obs]\n").unwrap().obs.unwrap();
+        assert!(!obs.match_canvas_to_display);
+        assert!(obs.capture_display.is_none());
+    }
+
+    #[test]
+    fn test_obs_match_canvas_to_display_must_be_bool() {
+        let result = parse_config(
+            r#"
+            [obs]
+            match_canvas_to_display = "yes"
+            "#,
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("boolean"));
+    }
+
+    #[test]
+    fn test_obs_capture_display_trimmed_and_blank_rejected() {
+        // Surrounding whitespace is stripped (connector matching is exact).
+        let obs = parse_config("[obs]\ncapture_display = \"  DP-1  \"\n")
+            .unwrap()
+            .obs
+            .unwrap();
+        assert_eq!(obs.capture_display.as_deref(), Some("DP-1"));
+
+        // A blank name can never match a real connector — reject it.
+        let result = parse_config("[obs]\ncapture_display = \"   \"\n");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("cannot be empty"));
     }
 
     #[test]

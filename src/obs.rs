@@ -9,7 +9,7 @@
 
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use log::{debug, info, warn};
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::time::sleep;
@@ -56,6 +56,11 @@ pub enum ObsEvent {
     CommandSucceeded(ObsCommand),
     /// An OBS command failed (e.g., OBS rejected it or we're disconnected).
     CommandFailed(ObsCommand, String),
+    /// Matching the canvas to the monitor failed while pcp_rust was about to
+    /// start the replay buffer on connect, so the buffer was *not* started.
+    /// Surfaced as an error flash, mirroring a failed record-start — this is
+    /// not tied to a button press, so it can't reuse `CommandFailed`.
+    CanvasMatchFailed(String),
 }
 
 /// Bound for the cross-thread mpsc channels. Both directions carry events
@@ -256,16 +261,26 @@ async fn run_session(
                 info!("OBS: replay buffer already running");
                 Some(true)
             }
-            Ok(false) => match client.replay_buffer().start().await {
-                Ok(()) => {
-                    info!("OBS: started replay buffer");
-                    Some(true)
+            Ok(false) => {
+                // Match the canvas BEFORE starting the buffer. The buffer is
+                // an output, so once it's running OBS locks the resolution
+                // (SetVideoSettings → OutputRunning). Starting it at the right
+                // resolution means the canvas is already correct by
+                // record-start. Fail-closed, exactly like record-start: if the
+                // match fails, don't start the buffer and surface an error
+                // flash rather than locking the canvas at the wrong size.
+                if config.match_canvas_to_display {
+                    if let Err(e) = match_canvas_to_display(client, config).await {
+                        warn!("OBS: canvas match failed; not starting replay buffer: {e:#}");
+                        let _ = event_tx.send(ObsEvent::CanvasMatchFailed(format!("{e:#}"))).await;
+                        Some(false)
+                    } else {
+                        start_replay_buffer(client).await
+                    }
+                } else {
+                    start_replay_buffer(client).await
                 }
-                Err(e) => {
-                    warn!("OBS: failed to start replay buffer: {e}");
-                    Some(false)
-                }
-            },
+            }
             Err(e) => {
                 warn!("OBS: failed to query replay buffer status: {e}");
                 None
@@ -297,7 +312,7 @@ async fn run_session(
             biased;
             cmd = cmd_rx.recv() => {
                 match cmd {
-                    Some(cmd) => handle_command(client, cmd, event_tx).await,
+                    Some(cmd) => handle_command(client, config, cmd, event_tx).await,
                     None => return Ok(()), // main thread closed the channel
                 }
             }
@@ -313,14 +328,21 @@ async fn run_session(
 
 async fn handle_command(
     client: &obws::Client,
+    config: &ObsConfig,
     cmd: ObsCommand,
     event_tx: &Sender<ObsEvent>,
 ) {
-    let result: Result<(), obws::error::Error> = match cmd {
-        ObsCommand::SaveReplay => client.replay_buffer().save().await,
-        ObsCommand::ToggleRecording => client.recording().toggle().await.map(|_| ()),
-        ObsCommand::PauseRecording => client.recording().toggle_pause().await.map(|_| ()),
-        ObsCommand::SplitRecording => client.recording().split_file().await,
+    // ToggleRecording goes through `toggle_recording` (which may match the
+    // canvas to the monitor before starting); the rest map directly to a
+    // single obws call. We unify on anyhow::Result so the canvas-match
+    // path's errors flow through the same failure handling.
+    let result: Result<()> = match cmd {
+        ObsCommand::SaveReplay => client.replay_buffer().save().await.map_err(Into::into),
+        ObsCommand::ToggleRecording => toggle_recording(client, config).await,
+        ObsCommand::PauseRecording => {
+            client.recording().toggle_pause().await.map(|_| ()).map_err(Into::into)
+        }
+        ObsCommand::SplitRecording => client.recording().split_file().await.map_err(Into::into),
     };
 
     match result {
@@ -329,8 +351,100 @@ async fn handle_command(
             let _ = event_tx.send(ObsEvent::CommandSucceeded(cmd)).await;
         }
         Err(e) => {
-            warn!("OBS: {} failed: {e}", cmd.label());
-            let _ = event_tx.send(ObsEvent::CommandFailed(cmd, e.to_string())).await;
+            warn!("OBS: {} failed: {e:#}", cmd.label());
+            let _ = event_tx.send(ObsEvent::CommandFailed(cmd, format!("{e:#}"))).await;
+        }
+    }
+}
+
+/// Start or stop recording. On the *start* edge, optionally match OBS's
+/// canvas to the current monitor resolution first.
+///
+/// When the canvas-match feature is off we use obws's atomic `toggle()` — the
+/// original behavior, one round-trip, no client-side state read. When it's on
+/// we can't use toggle: the canvas must be set *before* recording begins (OBS
+/// rejects resolution changes while active), and toggle leaves no window
+/// between flip and start. So we read the current state to learn the
+/// direction, then `stop()`, or (canvas-match →) `start()`. The brief TOCTOU
+/// window between the status read and the start/stop is irrelevant for a
+/// single user pressing a button. LED feedback is unaffected either way —
+/// it's driven by OBS's RecordStateChanged events, which fire for explicit
+/// start/stop just as they do for toggle.
+async fn toggle_recording(client: &obws::Client, config: &ObsConfig) -> Result<()> {
+    if !config.match_canvas_to_display {
+        client.recording().toggle().await?;
+        return Ok(());
+    }
+
+    let status = client.recording().status().await?;
+    if status.active {
+        // Stopping — resolution can't change mid-session, so nothing to match.
+        client.recording().stop().await?;
+        return Ok(());
+    }
+    // Starting. Fail-closed: a detection/set failure propagates and aborts the
+    // start, so the caller surfaces the error flash rather than recording at a
+    // stale (wrong) resolution.
+    match_canvas_to_display(client, config).await?;
+    client.recording().start().await?;
+    Ok(())
+}
+
+/// Read the target monitor's resolution and, if OBS's canvas (base + output)
+/// doesn't already match it, set both to it. Only writes when something
+/// differs, to avoid a needless video-pipeline reset. Leaves the FPS settings
+/// untouched.
+async fn match_canvas_to_display(client: &obws::Client, config: &ObsConfig) -> Result<()> {
+    let (w, h) = crate::display::current_display_resolution(config.capture_display.as_deref())
+        .await
+        .context("detecting monitor resolution")?;
+
+    let current = client
+        .config()
+        .video_settings()
+        .await
+        .context("reading OBS video settings")?;
+
+    if current.base_width == w
+        && current.base_height == h
+        && current.output_width == w
+        && current.output_height == h
+    {
+        debug!("OBS: canvas already {w}x{h}; leaving video settings unchanged");
+        return Ok(());
+    }
+
+    info!(
+        "OBS: setting canvas to {w}x{h} (was base {}x{}, output {}x{})",
+        current.base_width, current.base_height, current.output_width, current.output_height
+    );
+    client
+        .config()
+        .set_video_settings(obws::requests::config::SetVideoSettings {
+            base_width: Some(w),
+            base_height: Some(h),
+            output_width: Some(w),
+            output_height: Some(h),
+            ..Default::default()
+        })
+        .await
+        .context("setting OBS video settings")?;
+    Ok(())
+}
+
+/// Start the replay buffer, mapping the outcome to the `Some(bool)` running
+/// state `run_session` tracks. A start failure is non-fatal (logged, reported
+/// as inactive) — the canvas-match that gates this call is the fail-closed
+/// part; an OBS-side buffer-start error is a separate, rarer condition.
+async fn start_replay_buffer(client: &obws::Client) -> Option<bool> {
+    match client.replay_buffer().start().await {
+        Ok(()) => {
+            info!("OBS: started replay buffer");
+            Some(true)
+        }
+        Err(e) => {
+            warn!("OBS: failed to start replay buffer: {e}");
+            Some(false)
         }
     }
 }

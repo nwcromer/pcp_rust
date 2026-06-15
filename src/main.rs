@@ -1,6 +1,7 @@
 mod audio;
 mod config;
 mod device;
+mod display;
 mod icons;
 mod led;
 mod obs;

@@ -20,7 +20,7 @@ A Linux controller for the [PCPanel Pro](https://www.getpcpanel.com/product-page
 - Linux with PipeWire (or PulseAudio)
 - `libhidapi-dev` / `hidapi` (for USB HID access)
 - `libpulse` (for audio control)
-- KDE Plasma (optional, for OSD popups)
+- KDE Plasma (optional, for OSD popups and the OBS match-canvas-to-display feature, which uses `kscreen-doctor`)
 - OBS Studio 28+ (optional, for OBS integration — obs-websocket v5 is built in)
 
 ### Arch Linux
@@ -252,22 +252,30 @@ The OBS integration is opt-in. If you don't add an `[obs]` section to your confi
 
 ```toml
 [obs]
-host = "localhost"            # optional, default "localhost"
-port = 4455                   # optional, default 4455
-password = "secret"           # optional; omit or leave empty if OBS auth is disabled
-start_replay_buffer = false   # optional, default false; if true, pcp_rust starts
-                              # OBS's replay buffer on every successful connection
-                              # (including reconnects after OBS restarts or
-                              # network blips). Does nothing if it's already
-                              # running. Does not monitor or re-enable the buffer
-                              # during a live session — if you stop it via OBS,
-                              # it stays stopped until pcp_rust reconnects.
-paused_use_breath = false     # optional, default false. If true, paused
-                              # renders as a global breath animation (every
-                              # LED including the logo, so the replay-buffer
-                              # indicator is unavailable during paused). If
-                              # false, paused is a solid color and the logo
-                              # keeps its replay-buffer indicator.
+host = "localhost"               # optional, default "localhost"
+port = 4455                      # optional, default 4455
+password = "secret"              # optional; omit or leave empty if OBS auth is disabled
+start_replay_buffer = false      # optional, default false; if true, pcp_rust starts
+                                 # OBS's replay buffer on every successful connection
+                                 # (including reconnects after OBS restarts or
+                                 # network blips). Does nothing if it's already
+                                 # running. Does not monitor or re-enable the buffer
+                                 # during a live session — if you stop it via OBS,
+                                 # it stays stopped until pcp_rust reconnects.
+paused_use_breath = false        # optional, default false. If true, paused
+                                 # renders as a global breath animation (every
+                                 # LED including the logo, so the replay-buffer
+                                 # indicator is unavailable during paused). If
+                                 # false, paused is a solid color and the logo
+                                 # keeps its replay-buffer indicator.
+match_canvas_to_display = false  # optional, default false. If true, pcp_rust
+                                 # matches OBS's canvas to the current monitor
+                                 # resolution right before starting a recording.
+                                 # See "Match canvas to display" below.
+capture_display = "DP-1"         # optional; which display to match when
+                                 # match_canvas_to_display is on. Connector name
+                                 # as reported by `kscreen-doctor` (e.g. "DP-1").
+                                 # Omit to use the primary display.
 ```
 
 pcp_rust connects on startup and reconnects automatically (with exponential backoff, max ~30s) when OBS isn't running, restarts, or crashes. While disconnected, OBS action buttons produce an error flash.
@@ -276,6 +284,47 @@ pcp_rust connects on startup and reconnects automatically (with exponential back
 
 - Set `$PCPANEL_OBS_PASSWORD` in the environment to override the config-file value. The env var wins if both are set. Useful so the password doesn't end up in dotfile backups or version control.
 - If you do put the password in `config.toml`, tighten permissions: `chmod 600 ~/.config/pcpanel/config.toml`.
+
+#### Match canvas to display
+
+If you run one OBS profile across a monitor that switches resolution (e.g. a
+display that runs some games at 4K and others at 1080p), OBS's canvas no longer
+tracks the monitor — so you can end up recording at the wrong resolution and
+capturing only a corner of the screen. With `match_canvas_to_display = true`,
+pcp_rust detects the monitor's current resolution and sets OBS's canvas (both
+the base/canvas and output resolutions) to match **right before a recording
+starts**, via the `obs-toggle-recording` start path.
+
+- The check happens at record-start, not on monitor mode changes — so it's
+  correct even if you switched resolutions while OBS was closed.
+- It only writes OBS's video settings when they actually differ from the
+  monitor, avoiding a needless video-pipeline reset.
+- Frame rate is left untouched; only width/height change.
+- It applies when recording is started from a pcp_rust button, not from the
+  OBS GUI (resolution can only be changed while no output is running, so the set
+  must be sequenced immediately before start).
+- It **also** runs right before pcp_rust starts the replay buffer (when
+  `start_replay_buffer = true`, on every connect/reconnect). The replay buffer
+  is an output, so once it's running OBS locks the resolution — matching the
+  canvas first means the buffer captures at the right size and the canvas is
+  already correct by record-start. If the match fails here, the buffer is **not
+  started** and you get the error flash (same fail-closed behavior as
+  record-start). Note this can only re-match on a (re)connect: if you change the
+  monitor resolution while the replay buffer is already running, the canvas
+  stays locked and a subsequent record-start will fail with the error flash
+  until the buffer restarts (e.g. on an OBS reconnect).
+- **Multi-monitor:** set `capture_display` to the connector name of the display
+  you capture (run `kscreen-doctor --json` or `kscreen-doctor -o` to see names
+  like `DP-1`, `HDMI-A-1`). If omitted, the primary display is used (or the only
+  one, if a single display is connected).
+- **Fail-closed:** if the monitor resolution can't be detected (e.g.
+  `kscreen-doctor` missing or the named display isn't found) or OBS rejects the
+  video-settings change, the recording does **not** start and you get the error
+  flash — rather than silently recording at the wrong size.
+
+This requires `kscreen-doctor` (KDE Plasma; standard on a Plasma desktop). It's
+the right tool for the current display mode on Wayland. The feature is off by
+default.
 
 #### Action types
 
