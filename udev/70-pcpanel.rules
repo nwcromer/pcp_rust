@@ -9,5 +9,8 @@
 # and the ACL is never applied. Numbering this 70-* (matching systemd's own
 # 70-uaccess.rules) ensures the tag is set before those rules look for it.
 # Do not "tidy" this back to 99.
+# MODE="0660" drops the world-readable/writable default on the hidraw node so
+# the device is reachable only via the uaccess ACL above (the logged-in user)
+# plus root — not by every account on the machine.
 SUBSYSTEM=="usb", ATTR{idVendor}=="0483", ATTR{idProduct}=="a3c5", TAG+="uaccess"
-SUBSYSTEM=="hidraw", ATTRS{idVendor}=="0483", ATTRS{idProduct}=="a3c5", TAG+="uaccess"
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="0483", ATTRS{idProduct}=="a3c5", MODE="0660", TAG+="uaccess"
