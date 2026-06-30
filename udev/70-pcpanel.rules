@@ -1,0 +1,13 @@
+# PCPanel Pro — grant access to the physically logged-in user
+#
+# This file MUST sort before 71-seat.rules / 73-seat-late.rules — keep the
+# numeric prefix below 71. `uaccess` is not a permission applied here; it is a
+# TAG that systemd's seat rules consume. 71-seat.rules tags uaccess devices
+# for the seat and 73-seat-late.rules runs `RUN{builtin}+="uaccess"` to apply
+# the ACL. udev accumulates tags top-to-bottom in lexical filename order, so a
+# `TAG+="uaccess"` added by a 99-* file lands AFTER 71/73 have already matched
+# and the ACL is never applied. Numbering this 70-* (matching systemd's own
+# 70-uaccess.rules) ensures the tag is set before those rules look for it.
+# Do not "tidy" this back to 99.
+SUBSYSTEM=="usb", ATTR{idVendor}=="0483", ATTR{idProduct}=="a3c5", TAG+="uaccess"
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="0483", ATTRS{idProduct}=="a3c5", TAG+="uaccess"

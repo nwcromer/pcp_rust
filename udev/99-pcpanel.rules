@@ -1,3 +1,0 @@
-# PCPanel Pro — grant access to the physically logged-in user
-SUBSYSTEM=="usb", ATTR{idVendor}=="0483", ATTR{idProduct}=="a3c5", TAG+="uaccess"
-SUBSYSTEM=="hidraw", ATTRS{idVendor}=="0483", ATTRS{idProduct}=="a3c5", TAG+="uaccess"

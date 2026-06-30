@@ -5,12 +5,16 @@ use anyhow::{bail, Result};
 
 use crate::prompt::confirm_overwrite;
 
-const RULES_PATH: &str = "/etc/udev/rules.d/99-pcpanel.rules";
+// Numbered 70-* (below 71-seat.rules / 73-seat-late.rules) so its `uaccess`
+// tag is set before systemd's seat rules look for it; a 99-* file would tag
+// the device too late and the ACL would never be applied. See the header
+// comment in udev/70-pcpanel.rules for the full ordering rationale.
+const RULES_PATH: &str = "/etc/udev/rules.d/70-pcpanel.rules";
 
-// Single source of truth: the same file shipped at `udev/99-pcpanel.rules`
+// Single source of truth: the same file shipped at `udev/70-pcpanel.rules`
 // is embedded at compile time so the installed rule and the repo copy can't
 // drift apart.
-const RULES_CONTENT: &str = include_str!("../udev/99-pcpanel.rules");
+const RULES_CONTENT: &str = include_str!("../udev/70-pcpanel.rules");
 
 pub fn create_udev_rules() -> Result<()> {
     if !running_as_root() {
