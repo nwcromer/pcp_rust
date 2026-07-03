@@ -34,15 +34,12 @@ struct PendingPersist {
 /// PA API they called.
 ///
 /// Review-accepted: this centralizes the *data* differences (pa_name, label,
-/// default_channels), but four methods (query_default_channels,
-/// query_default_mute, set_default_volume, toggle_default_mute) still carry a
-/// sink/source match whose arms differ only in the libpulse method name
-/// (get_sink_info_by_name vs get_source_info_by_name, etc.). Left as-is:
-/// libpulse exposes those as distinct non-generic methods over distinct
-/// SinkInfo/SourceInfo payload types, so collapsing the arms needs a macro or
-/// a bridging trait — more indirection than two shallow, side-by-side arms are
-/// worth for a fixed 2-variant set that the hardware won't grow. The drift-
-/// prone bits (name/label/channels) are already centralized here.
+/// default_channels), but four methods still carry a sink/source match whose
+/// arms differ only in the libpulse method name (get_sink_info_by_name vs
+/// get_source_info_by_name, etc.). Left as-is: libpulse exposes those as
+/// distinct non-generic methods over distinct payload types, so collapsing them
+/// needs a macro or bridging trait — more indirection than two shallow arms are
+/// worth for a fixed 2-variant set. The drift-prone bits are centralized here.
 #[derive(Clone, Copy)]
 enum Target {
     DefaultSink,
@@ -138,22 +135,19 @@ impl AudioController {
             .connect(None, FlagSet::NOFLAGS, None)
             .context("failed to connect to PulseAudio")?;
 
-        // Wait for the context to reach Ready, bounded by a wall-clock
-        // deadline. This bounds the full handshake (socket connect → auth →
-        // negotiation → Ready), which is a different, slower operation than the
-        // per-op `wait_until` (that one runs against an already-Ready context,
-        // hence its tighter 250ms). A cold or resuming server legitimately
-        // takes a moment, so the deadline is seconds-scale; CONNECT_DEADLINE is
-        // kept under AudioReconnector's MAX_BACKOFF so a wedged server can't
-        // freeze the main-thread reconnect path for longer than a backoff gap.
+        // Wait for the context to reach Ready, bounded by a wall-clock deadline
+        // covering the full handshake (connect → auth → negotiate → Ready) —
+        // slower than the per-op `wait_until`, which runs against an
+        // already-Ready context (hence its tighter 250ms). Kept under
+        // AudioReconnector's MAX_BACKOFF so a wedged server can't freeze the
+        // reconnect path longer than a backoff gap.
         //
         // We poll non-blocking (`iterate(false)`) plus a short sleep rather
-        // than `iterate(true)`: a blocking iterate can park inside poll()
-        // indefinitely if the peer accepted the socket but sends nothing and
-        // never closes — exactly the wedged-handshake case this deadline
-        // defends against — so the elapsed() check would never be reached. The
-        // sleep caps the spin at ~100 wakeups/sec while keeping the deadline
-        // check live every pass.
+        // than `iterate(true)`, because a blocking iterate can park in poll()
+        // forever if the peer accepts the socket but never sends or closes —
+        // the wedged-handshake case this deadline defends against. The sleep
+        // caps the spin at ~100 wakeups/sec while keeping the deadline check
+        // live each pass.
         const CONNECT_DEADLINE: Duration = Duration::from_secs(3);
         let started = Instant::now();
         loop {
@@ -211,9 +205,8 @@ impl AudioController {
     /// with an error if the PA context disconnects, the mainloop quits, or
     /// the operation exceeds the wall-clock deadline.
     ///
-    /// Surfacing a real error rather than silently breaking out is the
-    /// "practical fallback" for the absent reconnect path: callers now see
-    /// the failure and propagate it; the user gets a visible error in the
+    /// Surfacing a real error rather than silently breaking out means callers
+    /// see the failure and propagate it, so the user gets a visible error in the
     /// journal instead of stale defaults from an apparently-successful call.
     fn wait_until<F: Fn() -> bool>(&self, is_done: F) -> Result<()> {
         const DEADLINE: Duration = Duration::from_millis(250);
@@ -704,21 +697,17 @@ impl AudioController {
         // persistence (a slider burst coalesces to one DB write per app once
         // idle for PERSIST_IDLE). The playback volume above is set every tick.
         //
-        // Only *matched* (currently-running) targets are persisted, and that's
-        // deliberate. Review-accepted: do NOT "fix" this to persist
-        // unmatched/offline targets so a fader move while an app is closed
-        // pre-sets its next-launch volume — it's a verified no-op on
-        // PipeWire/WirePlumber. There are two stream-restore stores: the
-        // libpulse `module-stream-restore` DB we write here, and WirePlumber's
-        // own `stream-properties`. WirePlumber restores a stream's volume at
-        // creation from ITS store, which it updates only by observing a *live*
-        // stream's volume change — it does not consult our pulse-side writes
-        // (confirmed: the write succeeds with no error, WirePlumber's store is
-        // untouched, and the app restores to its prior volume). So persistence
-        // here effectively rides on WirePlumber seeing our live `set` above;
-        // with no live stream there's nothing to observe, and a closed app's
-        // volume cannot be pre-set this way. (On a real PulseAudio server these
-        // writes WOULD govern restoration — hence we keep them.)
+        // Only *matched* (currently-running) targets are persisted, deliberately.
+        // Review-accepted: do NOT "fix" this to persist unmatched/offline targets
+        // so a fader move on a closed app pre-sets its next-launch volume — it's
+        // a verified no-op on PipeWire/WirePlumber. WirePlumber restores from its
+        // own `stream-properties` store, which it updates only by observing a
+        // *live* stream's volume change; it never consults our pulse-side
+        // `module-stream-restore` writes (confirmed: the write succeeds,
+        // WirePlumber's store is untouched, the app restores its prior volume).
+        // So persistence here rides on WirePlumber seeing the live `set` above —
+        // with no live stream there's nothing to observe. (On a real PulseAudio
+        // server these writes WOULD govern restoration, so we keep them.)
         for (i, target) in targets.iter().enumerate() {
             if matched[i] {
                 self.pending_persist.insert(
@@ -933,14 +922,11 @@ fn entry_matches_target(entry: &SinkInputEntry, target: &str, comm: Option<&str>
 /// a volume/mute change — low-stakes and self-correcting once that stream
 /// goes away. Mirrors the process-lifetime icon-resolution cache.
 ///
-/// Unbounded-growth note (reviewed, accepted): unlike the icon cache —
-/// which is keyed by the small, bounded set of distinct app *names* — this
-/// one is keyed by PID and never evicts, so a long-lived daemon accrues one
-/// entry per distinct PID ever seen on a non-name/binary-matched stream.
-/// In practice that's just the audio apps that aren't the configured
-/// target: dozens to low hundreds of ~70-byte entries, and single-digit MB
-/// even under pathological PID churn (something spawning a fresh PID per
-/// sound). Not worth an eviction scheme for that ceiling; left as-is.
+/// Unbounded-growth note (reviewed, accepted): keyed by PID and never evicts,
+/// so a long-lived daemon accrues one entry per distinct PID ever seen on a
+/// non-name/binary-matched stream — in practice dozens to low hundreds of
+/// ~70-byte entries, single-digit MB even under pathological PID churn. Not
+/// worth an eviction scheme for that ceiling.
 fn comm_for_pid(pid: &str) -> Option<String> {
     static CACHE: LazyLock<Mutex<HashMap<String, Option<String>>>> =
         LazyLock::new(|| Mutex::new(HashMap::new()));

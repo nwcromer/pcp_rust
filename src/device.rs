@@ -88,16 +88,14 @@ impl PcPanelPro {
                         self.pending.push_back(read_buf);
                     }
                 }
-                // A read that yields no frame (the 250ms timeout elapsed) once
-                // the burst has started means the burst is drained — the device
-                // emits it as one contiguous, sub-millisecond-spaced block right
-                // after init. Stop early rather than spending the remaining
-                // iterations blocking on 250ms timeouts (~2.75s of dead startup
-                // when the burst is ~9 frames). The CALIBRATION_READS cap still
-                // bounds the wait if the burst is slow to *start*. Worst case if
-                // a straggler is ever missed: it surfaces as one analog event in
-                // the main loop, which simply applies the control's true current
-                // position — harmless and self-correcting.
+                // Once the burst has started, a read that times out means it's
+                // drained — the device emits it as one contiguous, sub-ms-spaced
+                // block right after init. Stop early rather than blocking through
+                // the remaining 250ms timeouts (~2.75s of dead startup for a
+                // ~9-frame burst); the CALIBRATION_READS cap still bounds the
+                // wait if the burst is slow to *start*. If a straggler is ever
+                // missed it surfaces as one analog event that applies the
+                // control's true position — harmless and self-correcting.
                 Ok(_) if got_frame => break,
                 Ok(_) => {}
                 Err(e) => warn!("calibration read {} failed: {}", i, e),

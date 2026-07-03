@@ -409,18 +409,15 @@ impl ObsRuntime {
         ));
     }
 
-    /// Clear any expired flash. Returns `true` if a flash just expired OR
-    /// if a blinking flash is active (in which case we keep repainting so
-    /// the on/off phases render — the simplest implementation, costs an
-    /// extra LED write per main-loop iteration for the flash duration).
+    /// Clear any expired flash. Returns `true` if a flash just expired OR if a
+    /// blinking flash is active (we keep repainting so the on/off phases render,
+    /// at one extra LED write per main-loop iteration for the flash duration).
     ///
-    /// This produces redundant paints: the main loop runs at roughly
-    /// 10 Hz (paced by panel.read_event's 100 ms HID timeout) while the
-    /// blink phase only flips every 100 ms, so up to half of the paints
-    /// during a blink rewrite the same color. Not worth tracking
-    /// last-painted-phase to skip them — default flash_duration_ms is
-    /// 500 ms (~5 paints total) and each paint is microseconds of HID
-    /// traffic.
+    /// That means some redundant paints: the loop runs ~10 Hz (paced by
+    /// read_event's 100ms HID timeout) while the blink flips every 100ms, so up
+    /// to half the paints during a blink rewrite the same color. Not worth
+    /// tracking last-painted-phase to skip — the default 500ms flash is ~5
+    /// paints, each microseconds of HID traffic.
     pub fn expire_flash(&mut self) -> bool {
         match self.flash {
             Some(f) if Instant::now() >= f.expires_at => {

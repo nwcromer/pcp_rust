@@ -133,13 +133,11 @@ const STABLE_SESSION_DWELL: Duration = Duration::from_secs(30);
 /// have a secure tunnel (SSH, VPN, etc.) the program can't see.
 fn host_is_local(host: &str) -> bool {
     // Tolerate an FQDN trailing dot ("localhost.") and IPv6 brackets
-    // ("[::1]"), then accept a case-insensitive "localhost" (hostnames are
-    // case-insensitive) or any address std considers loopback — which covers
-    // the whole 127.0.0.0/8 block, not just 127.0.0.1, plus ::1. This is a
-    // best-effort string heuristic, not name resolution: a custom /etc/hosts
-    // alias pointing at loopback still reads as non-local and warns. That
-    // false positive is harmless (a spurious one-shot advisory), so we don't
-    // pay a startup DNS lookup to chase it.
+    // ("[::1]"), then accept case-insensitive "localhost" or any address std
+    // considers loopback (the whole 127.0.0.0/8 block plus ::1). Best-effort
+    // string heuristic, not name resolution: an /etc/hosts alias pointing at
+    // loopback still reads as non-local and warns — a harmless spurious
+    // advisory, not worth a startup DNS lookup.
     let h = host.trim_end_matches('.');
     let h = h.strip_prefix('[').and_then(|s| s.strip_suffix(']')).unwrap_or(h);
     h.eq_ignore_ascii_case("localhost")
@@ -385,23 +383,17 @@ async fn handle_command(
     }
 }
 
-/// Start or stop recording. On the *start* edge, optionally match OBS's
-/// canvas to the current monitor resolution first.
+/// Start or stop recording. On the *start* edge, run the capture-live guard
+/// and (if enabled) match OBS's canvas to the monitor resolution first.
 ///
-/// When the canvas-match feature is off we use obws's atomic `toggle()` — the
-/// original behavior, one round-trip, no client-side state read. When it's on
-/// we can't use toggle: the canvas must be set *before* recording begins (OBS
-/// rejects resolution changes while active), and toggle leaves no window
-/// between flip and start. So we read the current state to learn the
-/// direction, then `stop()`, or (canvas-match →) `start()`. The brief TOCTOU
-/// window between the status read and the start/stop is irrelevant for a
-/// single user pressing a button. LED feedback is unaffected either way —
-/// it's driven by OBS's RecordStateChanged events, which fire for explicit
-/// start/stop just as they do for toggle.
+/// Both pre-start checks must run *before* recording begins, and OBS rejects
+/// resolution changes while active, so we can't use obws's atomic `toggle()`
+/// (it leaves no window between flip and start). Instead we read the current
+/// state for the direction, then `stop()` or (checks first →) `start()`. The
+/// brief TOCTOU window between the status read and start/stop is irrelevant for
+/// a single user pressing a button. LED feedback is unaffected — it's driven by
+/// OBS's RecordStateChanged events, which fire for explicit start/stop.
 async fn toggle_recording(client: &obws::Client, config: &ObsConfig) -> Result<()> {
-    // Both pre-start checks (capture-live guard, canvas match) must run
-    // *before* recording begins, so we can't use obws's atomic toggle() (it
-    // leaves no window between flip and start). Read the direction ourselves.
     let status = client.recording().status().await?;
     if status.active {
         // Stopping — the pre-start checks only apply to the start edge (a
@@ -476,11 +468,10 @@ fn is_capture_kind(kind: &str) -> bool {
 /// Share-screen picker, so OBS records nothing" case. See `scan_captures` for
 /// scope and fail-open behavior.
 async fn ensure_capture_live(client: &obws::Client) -> Result<()> {
-    // Review-accepted: a capture can read 0x0 for a brief moment while its
-    // PipeWire portal stream is (re)negotiating, so hammering record in that
-    // instant could refuse a start that would've been fine a beat later. Not
-    // worth a retry/settle loop — recording is a deliberate press made once the
-    // capture is visibly up, and the error flash just prompts an immediate retry.
+    // Review-accepted: a capture can read 0x0 for a moment while its PipeWire
+    // portal stream (re)negotiates, so record in that instant could refuse a
+    // start that would've been fine a beat later. Not worth a retry/settle loop
+    // — recording is a deliberate press, and the error flash prompts a retry.
     let (found, live) = scan_captures(client).await?;
     if found && !live {
         bail!(

@@ -263,21 +263,16 @@ fn file_has_obs_password(content: &str) -> bool {
 /// purpose, and the warning leaks nothing (just the path + octal mode).
 /// Best-effort: a stat failure is silently ignored.
 ///
-/// Review-accepted: two non-issues here, both deliberately left as-is.
-///   1. `file_has_obs_password` re-parses the TOML that `parse_config`
-///      already parsed in `load_config`. Kept separate so it stays a pure
-///      `&str -> bool` (unit-tested) and so it keys off the *file* contents
-///      rather than the resolved password — a secret from
-///      `$PCPANEL_OBS_PASSWORD` with nothing in the file must NOT trip the
-///      perms warning. Both parses run on the same in-memory `content`
-///      (one disk read), so there is no race between them.
-///   2. There is a benign read-vs-stat TOCTOU window: `content` is read in
-///      `load_config` (T1) and `fs::metadata` re-stats `path` here (T2), so
-///      a swap/chmod/symlink-repoint in between could pair content from one
-///      file with mode bits from another. Consequence is nil — this is a
-///      one-shot startup advisory; the config actually in use is the T1
-///      snapshot, and the worst case is a spurious or missed warning printed
-///      once. Not worth an open-once-then-fstat rework for a perms hint.
+/// Review-accepted: two deliberate non-issues.
+///   1. `file_has_obs_password` re-parses the already-parsed TOML. Kept
+///      separate to stay a pure, unit-testable `&str -> bool` that keys off
+///      *file* contents, so a secret from `$PCPANEL_OBS_PASSWORD` with nothing
+///      in the file doesn't trip the warning. Both parses share the one
+///      in-memory `content`, so there's no race.
+///   2. Benign read-vs-stat TOCTOU: `content` is read in `load_config` and
+///      re-stat'd here, so a swap between could pair one file's contents with
+///      another's mode. Harmless — a one-shot startup advisory whose worst
+///      case is a single spurious/missed warning; not worth an fstat rework.
 fn warn_if_obs_password_world_readable(path: &Path, content: &str) {
     use std::os::unix::fs::PermissionsExt;
 
@@ -406,8 +401,8 @@ fn parse_rgb_section(table: &toml::value::Table) -> Result<RgbMode> {
             let hue = parse_u8_required(table, "hue", "wave")?;
             let brightness = parse_u8_with_default(table, "brightness", DEFAULT_BRIGHTNESS)?;
             let speed = parse_u8_with_default(table, "speed", DEFAULT_SPEED)?;
-            let reverse = parse_bool_with_default(table, "reverse", false)?;
-            let bounce = parse_bool_with_default(table, "bounce", false)?;
+            let reverse = parse_bool_with_default("rgb", table, "reverse", false)?;
+            let bounce = parse_bool_with_default("rgb", table, "bounce", false)?;
             Ok(RgbMode::Wave { hue, brightness, speed, reverse, bounce })
         }
         "breath" => {
@@ -472,6 +467,7 @@ fn range_check_u8(n: i64, field: &str) -> Result<u8> {
 }
 
 fn parse_bool_with_default(
+    section: &str,
     table: &toml::value::Table,
     field: &str,
     default: bool,
@@ -480,7 +476,7 @@ fn parse_bool_with_default(
         None => Ok(default),
         Some(v) => v
             .as_bool()
-            .with_context(|| format!("[rgb] \"{field}\" must be a boolean")),
+            .with_context(|| format!("[{section}] \"{field}\" must be a boolean")),
     }
 }
 
@@ -595,26 +591,10 @@ fn parse_obs_section(table: &toml::value::Table) -> Result<ObsConfig> {
                 .map(String::from)
         });
 
-    let start_replay_buffer = match table.get("start_replay_buffer") {
-        None => false,
-        Some(v) => v
-            .as_bool()
-            .context("[obs] \"start_replay_buffer\" must be a boolean")?,
-    };
-
-    let paused_use_breath = match table.get("paused_use_breath") {
-        None => false,
-        Some(v) => v
-            .as_bool()
-            .context("[obs] \"paused_use_breath\" must be a boolean")?,
-    };
-
-    let match_canvas_to_display = match table.get("match_canvas_to_display") {
-        None => false,
-        Some(v) => v
-            .as_bool()
-            .context("[obs] \"match_canvas_to_display\" must be a boolean")?,
-    };
+    let start_replay_buffer = parse_bool_with_default("obs", table, "start_replay_buffer", false)?;
+    let paused_use_breath = parse_bool_with_default("obs", table, "paused_use_breath", false)?;
+    let match_canvas_to_display =
+        parse_bool_with_default("obs", table, "match_canvas_to_display", false)?;
 
     // A blank/whitespace-only display name can never match a real connector,
     // so reject it the same way `clean_app_name` rejects blank app names —
@@ -633,12 +613,7 @@ fn parse_obs_section(table: &toml::value::Table) -> Result<ObsConfig> {
         }
     };
 
-    let show_capture_status = match table.get("show_capture_status") {
-        None => false,
-        Some(v) => v
-            .as_bool()
-            .context("[obs] \"show_capture_status\" must be a boolean")?,
-    };
+    let show_capture_status = parse_bool_with_default("obs", table, "show_capture_status", false)?;
 
     let colors = match table.get("colors") {
         None => ObsColors::default(),

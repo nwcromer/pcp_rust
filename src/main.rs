@@ -92,11 +92,10 @@ fn list_apps() -> Result<()> {
         let pid = app.pid.as_deref().unwrap_or("?");
 
         // Try to find a useful extra identifier: binary name or /proc/comm.
-        // Review-accepted: the /proc/comm read below duplicates the one in
-        // audio.rs `comm_for_pid`, but deliberately — this cold display path
-        // keeps original case and skips the match-cache, where the hot-path
-        // matcher lower-cases and memoizes. A shared helper would be net
-        // worse. See the matching note in `comm_for_pid`.
+        // Review-accepted: this /proc/comm read duplicates audio.rs
+        // `comm_for_pid`, deliberately — this cold path keeps original case and
+        // skips the hot-path lower-case/memoize, so a shared helper would be
+        // net worse. See the matching note in `comm_for_pid`.
         let extra = app
             .binary
             .as_deref()
@@ -144,13 +143,11 @@ fn spawn_resume_monitor() -> mpsc::Receiver<()> {
             }
         };
 
-        // All three pinned values (sender, interface, member) are hardcoded
-        // valid D-Bus identifiers, so the builder calls can't realistically
-        // error in production. The match arm exists as a defensive catch,
-        // not because we expect to hit it. If the sender pin ever did fail
-        // on some exotic D-Bus setup, resume detection would silently
-        // disable until the daemon is restarted — acceptable for the
-        // spoof-defense it buys.
+        // The pinned sender/interface/member are hardcoded valid D-Bus
+        // identifiers, so these builder calls can't realistically fail; the
+        // error arms are a defensive catch. If one ever did fail, resume
+        // detection silently disables until restart — acceptable for the
+        // spoof-defense the sender pin buys.
         let rule = match MatchRule::builder()
             .msg_type(zbus::message::Type::Signal)
             .sender("org.freedesktop.login1")
@@ -216,12 +213,10 @@ struct MicPoller {
     /// startup seed (PA still booting) doesn't leave a stale value visible for
     /// up to one interval.
     ///
-    /// Review-accepted: because `run()` also seeds the mic state once before
-    /// the loop, that immediate first `tick` is a redundant PA query at
-    /// startup. Left as-is deliberately — the immediate poll is what avoids a
-    /// stale-value window, and seeding `last_poll` to defer it would
-    /// reintroduce exactly that window when the startup seed fails. One extra
-    /// query, once, is the cheaper trade.
+    /// Review-accepted: this makes the first `tick` redundant with `run()`'s
+    /// startup seed. Deliberate — deferring it (seeding `last_poll`) would
+    /// reopen the stale-value window whenever the seed fails. One extra query
+    /// once is the cheaper trade.
     last_poll: Option<Instant>,
     /// Consecutive failed polls. Used to warn once at the start of an outage
     /// and report the recovery duration when it clears. Reset to 0 on success.
@@ -465,26 +460,22 @@ fn run(cli: Cli) -> Result<()> {
     loop {
         let mut led_dirty = obs.drain_events();
         led_dirty |= obs.expire_flash();
-        // While the mic indicator is in its "unknown" state, force a
-        // repaint each iteration so the logo's blink renders. The blink
-        // phase is time-driven inside runtime, so just keeping led_dirty
-        // true is enough. Gate on logo_indicator_visible: if the current
-        // appearance can't show the indicator (a flash owns the panel, or
-        // a global animation owns the logo), forcing a repaint would only
-        // restart that animation every iteration without rendering any
-        // blink. Recovery/state-change repaints still happen via the
-        // poll/resume paths below, so suppressing the blink-only repaint
-        // here can't strand a stale frame.
+        // While the mic indicator is "unknown", force a repaint each iteration
+        // so the logo's blink renders (the blink phase is time-driven in
+        // runtime, so keeping led_dirty true is enough). Gate on
+        // logo_indicator_visible: if a flash owns the panel or a global
+        // animation owns the logo, a forced repaint would only restart that
+        // animation without rendering any blink. Recovery/state-change repaints
+        // still come from the poll/resume paths below, so skipping the
+        // blink-only repaint here can't strand a stale frame.
         //
-        // Review-accepted: each forced repaint runs paint_leds, which rewrites
-        // all four LED regions (knobs/sliders/labels/logo) even though only the
-        // logo color changes during the blink — 4 USB writes ~10x/sec where 1
-        // would do. Left as-is: it's bounded to the PA-outage duration (steady
-        // 250ms polling keeps the indicator fresh otherwise), each write is
-        // microseconds of HID traffic, and it mirrors the blinking-flash path's
-        // accepted "repaint every iteration" trade (see expire_flash in
-        // runtime.rs). A logo-only repaint path would add dirty-region state to
-        // paint_leds for no user-visible gain.
+        // Review-accepted: each forced repaint rewrites all four LED regions
+        // though only the logo changes during the blink — 4 USB writes ~10x/sec
+        // where 1 would do. Left as-is: bounded to the PA-outage duration (250ms
+        // polling keeps the indicator fresh otherwise), each write is
+        // microseconds of HID traffic, and it mirrors expire_flash's accepted
+        // per-iteration repaint (runtime.rs). A logo-only path would add
+        // dirty-region state to paint_leds for no user-visible gain.
         led_dirty |= obs.mic_indicator_needs_repaint()
             && paint::logo_indicator_visible(&obs, config.rgb);
 
