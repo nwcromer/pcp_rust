@@ -131,6 +131,11 @@ pub struct ObsRuntime {
     /// `LogoIndicator::None` (the default) means the logo just matches the
     /// panel color.
     logo_cfg: LogoConfig,
+    /// Whether OBS is currently capturing, per the capture-liveness poll. Only
+    /// updated when `show_capture_status` is on, and only read for the idle
+    /// panel color. Defaults to true so we don't show the not-capturing color
+    /// before the first poll.
+    capturing: bool,
 }
 
 impl ObsRuntime {
@@ -152,6 +157,7 @@ impl ObsRuntime {
             mic_confirmed_at: None,
             created_at: Instant::now(),
             logo_cfg,
+            capturing: true,
         }
     }
 
@@ -178,6 +184,10 @@ impl ObsRuntime {
 
     pub fn paused_use_breath(&self) -> bool {
         self.paused_use_breath
+    }
+
+    pub fn capturing(&self) -> bool {
+        self.capturing
     }
 
     /// Record a confirmed mic-mute state from PA. Updates the cached
@@ -321,11 +331,19 @@ impl ObsRuntime {
             ObsEvent::Disconnected => {
                 self.connected = false;
                 self.replay_buffer_active = None;
+                // Assume capturing on the next connect until the poll says
+                // otherwise, so a reconnect doesn't briefly show stale state.
+                self.capturing = true;
                 // Disconnected behaves visually like Idle. Also force a
                 // repaint so we switch back to `[rgb]` mode from the
                 // OBS-connected-idle appearance.
                 let _ = self.transition_to(ObsState::Idle);
                 true
+            }
+            ObsEvent::CaptureLive(live) => {
+                let changed = self.capturing != live;
+                self.capturing = live;
+                changed
             }
             ObsEvent::RecordingActive | ObsEvent::RecordingResumed => {
                 self.transition_to(ObsState::Recording)
@@ -530,6 +548,26 @@ mod tests {
 
         // Redundant Inactive: no change, not dirty.
         assert!(!obs.apply_event(ObsEvent::ReplayBufferInactive));
+    }
+
+    #[test]
+    fn apply_capture_live_dirty_only_on_change() {
+        let mut obs = fresh_runtime();
+        assert!(obs.capturing()); // default: assume capturing
+
+        // true → false is a change → dirty.
+        assert!(obs.apply_event(ObsEvent::CaptureLive(false)));
+        assert!(!obs.capturing());
+        // Redundant false → not dirty.
+        assert!(!obs.apply_event(ObsEvent::CaptureLive(false)));
+        // Back to true → dirty.
+        assert!(obs.apply_event(ObsEvent::CaptureLive(true)));
+        assert!(obs.capturing());
+
+        // Disconnect resets to capturing so a reconnect doesn't show stale state.
+        obs.apply_event(ObsEvent::CaptureLive(false));
+        obs.apply_event(ObsEvent::Disconnected);
+        assert!(obs.capturing());
     }
 
     #[test]

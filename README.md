@@ -276,9 +276,15 @@ capture_display = "DP-1"         # optional; which display to match when
                                  # match_canvas_to_display is on. Connector name
                                  # as reported by `kscreen-doctor` (e.g. "DP-1").
                                  # Omit to use the primary display.
+show_capture_status = false      # optional, default false. If true, the idle
+                                 # panel shows the [obs.colors] idle_not_capturing
+                                 # color while OBS is connected but capturing
+                                 # nothing. Adds a ~1s OBS poll while connected.
 ```
 
 pcp_rust connects on startup and reconnects automatically (with exponential backoff, max ~30s) when OBS isn't running, restarts, or crashes. While disconnected, OBS action buttons produce an error flash.
+
+If OBS is running but its screen capture is empty — e.g. you dismissed the Wayland screen-share prompt so nothing is being captured — pressing record error-flashes instead of starting a blank recording. Enable `show_capture_status` to also see this at a glance while idle (the panel uses `idle_not_capturing` instead of `idle`).
 
 **Password handling.** The `password` field in `config.toml` is stored in plain text. obs-websocket is normally bound to localhost, so this is a personal-machine convenience rather than a transport concern, but two things to know:
 
@@ -361,7 +367,7 @@ When `[obs]` is configured, the LEDs follow OBS state:
 | OBS state | Panel (knobs/sliders/labels) | Logo (with no `[logo]` indicators) |
 |---|---|---|
 | OBS disconnected | Your `[rgb]` mode (or off if omitted) | follows `[rgb]` |
-| OBS connected, idle | Solid `idle_panel` color (configurable) | matches panel |
+| OBS connected, idle | Solid `idle` color (configurable) | matches panel |
 | Recording active | Solid red (configurable) | matches panel |
 | Recording paused | Solid amber (configurable); breath if `paused_use_breath = true` | matches panel (or joins breath in `paused_use_breath` mode — hardware limit) |
 | Any command succeeded | Brief green flash | follows flash |
@@ -383,7 +389,10 @@ success_flash = "#00FF00"       # flash on successful OBS commands
 error_flash = "#FF00FF"         # blinking flash on failed OBS commands
 flash_duration_ms = 500         # how long each flash stays before reverting
 
-idle_panel = "#202020"          # panel color when OBS is connected and idle
+idle = "#202020"                # panel color when OBS is connected and idle
+idle_not_capturing = "#000000"  # panel color while connected but capturing
+                                # nothing; only used when [obs]
+                                # show_capture_status = true (see below)
 ```
 
 Static effects (solid, gradient, volume-gradient) and the `recording` / flash colors take full hex; the paused color's hue is derived from the hex (saturation and brightness are managed by the breath effect itself).

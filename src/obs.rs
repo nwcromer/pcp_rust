@@ -9,7 +9,7 @@
 
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use log::{debug, info, warn};
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::time::sleep;
@@ -61,6 +61,10 @@ pub enum ObsEvent {
     /// Surfaced as an error flash, mirroring a failed record-start — this is
     /// not tied to a button press, so it can't reuse `CommandFailed`.
     CanvasMatchFailed(String),
+    /// Capture-liveness poll result: `true` = OBS is capturing (or has no
+    /// capture source), `false` = an enabled capture is present but blind
+    /// (0x0). Only emitted when `show_capture_status` is on.
+    CaptureLive(bool),
 }
 
 /// Bound for the cross-thread mpsc channels. Both directions carry events
@@ -107,6 +111,10 @@ pub fn spawn_obs_thread(config: ObsConfig) -> Option<ObsHandle> {
         }
     }
 }
+
+/// How often to re-check capture liveness for the `idle_not_capturing` panel
+/// color. Capture state only changes on user action, so a slow poll is plenty.
+const CAPTURE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 const BACKOFF_INITIAL_SECS: u64 = 2;
 const BACKOFF_MAX_SECS: u64 = 30;
@@ -299,6 +307,14 @@ async fn run_session(
         None => {} // unknown — wait for next event to populate
     }
 
+    // Poll capture liveness only when the user opted into the status indicator.
+    let mut capture_poll = config.show_capture_status.then(|| {
+        let mut i = tokio::time::interval(CAPTURE_POLL_INTERVAL);
+        i.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        i
+    });
+    let mut last_capture_live: Option<bool> = None;
+
     loop {
         // `biased` polls the arms in written order, so when both cmd_rx and
         // the event stream are ready at the same select point, a button
@@ -320,6 +336,18 @@ async fn run_session(
                 match evt {
                     Some(evt) => handle_obs_event(evt, event_tx).await,
                     None => return Err(anyhow::anyhow!("event stream ended")),
+                }
+            }
+            _ = async { capture_poll.as_mut().unwrap().tick().await }, if capture_poll.is_some() => {
+                match scan_captures(client).await {
+                    Ok((found, live)) => {
+                        let capturing = !found || live;
+                        if last_capture_live != Some(capturing) {
+                            last_capture_live = Some(capturing);
+                            let _ = event_tx.send(ObsEvent::CaptureLive(capturing)).await;
+                        }
+                    }
+                    Err(e) => debug!("OBS: capture poll failed: {e:#}"),
                 }
             }
         }
@@ -371,21 +399,24 @@ async fn handle_command(
 /// it's driven by OBS's RecordStateChanged events, which fire for explicit
 /// start/stop just as they do for toggle.
 async fn toggle_recording(client: &obws::Client, config: &ObsConfig) -> Result<()> {
-    if !config.match_canvas_to_display {
-        client.recording().toggle().await?;
-        return Ok(());
-    }
-
+    // Both pre-start checks (capture-live guard, canvas match) must run
+    // *before* recording begins, so we can't use obws's atomic toggle() (it
+    // leaves no window between flip and start). Read the direction ourselves.
     let status = client.recording().status().await?;
     if status.active {
-        // Stopping — resolution can't change mid-session, so nothing to match.
+        // Stopping — the pre-start checks only apply to the start edge (a
+        // running recording already has whatever capture/resolution it has),
+        // so there's nothing to do but stop.
         client.recording().stop().await?;
         return Ok(());
     }
-    // Starting. Fail-closed: a detection/set failure propagates and aborts the
-    // start, so the caller surfaces the error flash rather than recording at a
-    // stale (wrong) resolution.
-    match_canvas_to_display(client, config).await?;
+    // Starting. Both checks are fail-closed: an error aborts the start, so the
+    // caller surfaces the error flash instead of recording nothing (capture
+    // guard) or at a stale resolution (canvas match).
+    ensure_capture_live(client).await?;
+    if config.match_canvas_to_display {
+        match_canvas_to_display(client, config).await?;
+    }
     client.recording().start().await?;
     Ok(())
 }
@@ -430,6 +461,132 @@ async fn match_canvas_to_display(client: &obws::Client, config: &ObsConfig) -> R
         .await
         .context("setting OBS video settings")?;
     Ok(())
+}
+
+/// Input kinds we treat as a screen/window video capture: the Linux PipeWire
+/// portal captures, whose kinds end in `-capture-source`. Matching that
+/// substring deliberately excludes audio captures (which have no video surface
+/// and would otherwise read 0x0 and wrongly trip the guard).
+fn is_capture_kind(kind: &str) -> bool {
+    kind.contains("capture-source")
+}
+
+/// Record-start guard: bail (→ error flash) if OBS has an enabled screen/window
+/// capture but every one is blind (0x0) — the Wayland "dismissed the
+/// Share-screen picker, so OBS records nothing" case. See `scan_captures` for
+/// scope and fail-open behavior.
+async fn ensure_capture_live(client: &obws::Client) -> Result<()> {
+    // Review-accepted: a capture can read 0x0 for a brief moment while its
+    // PipeWire portal stream is (re)negotiating, so hammering record in that
+    // instant could refuse a start that would've been fine a beat later. Not
+    // worth a retry/settle loop — recording is a deliberate press made once the
+    // capture is visibly up, and the error flash just prompts an immediate retry.
+    let (found, live) = scan_captures(client).await?;
+    if found && !live {
+        bail!(
+            "OBS isn't capturing anything — its screen/window capture is 0x0 \
+             (was the \"Share screen\" picker dismissed?); refusing to record"
+        );
+    }
+    Ok(())
+}
+
+/// Scan the current program scene for enabled screen/window captures, returning
+/// `(found, live)`: whether any enabled capture is present, and whether at
+/// least one is producing video. Scope is the scene's top-level items plus one
+/// level of enabled groups (OBS groups can't nest); nested scenes aren't
+/// descended, and disabled items are ignored since they composite nothing.
+/// Shared by the record-start guard and the idle capture-status poll.
+async fn scan_captures(client: &obws::Client) -> Result<(bool, bool)> {
+    let scene = client
+        .scenes()
+        .current_program_scene()
+        .await
+        .context("reading OBS current program scene")?;
+    let scene_id = obws::requests::scenes::SceneId::Name(&scene.id.name);
+
+    let items = client
+        .scene_items()
+        .list(scene_id)
+        .await
+        .context("listing OBS scene items")?;
+
+    let mut found = false;
+    let mut live = false;
+    for item in &items {
+        if let Some(l) =
+            capture_liveness(client, scene_id, item.input_kind.as_deref(), item.id).await?
+        {
+            found = true;
+            live |= l;
+        }
+        // Descend into a group only if the group itself is enabled — a
+        // disabled group composites none of its members.
+        if item.is_group == Some(true)
+            && client
+                .scene_items()
+                .enabled(scene_id, item.id)
+                .await
+                .with_context(|| {
+                    format!("reading OBS group {:?} enabled state", item.source_name)
+                })?
+        {
+            let group_id = obws::requests::scenes::SceneId::Name(&item.source_name);
+            let members = client
+                .scene_items()
+                .list_group(group_id)
+                .await
+                .with_context(|| format!("listing OBS group {:?}", item.source_name))?;
+            for m in &members {
+                if let Some(l) =
+                    capture_liveness(client, group_id, m.input_kind.as_deref(), m.id).await?
+                {
+                    found = true;
+                    live |= l;
+                }
+            }
+        }
+    }
+    Ok((found, live))
+}
+
+/// Liveness of a scene item viewed as a capture source:
+/// `None` — not a screen/window capture, or one that's disabled/hidden
+/// (ignore it); `Some(true)` — an enabled capture with real (non-zero)
+/// dimensions; `Some(false)` — an enabled capture reporting 0x0, i.e. no live
+/// stream. `scene` is the item's containing scene or group.
+async fn capture_liveness(
+    client: &obws::Client,
+    scene: obws::requests::scenes::SceneId<'_>,
+    input_kind: Option<&str>,
+    item_id: i64,
+) -> Result<Option<bool>> {
+    let Some(kind) = input_kind else {
+        return Ok(None);
+    };
+    if !is_capture_kind(kind) {
+        return Ok(None);
+    }
+    // A disabled (hidden) item isn't composited into the recording, so it must
+    // not count in either direction: it can't block, and can't mask a dead
+    // visible capture. Skip it before reading dimensions.
+    if !client
+        .scene_items()
+        .enabled(scene, item_id)
+        .await
+        .context("reading OBS scene item enabled state")?
+    {
+        return Ok(None);
+    }
+    let t = client
+        .scene_items()
+        .transform(scene, item_id)
+        .await
+        .context("reading OBS scene item transform")?;
+    // A live capture reports the captured surface's pixel size; a stream-less
+    // one collapses to 0x0. Compare with `>= 1.0` rather than `!= 0.0` to stay
+    // clear of float-equality pitfalls on the f32 the API returns.
+    Ok(Some(t.source_width >= 1.0 && t.source_height >= 1.0))
 }
 
 /// Start the replay buffer, mapping the outcome to the `Some(bool)` running

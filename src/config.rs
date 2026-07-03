@@ -192,6 +192,10 @@ pub struct ObsConfig {
     /// on. The connector name as reported by `kscreen-doctor` (e.g. "DP-1").
     /// `None` → use the primary display (or the sole enabled one).
     pub capture_display: Option<String>,
+    /// If true, poll OBS's capture liveness and paint the `idle_not_capturing`
+    /// color while connected but capturing nothing. Off by default — opt-in,
+    /// since it adds a periodic OBS query (see the README).
+    pub show_capture_status: bool,
     pub colors: ObsColors,
 }
 
@@ -204,7 +208,11 @@ pub struct ObsColors {
     pub flash_duration_ms: u64,
     /// Panel color when OBS is connected and idle (not recording). When OBS
     /// is disconnected, `[rgb]` is used instead.
-    pub idle_panel: RgbColor,
+    pub idle: RgbColor,
+    /// Idle panel color while OBS is connected but capturing no video (its
+    /// screen/window capture reads 0x0). Only used when `[obs]
+    /// show_capture_status` is on.
+    pub idle_not_capturing: RgbColor,
 }
 
 impl Default for ObsColors {
@@ -218,7 +226,8 @@ impl Default for ObsColors {
             success_flash: RgbColor { r: 0x00, g: 0xFF, b: 0x00 },
             error_flash: RgbColor { r: 0xFF, g: 0x00, b: 0xFF },
             flash_duration_ms: 500,
-            idle_panel: RgbColor { r: 0x20, g: 0x20, b: 0x20 },
+            idle: RgbColor { r: 0x20, g: 0x20, b: 0x20 },
+            idle_not_capturing: RgbColor { r: 0x00, g: 0x00, b: 0x00 },
         }
     }
 }
@@ -552,7 +561,7 @@ fn parse_obs_section(table: &toml::value::Table) -> Result<ObsConfig> {
         "obs",
         &[
             "host", "port", "password", "start_replay_buffer", "paused_use_breath",
-            "match_canvas_to_display", "capture_display", "colors",
+            "match_canvas_to_display", "capture_display", "show_capture_status", "colors",
         ],
     );
     let host = table
@@ -624,6 +633,13 @@ fn parse_obs_section(table: &toml::value::Table) -> Result<ObsConfig> {
         }
     };
 
+    let show_capture_status = match table.get("show_capture_status") {
+        None => false,
+        Some(v) => v
+            .as_bool()
+            .context("[obs] \"show_capture_status\" must be a boolean")?,
+    };
+
     let colors = match table.get("colors") {
         None => ObsColors::default(),
         Some(toml::Value::Table(t)) => parse_obs_colors(t)?,
@@ -638,6 +654,7 @@ fn parse_obs_section(table: &toml::value::Table) -> Result<ObsConfig> {
         paused_use_breath,
         match_canvas_to_display,
         capture_display,
+        show_capture_status,
         colors,
     })
 }
@@ -660,7 +677,8 @@ fn parse_obs_colors(table: &toml::value::Table) -> Result<ObsColors> {
         "obs.colors",
         &[
             "recording", "recording_paused", "success_flash", "error_flash",
-            "flash_duration_ms", "idle_panel", "replay_active", "replay_inactive",
+            "flash_duration_ms", "idle", "idle_not_capturing",
+            "replay_active", "replay_inactive",
         ],
     );
     let defaults = ObsColors::default();
@@ -670,7 +688,12 @@ fn parse_obs_colors(table: &toml::value::Table) -> Result<ObsColors> {
         success_flash: parse_obs_color(table, "success_flash", defaults.success_flash)?,
         error_flash: parse_obs_color(table, "error_flash", defaults.error_flash)?,
         flash_duration_ms: parse_flash_duration(table, defaults.flash_duration_ms)?,
-        idle_panel: parse_obs_color(table, "idle_panel", defaults.idle_panel)?,
+        idle: parse_obs_color(table, "idle", defaults.idle)?,
+        idle_not_capturing: parse_obs_color(
+            table,
+            "idle_not_capturing",
+            defaults.idle_not_capturing,
+        )?,
     })
 }
 
@@ -1460,18 +1483,44 @@ mod tests {
     }
 
     #[test]
-    fn test_obs_idle_panel_color() {
+    fn test_obs_idle_color() {
         let config = parse_config(
             r##"
             [obs]
 
             [obs.colors]
-            idle_panel = "#101020"
+            idle = "#101020"
             "##,
         )
         .unwrap();
         let colors = config.obs.unwrap().colors;
-        assert_eq!(colors.idle_panel, RgbColor { r: 0x10, g: 0x10, b: 0x20 });
+        assert_eq!(colors.idle, RgbColor { r: 0x10, g: 0x10, b: 0x20 });
+    }
+
+    #[test]
+    fn test_obs_show_capture_status() {
+        let obs = parse_config("[obs]\nshow_capture_status = true\n")
+            .unwrap()
+            .obs
+            .unwrap();
+        assert!(obs.show_capture_status);
+        // Default: off.
+        assert!(!parse_config("[obs]\n").unwrap().obs.unwrap().show_capture_status);
+    }
+
+    #[test]
+    fn test_obs_idle_not_capturing_color() {
+        // Set → parsed value.
+        let colors = parse_config("[obs]\n[obs.colors]\nidle_not_capturing = \"#402000\"\n")
+            .unwrap()
+            .obs
+            .unwrap()
+            .colors;
+        assert_eq!(colors.idle_not_capturing, RgbColor { r: 0x40, g: 0x20, b: 0x00 });
+
+        // Unset → default off/black.
+        let colors = parse_config("[obs]\n").unwrap().obs.unwrap().colors;
+        assert_eq!(colors.idle_not_capturing, RgbColor { r: 0, g: 0, b: 0 });
     }
 
     #[test]

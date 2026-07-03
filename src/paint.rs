@@ -100,7 +100,7 @@ pub fn apply_rgb(panel: &PcPanelPro, mode: RgbMode, logo_override: Option<RgbCol
 ///      when the active mode leaves the logo independently writable.
 ///   3. Panel color (so an unconfigured logo blends in).
 ///
-/// The panel (knobs/sliders/labels) follows OBS state: `idle_panel` when
+/// The panel (knobs/sliders/labels) follows OBS state: `idle` when
 /// connected-idle, `recording` while recording, `paused` while paused, the
 /// `[rgb]` mode when OBS is disconnected.
 ///
@@ -121,8 +121,14 @@ pub fn paint_leds(panel: &PcPanelPro, obs: &ObsRuntime, idle_rgb: Option<RgbMode
     }
     match obs.state() {
         ObsState::Idle if obs.connected() => {
-            paint_panel_solid(panel, colors.idle_panel)?;
-            paint_logo_with_indicator(panel, obs, colors.idle_panel)?;
+            // Distinct color while connected but capturing nothing.
+            let idle = if obs.capturing() {
+                colors.idle
+            } else {
+                colors.idle_not_capturing
+            };
+            paint_panel_solid(panel, idle)?;
+            paint_logo_with_indicator(panel, obs, idle)?;
         }
         ObsState::Idle => {
             // Only pass the indicator color through when the active mode

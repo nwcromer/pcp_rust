@@ -335,8 +335,9 @@ impl AudioController {
     /// `None` for any non-null callback pointer, so `cancel()`'s drop
     /// branch never runs for our use cases. The boxed FnMut therefore
     /// leaks on each wait-deadline trip — bounded by how often PA
-    /// actually fails, so small in practice. Fixed properly by
-    /// patching upstream libpulse-binding.
+    /// actually fails, so small in practice. Our fork patch
+    /// (`fix-ext-stream-restore-write`) does not fix this inversion, so
+    /// the leak is still present.
     fn pa_write_with_result<R>(&self, register: R) -> Result<bool>
     where
         R: FnOnce(Rc<RefCell<Option<bool>>>) -> Option<Operation<dyn FnMut(bool) + 'static>>,
