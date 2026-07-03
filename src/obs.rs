@@ -239,17 +239,32 @@ async fn run_session(
     tokio::pin!(events);
 
     // Publish initial recording state so the LEDs reflect reality immediately
-    // after connection (without waiting for the first event).
-    if let Ok(status) = client.recording().status().await {
-        if status.active {
-            if status.paused {
-                let _ = event_tx.send(ObsEvent::RecordingPaused).await;
-            } else {
-                let _ = event_tx.send(ObsEvent::RecordingActive).await;
-            }
-        } else {
-            let _ = event_tx.send(ObsEvent::RecordingStopped).await;
+    // after connection. OBS only emits RecordStateChanged on transitions, so a
+    // failed seed while OBS is already recording strands the LEDs at idle for
+    // the whole session — retry, then warn so it's not a silent drop.
+    let mut status = client.recording().status().await;
+    for _ in 0..2 {
+        if status.is_ok() {
+            break;
         }
+        status = client.recording().status().await;
+    }
+    match status {
+        Ok(status) => {
+            if status.active {
+                if status.paused {
+                    let _ = event_tx.send(ObsEvent::RecordingPaused).await;
+                } else {
+                    let _ = event_tx.send(ObsEvent::RecordingActive).await;
+                }
+            } else {
+                let _ = event_tx.send(ObsEvent::RecordingStopped).await;
+            }
+        }
+        Err(e) => warn!(
+            "OBS: failed to seed recording status; LEDs may show idle until the \
+             next record event: {e}"
+        ),
     }
 
     // Determine the replay-buffer state and optionally start it. Runs on EVERY
