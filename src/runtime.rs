@@ -1,7 +1,6 @@
-//! Runtime state owned by the main thread: the OBS connection, recording
-//! state, flash overlay, and the cached mic-mute state used by the logo
-//! indicator. Pure state and event-application logic — LED writes live in
-//! `paint`, configuration types in `config`.
+//! Runtime state owned by the main thread — OBS connection, recording state,
+//! flash overlay, cached mic-mute. Pure state + event-application; LED writes
+//! live in `paint`, config types in `config`.
 
 use std::time::{Duration, Instant};
 
@@ -20,17 +19,14 @@ pub enum ObsState {
 /// Total on+off period for blinking flashes. Half is "on", half is "off".
 const BLINK_CYCLE: Duration = Duration::from_millis(200);
 
-/// How fresh a successful mic-mute confirmation must be before we trust
-/// the cached `mic_muted` value. After this threshold, the logo flips to
-/// the "unknown" indicator (blinking warning color) so the user knows
-/// the cache may not match the device. 4 poll intervals — a single
-/// transient PA hiccup won't trigger the warning, but a sustained outage
-/// will within ~1 second.
+/// How fresh a mic-mute confirmation must be to trust the cached `mic_muted`.
+/// Past this, the logo shows the blinking "unknown" indicator so the user knows
+/// the cache may not match the device. 4 poll intervals: a transient PA hiccup
+/// won't trip the warning, a sustained outage will within ~1s.
 const MIC_STALE_THRESHOLD: Duration = Duration::from_millis(1000);
 
-/// On+off period for the mic-unknown blink. Half is "on" (mic_unknown
-/// color), half is "off". 500 ms total is attention-grabbing without
-/// being seizure-inducing.
+/// On+off period for the mic-unknown blink (half on, half off). 500 ms is
+/// attention-grabbing without being seizure-inducing.
 const MIC_UNKNOWN_BLINK_CYCLE: Duration = Duration::from_millis(500);
 
 #[derive(Debug, Clone, Copy)]
@@ -69,11 +65,9 @@ impl Flash {
         }
     }
 
-    /// The color to display right now. For solid flashes this just returns
-    /// `self.color`. For blinking flashes it reads `Instant::now()` and
-    /// returns either `self.color` or black depending on the current phase
-    /// of the blink cycle — so the return value is *not* pure: two calls
-    /// across a phase boundary will yield different results.
+    /// The color to display right now. Solid flashes return `self.color`; blinking
+    /// flashes read `Instant::now()` and return `self.color` or black by phase — so
+    /// this is *not* pure: two calls across a phase boundary differ.
     pub fn current_color(&self) -> RgbColor {
         self.current_color_at(Instant::now())
     }
@@ -93,10 +87,8 @@ impl Flash {
     }
 }
 
-/// All OBS-related state owned by the main thread: the handle to the OBS
-/// thread, the connection flag, the current recording state, the configured
-/// colors, and any active flash overlay. Bundling them keeps the main loop
-/// and `handle_panel_event` from threading a long parameter list, and lets
+/// All OBS-related state owned by the main thread. Bundling it keeps the main
+/// loop and `handle_panel_event` from threading a long parameter list, and lets
 /// `dispatch`/`drain_events` operate over a single self.
 pub struct ObsRuntime {
     handle: Option<ObsHandle>,
@@ -104,37 +96,30 @@ pub struct ObsRuntime {
     state: ObsState,
     colors: ObsColors,
     flash: Option<Flash>,
-    /// Whether OBS's replay buffer is currently running. `None` until OBS
-    /// reports its state (during initial-status query on connect or via an
-    /// event). Reset to `None` on disconnect.
+    /// Whether OBS's replay buffer is running. `None` until OBS reports it (initial
+    /// status query on connect, or an event); reset to `None` on disconnect.
     replay_buffer_active: Option<bool>,
-    /// Pulled from `ObsConfig.paused_use_breath`. When true, paused state
-    /// renders as a global breath animation that drives every LED including
-    /// the logo (so any configured logo indicator is unavailable while
-    /// paused). When false, paused is a solid panel color and the logo
-    /// continues to show whatever the configured indicator says.
+    /// From `ObsConfig.paused_use_breath`. True: paused renders as a global breath
+    /// driving every LED including the logo (so the logo indicator is unavailable
+    /// while paused). False: paused is a solid panel color and the logo indicator
+    /// still shows.
     paused_use_breath: bool,
-    /// Current default-microphone mute state. Tracked here (rather than
-    /// queried fresh at paint time) so it persists across paints and so
-    /// changes can mark the LEDs dirty for a repaint.
+    /// Current default-mic mute state. Cached here rather than queried at paint
+    /// time so it persists across paints and changes can mark the LEDs dirty.
     mic_muted: bool,
-    /// Instant of the last successful mic-mute confirmation from PA. None
-    /// at startup before the first seed. If older than MIC_STALE_THRESHOLD,
-    /// `logo_indicator_color` returns the unknown-state color instead of
-    /// trusting the cached `mic_muted`.
+    /// Instant of the last successful mic-mute confirmation from PA; None before
+    /// the first seed. Older than MIC_STALE_THRESHOLD → `logo_indicator_color`
+    /// returns the unknown color instead of trusting `mic_muted`.
     mic_confirmed_at: Option<Instant>,
-    /// Reference instant for computing blink phase. Set once at
-    /// construction; stable across the runtime's lifetime so blink phases
-    /// are continuous.
+    /// Reference instant for blink phase. Set once at construction and stable for
+    /// the runtime's life so blink phases are continuous.
     created_at: Instant,
-    /// Which logo indicator is active and the colors for each state.
-    /// `LogoIndicator::None` (the default) means the logo just matches the
-    /// panel color.
+    /// Which logo indicator is active and the per-state colors. `LogoIndicator::None`
+    /// (the default) means the logo just matches the panel color.
     logo_cfg: LogoConfig,
-    /// Whether OBS is currently capturing, per the capture-liveness poll. Only
-    /// updated when `show_capture_status` is on, and only read for the idle
-    /// panel color. Defaults to true so we don't show the not-capturing color
-    /// before the first poll.
+    /// Whether OBS is capturing, per the capture-liveness poll. Updated only when
+    /// `show_capture_status` is on, read only for the idle panel color. Defaults to
+    /// true so we don't flash the not-capturing color before the first poll.
     capturing: bool,
 }
 
@@ -161,10 +146,9 @@ impl ObsRuntime {
         }
     }
 
-    // ---- Field accessors. paint.rs and main.rs read these via methods so
-    // ---- the field-level invariants enforced by apply_event (e.g. "if
-    // ---- !connected then replay_buffer_active is None") can't be
-    // ---- accidentally violated by a stray direct write.
+    // ---- Field accessors. paint.rs/main.rs read via methods so the invariants
+    // ---- apply_event enforces (e.g. !connected → replay_buffer_active is None)
+    // ---- can't be violated by a stray direct write.
 
     pub fn connected(&self) -> bool {
         self.connected
@@ -190,24 +174,20 @@ impl ObsRuntime {
         self.capturing
     }
 
-    /// Record a confirmed mic-mute state from PA. Updates the cached
-    /// `mic_muted` AND bumps `mic_confirmed_at` so the logo trusts the
-    /// value for the next MIC_STALE_THRESHOLD window. The staleness clock is
-    /// reset only on actual PA confirmations. Used directly for the startup
-    /// seed and the post-resume refresh, where dirty-tracking is handled by
-    /// the caller; the button and poll paths go through `update_mic_muted`.
+    /// Record a confirmed mic-mute state from PA: sets `mic_muted` and bumps
+    /// `mic_confirmed_at` so the logo trusts it for the next MIC_STALE_THRESHOLD
+    /// window (staleness resets only on real confirmations). Startup seed and
+    /// post-resume refresh call this directly; button/poll paths use `update_mic_muted`.
     pub fn set_mic_muted(&mut self, muted: bool) {
         self.mic_muted = muted;
         self.mic_confirmed_at = Some(Instant::now());
     }
 
     /// Record a confirmed mic-mute state and report whether the logo needs a
-    /// repaint as a result. A repaint is needed if the value changed OR if we
-    /// were in the stale "unknown" state (so recovering from a PA outage stops
-    /// the blink even when the value is unchanged). No-op returning `false`
-    /// when the mic indicator isn't selected — nothing reads `mic_muted` then,
-    /// so there's no reason to touch the state or the staleness clock. This is
-    /// the single home for the button and poll paths' dirty rule.
+    /// repaint: true if the value changed OR we were in the stale "unknown" state
+    /// (so recovering from a PA outage stops the blink even when unchanged). No-op
+    /// `false` when the mic indicator isn't selected — nothing reads `mic_muted`
+    /// then. The single home for the button/poll dirty rule.
     pub fn update_mic_muted(&mut self, muted: bool) -> bool {
         if !self.mic_indicator_enabled() {
             return false;
@@ -217,11 +197,8 @@ impl ObsRuntime {
         dirty
     }
 
-    /// True if the cached `mic_muted` is older than MIC_STALE_THRESHOLD
-    /// (or has never been confirmed). When stale, the logo flashes the
-    /// `mic_unknown` color to signal that the cache may not match the
-    /// device — the user should treat the mic as possibly unmuted until
-    /// PA recovers and the indicator returns to red/green.
+    /// True if the cached `mic_muted` is older than MIC_STALE_THRESHOLD, or was
+    /// never confirmed. Stale drives the logo's blinking `mic_unknown` warning.
     fn mic_is_stale(&self) -> bool {
         match self.mic_confirmed_at {
             None => true,
@@ -229,26 +206,22 @@ impl ObsRuntime {
         }
     }
 
-    /// Phase of a free-running blink with the given cycle. Returns true
-    /// for the "on" half, false for the "off" half. Driven from
-    /// `created_at` so the blink is continuous across the runtime's life.
+    /// Phase of a free-running blink of the given cycle: true on the "on" half.
+    /// Driven from `created_at` so the blink is continuous across the runtime's life.
     fn blink_phase(&self, cycle: Duration) -> bool {
         let elapsed_ms = self.created_at.elapsed().as_millis();
         let half = (cycle.as_millis() / 2).max(1);
         (elapsed_ms / half).is_multiple_of(2)
     }
 
-    /// True if the mic indicator is selected AND the cached state is
-    /// stale. The main loop checks this to drive continuous repaints
-    /// during the blink (each main-loop iteration renders the current
-    /// phase of the blink cycle).
+    /// True if the mic indicator is selected and its state is stale. The main loop
+    /// checks this to drive continuous repaints so the blink phases render.
     pub fn mic_indicator_needs_repaint(&self) -> bool {
         self.mic_indicator_enabled() && self.mic_is_stale()
     }
 
-    /// The color the configured logo indicator wants right now, or `None`
-    /// if no indicator is selected or the indicator has nothing useful to
-    /// show (e.g. replay indicator with OBS disconnected).
+    /// The color the configured logo indicator wants now, or `None` if no indicator
+    /// is selected or it has nothing to show (e.g. replay with OBS disconnected).
     pub fn logo_indicator_color(&self) -> Option<RgbColor> {
         match self.logo_cfg.indicator {
             LogoIndicator::None => None,
@@ -310,10 +283,9 @@ impl ObsRuntime {
     pub fn apply_event(&mut self, event: ObsEvent) -> bool {
         match event {
             ObsEvent::Connected => {
-                // Dirty only on the actual transition. The first Connected
-                // event flips us out of `[rgb]` and into the OBS-connected
-                // appearance; a redundant Connected (shouldn't happen, but
-                // defensive) is a no-op.
+                // Dirty only on the real transition: the first Connected flips us
+                // out of `[rgb]` into the OBS-connected look. A redundant one is a
+                // defensive no-op.
                 let was_disconnected = !self.connected;
                 self.connected = true;
                 was_disconnected
@@ -334,9 +306,8 @@ impl ObsRuntime {
                 // Assume capturing on the next connect until the poll says
                 // otherwise, so a reconnect doesn't briefly show stale state.
                 self.capturing = true;
-                // Disconnected behaves visually like Idle. Also force a
-                // repaint so we switch back to `[rgb]` mode from the
-                // OBS-connected-idle appearance.
+                // Disconnected looks like Idle, but force a repaint anyway to switch
+                // back to `[rgb]` from the OBS-connected-idle appearance.
                 let _ = self.transition_to(ObsState::Idle);
                 true
             }
@@ -352,11 +323,9 @@ impl ObsRuntime {
             ObsEvent::RecordingStopped => self.transition_to(ObsState::Idle),
             ObsEvent::CommandSucceeded(cmd) => {
                 info!("OBS: {} succeeded", cmd.label());
-                // Skip the success flash for commands whose effect is
-                // already visible on the LEDs via a state change.
-                // Save Replay and Split Recording cause no visible state
-                // change, so they still get the flash as the only
-                // acknowledgement.
+                // Skip the success flash for commands whose effect already shows on
+                // the LEDs via a state change. Save Replay and Split Recording change
+                // no visible state, so they keep the flash as their only acknowledgement.
                 let visibly_changes_state = matches!(
                     cmd,
                     ObsCommand::ToggleRecording | ObsCommand::PauseRecording
@@ -409,15 +378,13 @@ impl ObsRuntime {
         ));
     }
 
-    /// Clear any expired flash. Returns `true` if a flash just expired OR if a
-    /// blinking flash is active (we keep repainting so the on/off phases render,
-    /// at one extra LED write per main-loop iteration for the flash duration).
+    /// Clear any expired flash. Returns `true` if a flash just expired OR a blinking
+    /// flash is active (we keep repainting so the on/off phases render, one extra
+    /// LED write per loop iteration for the flash duration).
     ///
-    /// That means some redundant paints: the loop runs ~10 Hz (paced by
-    /// read_event's 100ms HID timeout) while the blink flips every 100ms, so up
-    /// to half the paints during a blink rewrite the same color. Not worth
-    /// tracking last-painted-phase to skip — the default 500ms flash is ~5
-    /// paints, each microseconds of HID traffic.
+    /// Some of those paints are redundant — the loop runs ~10 Hz while the blink
+    /// flips every 100ms — but not worth tracking last-painted-phase: the default
+    /// 500ms flash is ~5 paints, each microseconds of HID traffic.
     pub fn expire_flash(&mut self) -> bool {
         match self.flash {
             Some(f) if Instant::now() >= f.expires_at => {
@@ -435,16 +402,15 @@ impl ObsRuntime {
         if verbose {
             println!("OBS: {}", cmd.label());
         }
-        // Use try_send on the bounded channel: in normal operation the OBS
-        // thread keeps the queue near-empty, so a Full result would indicate
-        // the OBS thread is wedged. Either Full or Closed gets treated as
-        // "OBS unreachable" and surfaces an error flash.
+        // try_send on the bounded channel: the OBS thread keeps the queue
+        // near-empty, so Full means it's wedged. Both Full and Closed are
+        // treated as "OBS unreachable" and surface an error flash.
         let send_result = match &self.handle {
             Some(h) if self.connected => h.commands_tx.try_send(cmd),
             _ => {
-                // Either no [obs] in config (config validation rejects OBS
-                // actions when [obs] is absent, so this is normally only
-                // hit when OBS is disconnected) or the thread is gone.
+                // No [obs] in config (validation rejects OBS actions when absent,
+                // so this is normally only hit when OBS is disconnected) or the
+                // thread is gone.
                 warn!("OBS not connected — {} skipped", cmd.label());
                 self.set_error_flash();
                 return true;
@@ -603,10 +569,8 @@ mod tests {
 
     #[test]
     fn logo_indicator_mic_unconfirmed_returns_unknown_or_off() {
-        // Fresh runtime → mic_confirmed_at is None → stale → blink between
-        // mic_unknown color and off. Color depends on the blink phase
-        // (driven by Instant::now() vs created_at), so we just assert it's
-        // one of the two valid stale-state colors.
+        // Fresh runtime → mic_confirmed_at None → stale → blinks between mic_unknown
+        // and off. The phase depends on Instant::now(), so assert it's one of the two.
         let cfg = LogoConfig {
             indicator: LogoIndicator::Mic,
             ..Default::default()

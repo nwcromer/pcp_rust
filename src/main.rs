@@ -91,11 +91,10 @@ fn list_apps() -> Result<()> {
     for app in &apps {
         let pid = app.pid.as_deref().unwrap_or("?");
 
-        // Try to find a useful extra identifier: binary name or /proc/comm.
-        // Review-accepted: this /proc/comm read duplicates audio.rs
-        // `comm_for_pid`, deliberately — this cold path keeps original case and
-        // skips the hot-path lower-case/memoize, so a shared helper would be
-        // net worse. See the matching note in `comm_for_pid`.
+        // Try a useful extra identifier: binary name or /proc/comm.
+        // Review-accepted: duplicates audio.rs `comm_for_pid` deliberately — this
+        // cold path keeps original case and skips the hot-path lowercase/memoize,
+        // so a shared helper would be net worse. See the note in `comm_for_pid`.
         let extra = app
             .binary
             .as_deref()
@@ -143,11 +142,10 @@ fn spawn_resume_monitor() -> mpsc::Receiver<()> {
             }
         };
 
-        // The pinned sender/interface/member are hardcoded valid D-Bus
-        // identifiers, so these builder calls can't realistically fail; the
-        // error arms are a defensive catch. If one ever did fail, resume
-        // detection silently disables until restart — acceptable for the
-        // spoof-defense the sender pin buys.
+        // The pinned sender/interface/member are hardcoded valid D-Bus identifiers,
+        // so these builder calls can't realistically fail — the error arms are a
+        // defensive catch. If one did, resume detection silently disables until
+        // restart, acceptable for the spoof-defense the sender pin buys.
         let rule = match MatchRule::builder()
             .msg_type(zbus::message::Type::Signal)
             .sender("org.freedesktop.login1")
@@ -188,9 +186,8 @@ fn spawn_resume_monitor() -> mpsc::Receiver<()> {
 }
 
 /// Query PA for the current mic-mute state and update `obs.mic_muted`.
-/// Returns `true` if the query succeeded (caller may want to bump the
-/// poll-cadence timer). On PA error, leaves the field unchanged, logs at
-/// warn level, and returns `false`.
+/// Returns whether the query succeeded (caller may bump its poll timer). On
+/// PA error, leaves the field unchanged, logs at warn, and returns `false`.
 fn refresh_mic_muted(audio: &audio::AudioController, obs: &mut ObsRuntime) -> bool {
     match audio.is_mic_muted() {
         Ok(muted) => {
@@ -205,18 +202,16 @@ fn refresh_mic_muted(audio: &audio::AudioController, obs: &mut ObsRuntime) -> bo
 }
 
 /// Periodic poll of the default mic's mute state so external changes (system
-/// hotkeys, KDE tray, other tools) show up on the logo. Owns its cadence
-/// timer and the consecutive-failure counter, so the main loop just calls
-/// `tick` and reads the returned dirty flag.
+/// hotkeys, KDE tray, other tools) show up on the logo. Owns its cadence timer
+/// and failure counter, so the main loop just calls `tick` and reads the flag.
 struct MicPoller {
     /// `None` = never polled, so the first `tick` polls immediately — a failed
     /// startup seed (PA still booting) doesn't leave a stale value visible for
     /// up to one interval.
     ///
-    /// Review-accepted: this makes the first `tick` redundant with `run()`'s
-    /// startup seed. Deliberate — deferring it (seeding `last_poll`) would
-    /// reopen the stale-value window whenever the seed fails. One extra query
-    /// once is the cheaper trade.
+    /// Review-accepted: this duplicates `run()`'s startup seed. Deliberate —
+    /// deferring it (seeding `last_poll`) would reopen the stale-value window
+    /// whenever the seed fails; one extra query once is the cheaper trade.
     last_poll: Option<Instant>,
     /// Consecutive failed polls. Used to warn once at the start of an outage
     /// and report the recovery duration when it clears. Reset to 0 on success.
@@ -243,17 +238,15 @@ impl MicPoller {
             Ok(muted) => {
                 if self.failures > 0 {
                     // Approximate outage duration. Duration's Debug formatter
-                    // picks an appropriate unit (250ms, 1s, 1.25s, etc.) —
-                    // better than an integer second count that truncates short
-                    // outages to 0.
+                    // picks an appropriate unit (250ms, 1.25s) — better than an
+                    // integer second count that truncates short outages to 0.
                     let outage = Self::INTERVAL * self.failures;
                     info!("audio: mic-mute poll recovered after ~{outage:?}");
                     self.failures = 0;
                 }
                 // Always record on a successful poll — even when unchanged — so
                 // mic_confirmed_at stays fresh and the logo leaves the "unknown"
-                // stale state. update_mic_muted reports whether a repaint is
-                // needed (value changed, or we just recovered).
+                // state. update_mic_muted returns whether a repaint is needed.
                 obs.update_mic_muted(muted)
             }
             Err(e) => {
@@ -268,8 +261,7 @@ impl MicPoller {
 
     /// Force an immediate re-poll (used on resume, so a mic toggle during
     /// suspend is reflected without waiting for the cadence). Resets the timer
-    /// only on a successful query, so a not-yet-ready PA gets retried on the
-    /// next loop iteration instead of waiting a full INTERVAL.
+    /// only on success, so a not-yet-ready PA retries next loop, not next INTERVAL.
     fn refresh_now(&mut self, audio: &audio::AudioController, obs: &mut ObsRuntime) {
         if obs.mic_indicator_enabled() && refresh_mic_muted(audio, obs) {
             self.last_poll = Some(Instant::now());
@@ -278,31 +270,26 @@ impl MicPoller {
 }
 
 /// Re-establishes the PulseAudio connection after the server drops (PA/
-/// PipeWire restart, suspend/resume). Unlike the HID reconnect — which blocks
-/// the loop because there's nothing to do without a panel — this is
-/// non-blocking and throttled: PA being down must not freeze HID input, OBS
-/// LED updates, or flashes, so we attempt at most one reconnect per backoff
-/// interval and let the loop keep running in between.
+/// PipeWire restart, suspend/resume). Non-blocking and throttled, unlike the
+/// blocking HID reconnect: PA being down must not freeze HID input, OBS
+/// updates, or flashes, so it attempts one reconnect per backoff interval.
 ///
-/// Detection is on-demand: `audio.is_connected()` reads the state cached from
-/// the last mainloop iteration, so an outage with no audio activity at all
-/// (mic indicator off, no slider movement) isn't noticed until the next op
-/// fails — after which this reconnects. Worst case is one lost action, versus
-/// today's "broken until the daemon is restarted."
+/// Detection is on-demand: `audio.is_connected()` reads state cached from the
+/// last mainloop iteration, so an outage with no audio activity (mic indicator
+/// off, no slider movement) isn't noticed until the next op fails — then this
+/// reconnects. Worst case one lost action, versus "broken until daemon restart."
 struct AudioReconnector {
     /// Earliest instant of the next reconnect attempt. `None` means "attempt
-    /// now if disconnected" (no attempt is pending). Set after a failed
-    /// attempt to space out retries.
+    /// now if disconnected"; set after a failed attempt to space out retries.
     next_attempt: Option<Instant>,
     backoff: Duration,
 }
 
 impl AudioReconnector {
     const INITIAL_BACKOFF: Duration = Duration::from_secs(2);
-    // Capped low (5s, vs the HID reconnect's 30s) so that when PA returns after
-    // a long outage the panel notices and re-seeds within ~5s rather than up to
-    // 30s. Each extra attempt against a still-dead server is a cheap fast `Err`,
-    // so the tighter ceiling costs little.
+    // Capped low (5s vs the HID reconnect's 30s) so PA returning after a long
+    // outage is noticed and re-seeded within ~5s. Each retry against a dead
+    // server is a cheap fast `Err`, so the tight ceiling costs little.
     const MAX_BACKOFF: Duration = Duration::from_secs(5);
 
     fn new() -> Self {
@@ -345,14 +332,13 @@ impl AudioReconnector {
 
 
 /// Re-open the PCPanel after a read error (USB unplug / hub power-cycle /
-/// suspend), retrying forever with exponential backoff. Blocks the main loop
-/// while it runs — there's no panel to service until it returns, so OBS/mic
-/// updates simply pause (and resume on the next iteration once a panel is
-/// back). Mirrors the OBS reconnect backoff in `obs.rs`.
+/// suspend), retrying forever with exponential backoff. Blocks the main loop —
+/// there's no panel to service until it returns, so OBS/mic updates pause and
+/// resume once a panel is back. Mirrors the OBS reconnect backoff in `obs.rs`.
 ///
-/// The backoff sleep runs before every attempt, including the first, so even a
-/// device that accepts open() but immediately fails the next read can't spin
-/// the loop — the worst case is a 2s-paced retry, never a busy wait.
+/// The backoff sleep runs before every attempt, including the first, so a
+/// device that accepts open() but fails the next read can't spin the loop —
+/// worst case a 2s-paced retry, never a busy wait.
 fn reconnect_panel() -> PcPanelPro {
     const INITIAL_BACKOFF: Duration = Duration::from_secs(2);
     const MAX_BACKOFF: Duration = Duration::from_secs(30);
@@ -397,25 +383,22 @@ fn run(cli: Cli) -> Result<()> {
     info!("connecting to PCPanel Pro...");
     let mut panel = PcPanelPro::open()?;
 
-    // Log the configured [rgb] mode (or warn if omitted). The actual initial
-    // LED write happens via paint_leds below — doing it here too would
-    // restart firmware animations (rainbow/wave/breath) on the second write.
+    // Log the [rgb] mode (or warn if omitted). The actual LED write happens via
+    // paint_leds below — a second write here would restart firmware animations.
     match config.rgb {
         Some(rgb_mode) => log_rgb_mode(rgb_mode),
         None => warn!("no [rgb] section in config; LEDs will be off"),
     }
 
     // Spawn the OBS background thread if [obs] is configured. spawn_obs_thread
-    // itself returns Option (None if the thread can't be spawned), so we
-    // .and_then to flatten Option<Option<_>>.
+    // returns Option (None if it can't spawn), so .and_then flattens Option<Option<_>>.
     let obs_handle: Option<ObsHandle> = config
         .obs
         .as_ref()
         .and_then(|cfg| obs::spawn_obs_thread(cfg.clone()));
-    // ObsColors is always present so `paint_leds` and `ObsRuntime` have a
-    // value to read. When [obs] is absent, no OBS events fire and no OBS
-    // button dispatches happen, so the defaulted struct is never actually
-    // consulted — it just keeps the types simple.
+    // ObsColors is always present so `paint_leds` and `ObsRuntime` have a value
+    // to read. When [obs] is absent, no OBS events or dispatches happen, so the
+    // defaulted struct is never consulted — it just keeps the types simple.
     let obs_colors: ObsColors = config
         .obs
         .as_ref()
@@ -428,17 +411,15 @@ fn run(cli: Cli) -> Result<()> {
         .unwrap_or(false);
     let mut obs = ObsRuntime::new(obs_handle, obs_colors, paused_use_breath, config.logo);
 
-    // Seed initial mic-mute state so the first paint reflects reality
-    // instead of the `false` default. A PA failure here is non-fatal —
-    // we'll just start with mic_muted=false and pick up the real state
-    // on the next poll.
+    // Seed initial mic-mute state so the first paint reflects reality, not the
+    // `false` default. A PA failure here is non-fatal — we start with
+    // mic_muted=false and pick up the real state on the next poll.
     if obs.mic_indicator_enabled() {
         refresh_mic_muted(&audio, &mut obs);
     }
 
-    // Initial LED write. paint_leds handles the disconnected-idle case
-    // (apply_rgb for the [rgb] mode, or solid black if no [rgb]) plus the
-    // mic-indicator override when seeded mic_muted is true.
+    // Initial LED write. paint_leds handles the disconnected-idle case (the
+    // [rgb] mode or solid black if none) plus the mic-indicator override.
     if let Err(e) = paint_leds(&panel, &obs, config.rgb) {
         warn!("initial LED paint failed: {e}");
     }
@@ -446,36 +427,31 @@ fn run(cli: Cli) -> Result<()> {
     // Monitor for system resume to re-apply LED state
     let resume_rx = spawn_resume_monitor();
 
-    // Poll mic-mute state periodically so external mute changes (system
-    // hotkeys, KDE's tray, other tools) are reflected on the logo. Button
-    // presses bypass the cadence by updating the cached state directly.
+    // Poll mic-mute state periodically so external mute changes (system hotkeys,
+    // KDE tray, other tools) reflect on the logo. Button presses bypass the cadence.
     let mut mic_poller = MicPoller::new();
 
     // Re-establish the PulseAudio connection if the server drops (PA/PipeWire
-    // restart, suspend/resume) instead of failing every audio call until the
-    // daemon is restarted.
+    // restart, suspend/resume) instead of failing every audio call until restart.
     let mut audio_reconnect = AudioReconnector::new();
 
     info!("listening for events (Ctrl+C to quit)...");
     loop {
         let mut led_dirty = obs.drain_events();
         led_dirty |= obs.expire_flash();
-        // While the mic indicator is "unknown", force a repaint each iteration
-        // so the logo's blink renders (the blink phase is time-driven in
-        // runtime, so keeping led_dirty true is enough). Gate on
-        // logo_indicator_visible: if a flash owns the panel or a global
-        // animation owns the logo, a forced repaint would only restart that
-        // animation without rendering any blink. Recovery/state-change repaints
-        // still come from the poll/resume paths below, so skipping the
-        // blink-only repaint here can't strand a stale frame.
+        // While the mic indicator is "unknown", force a repaint each iteration so
+        // the logo's blink renders (the blink phase is time-driven, so keeping
+        // led_dirty true suffices). Gate on logo_indicator_visible: if a flash or
+        // global animation owns the logo, a forced repaint would only restart it
+        // without rendering the blink. State-change repaints still come from the
+        // poll/resume paths, so skipping here can't strand a stale frame.
         //
         // Review-accepted: each forced repaint rewrites all four LED regions
-        // though only the logo changes during the blink — 4 USB writes ~10x/sec
-        // where 1 would do. Left as-is: bounded to the PA-outage duration (250ms
-        // polling keeps the indicator fresh otherwise), each write is
-        // microseconds of HID traffic, and it mirrors expire_flash's accepted
-        // per-iteration repaint (runtime.rs). A logo-only path would add
-        // dirty-region state to paint_leds for no user-visible gain.
+        // though only the logo blinks — 4 USB writes ~10x/sec where 1 would do.
+        // Left as-is: bounded to the PA-outage duration (250ms polling keeps the
+        // indicator fresh otherwise), each write is microseconds of HID traffic,
+        // and it mirrors expire_flash's accepted per-iteration repaint. A
+        // logo-only path would add dirty-region state to paint_leds for no gain.
         led_dirty |= obs.mic_indicator_needs_repaint()
             && paint::logo_indicator_visible(&obs, config.rgb);
 
@@ -487,9 +463,8 @@ fn run(cli: Cli) -> Result<()> {
             led_dirty = true;
         }
 
-        // Reconnect PulseAudio if it dropped. On a fresh reconnect, re-seed
-        // the mic state and repaint so the logo doesn't linger on the stale
-        // "unknown" blink it fell into during the outage.
+        // Reconnect PulseAudio if it dropped. On a fresh reconnect, re-seed mic
+        // state and repaint so the logo doesn't linger on the stale "unknown" blink.
         // Review-accepted: tick() can block this loop up to CONNECT_DEADLINE
         // (~3s) per attempt, delaying HID — but only while PA is down.
         if audio_reconnect.tick(&mut audio) {
@@ -499,22 +474,19 @@ fn run(cli: Cli) -> Result<()> {
 
         led_dirty |= mic_poller.tick(&audio, &mut obs);
 
-        // Flush any deferred stream-restore persistence writes that have
-        // been idle long enough. Coalesces slider-scrub bursts into a
-        // single DB write per app.
+        // Flush any deferred stream-restore persistence writes idle long enough.
+        // Coalesces slider-scrub bursts into a single DB write per app.
         audio.flush_persist_writes();
 
         // Read a panel event (may block ~100ms). Process before painting so
-        // any button-triggered state changes (e.g., a local error flash from
-        // a dispatch when OBS is disconnected) get painted this iteration.
+        // button-triggered state changes get painted this same iteration.
         //
         // A read error means the HID device went away (USB unplug, hub
-        // power-cycle, suspend transition). Rather than propagate it and let
-        // systemd respawn us — losing OBS/PA state and any in-flight flash —
-        // reconnect in place with backoff. PcPanelPro::open() re-runs init()
-        // (absorbing the calibration burst), and forcing led_dirty makes the
-        // repaint below restore the configured appearance from `obs` state,
-        // exactly like the resume-from-sleep path above.
+        // power-cycle, suspend). Rather than propagate it and let systemd respawn
+        // us — losing OBS/PA state and any in-flight flash — reconnect in place
+        // with backoff. PcPanelPro::open() re-runs init() (absorbing the
+        // calibration burst), and forcing led_dirty restores the configured
+        // appearance from `obs` state, like the resume-from-sleep path above.
         match panel.read_event() {
             Ok(Some(event)) => {
                 led_dirty |= handle_panel_event(event, &cli, &config, &mut audio, &mut obs);
@@ -522,22 +494,19 @@ fn run(cli: Cli) -> Result<()> {
             Ok(None) => {}
             Err(e) => {
                 warn!("panel read failed ({e}); attempting to reconnect");
-                // While reconnect_panel sleeps, the main loop doesn't drain
-                // OBS events — they queue in the bounded channel and the OBS
-                // thread parks on a full send. apply_event is last-write-wins,
-                // so drain_events collapses the backlog to the current state on
-                // the next iteration; no events are lost meaningfully.
+                // While reconnect_panel sleeps, the loop doesn't drain OBS events
+                // — they queue in the bounded channel and the OBS thread parks on
+                // a full send. apply_event is last-write-wins, so drain_events
+                // collapses the backlog to current state next iteration; none lost.
                 panel = reconnect_panel();
                 led_dirty = true;
             }
         }
 
         // Repaint LEDs if anything changed (OBS event, flash expiry, resume,
-        // or button-press-induced flash). LED-write failures are logged and
-        // swallowed — they shouldn't kill the main loop. If one of the four
-        // region writes inside paint_leds fails, the remaining ones are
-        // skipped for this iteration but will be retried on the next dirty
-        // repaint.
+        // button-press flash). Write failures are logged and swallowed — they
+        // shouldn't kill the loop. If one of the four region writes fails, the
+        // rest are skipped this iteration but retried on the next dirty repaint.
         if led_dirty
             && let Err(e) = paint_leds(&panel, &obs, config.rgb) {
                 warn!("failed to repaint LEDs: {e}");
@@ -545,14 +514,12 @@ fn run(cli: Cli) -> Result<()> {
     }
 }
 
-/// Apply a volume slider/knob change to a default-device target (`System`
-/// or `Mic`). Returns `true` on success (these always drive a single
-/// default device, so a success is a match). PA failures are logged and
-/// treated as no-match.
+/// Apply a volume slider/knob change to a default-device target (`System` or
+/// `Mic`). Returns `true` on success (each drives a single default device, so
+/// success is a match). PA failures are logged and treated as no-match.
 ///
-/// `Named` targets are deliberately NOT handled here — they're batched into
-/// one sink-input enumeration by `set_app_volumes` at the call site, so this
-/// helper only ever sees the two default-device variants.
+/// `Named` targets are deliberately NOT handled here — they're batched into one
+/// sink-input enumeration by `set_app_volumes`, so this helper only sees defaults.
 fn apply_volume_to(audio: &mut audio::AudioController, target: &AppTarget, value: u8) -> bool {
     let result = match target {
         AppTarget::System => audio.set_system_volume(value),
@@ -581,10 +548,9 @@ fn toggle_mute_for(audio: &mut audio::AudioController, target: &AppTarget) -> Op
     })
 }
 
-/// Extract the configured names from a slice of target refs, dropping
-/// `System`/`Mic` (which aren't candidates for icon lookup). Takes a slice
-/// of `&AppTarget` so callers can pass either the configured list or a
-/// matched-only filtered subset without re-cloning.
+/// Extract the configured names from target refs, dropping `System`/`Mic`
+/// (not icon-lookup candidates). Takes `&AppTarget` refs so callers can pass
+/// the configured list or a matched-only subset without re-cloning.
 fn named_target_names<'a>(targets: impl IntoIterator<Item = &'a AppTarget>) -> Vec<String> {
     targets
         .into_iter()
@@ -596,9 +562,8 @@ fn named_target_names<'a>(targets: impl IntoIterator<Item = &'a AppTarget>) -> V
 }
 
 /// Apply a volume slider/knob change: drive every configured target, then show
-/// a single OSD for the change. Named targets are batched into one sink-input
-/// enumeration; System/Mic each drive a single default device individually.
-/// Volume changes never affect LED state, so this returns nothing.
+/// a single OSD. Named targets are batched into one sink-input enumeration,
+/// System/Mic each drive a default device. Returns nothing — volume never affects LEDs.
 fn handle_volume_change(
     action: &AppAction,
     value: u8,
@@ -607,9 +572,8 @@ fn handle_volume_change(
 ) {
     let pct = audio::value_to_percent(value);
 
-    // Batch all named targets into ONE sink-input enumeration (one PA
-    // round-trip for the whole control rather than one per app). System/Mic
-    // each drive a single default device, so they stay individual.
+    // Batch all named targets into ONE sink-input enumeration (one PA round-trip
+    // for the whole control, not one per app). System/Mic stay individual.
     let named: Vec<&str> = action
         .targets
         .iter()
@@ -640,9 +604,8 @@ fn handle_volume_change(
                 h
             }
         };
-        // Only trace targets that actually changed — a miss (app not running)
-        // or PA error is already logged at debug!/warn! in the audio layer, so
-        // printing here too would falsely claim a change happened.
+        // Only trace targets that actually changed — a miss or PA error is
+        // already logged in the audio layer, and printing here would falsely claim a change.
         if hit {
             matched.push(target);
             if cli.verbose {
@@ -657,9 +620,8 @@ fn handle_volume_change(
     } else if matched.iter().any(|t| matches!(t, AppTarget::Mic)) {
         osd::microphone_volume_changed(pct as i32);
     } else if !matched.is_empty() {
-        // Icon lookup uses only the matched Named targets so the icon
-        // corresponds to apps that actually changed volume (not configured-
-        // but-not-running apps that would otherwise win the .desktop search).
+        // Icon lookup uses only the matched Named targets, so the icon reflects
+        // apps that actually changed — not configured-but-not-running ones.
         let names = named_target_names(matched.iter().copied());
         let label = matched
             .iter()
@@ -707,9 +669,8 @@ fn handle_panel_event(
                         match target {
                             AppTarget::System => osd::show_mute("System", muted),
                             AppTarget::Mic => {
-                                // Update the cached mic-mute state immediately
-                                // so the logo repaints this iteration instead
-                                // of waiting up to MIC_POLL_INTERVAL.
+                                // Update the cached mic-mute state immediately so
+                                // the logo repaints now, not after up to MIC_POLL_INTERVAL.
                                 led_dirty |= obs.update_mic_muted(muted);
                                 osd::show_mic_mute(muted);
                             }

@@ -29,19 +29,17 @@ fn binary_path() -> Result<String> {
 }
 
 /// Reject binary paths that can't be safely embedded in the double-quoted
-/// `ExecStart="{bin_path}"` of the generated unit file. We refuse rather
-/// than escape — no real-world Linux install puts these in a binary path.
-/// Pure so it can be unit-tested.
+/// `ExecStart="{bin_path}"` of the generated unit file. We refuse rather than
+/// escape — no real install puts these in a binary path.
 ///
 ///   "  closes the quoted string
 ///   \  is the escape character
 ///   $  triggers variable expansion
 ///   %  introduces a systemd specifier (e.g. %h); expanded even inside
 ///      double quotes, so a literal % would have to be written %%
-///   control chars (especially newline) terminate the value / line
-///      entirely, so a path containing one could inject arbitrary unit
-///      directives after ExecStart — strictly more dangerous than the
-///      quoting characters above, which only break out of the string.
+///   control chars (especially newline) terminate the value / line entirely,
+///      so one could inject unit directives after ExecStart — worse than the
+///      quoting chars above, which only break out of the string.
 fn check_path_for_unit_file(path: &str) -> Result<()> {
     if let Some(bad) = path
         .chars()

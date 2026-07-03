@@ -18,8 +18,7 @@ use pulse::time::MicroSeconds;
 use pulse::volume::{ChannelVolumes, Volume};
 
 /// How long an app's volume must be stable before we persist it to the
-/// stream-restore database. Coalesces bursts of slider events into a
-/// single DB write after the user stops moving the slider.
+/// stream-restore database — coalesces a slider burst into one DB write.
 const PERSIST_IDLE: Duration = Duration::from_millis(200);
 
 #[derive(Clone, Copy)]
@@ -29,17 +28,14 @@ struct PendingPersist {
 }
 
 /// Distinguishes the two "default audio device" targets we drive — system
-/// output (sink) and mic input (source). Used to deduplicate the
-/// per-system/per-mic methods which were near-identical except for which
-/// PA API they called.
+/// output (sink) and mic input (source). Dedupes the near-identical
+/// per-system/per-mic methods.
 ///
 /// Review-accepted: this centralizes the *data* differences (pa_name, label,
-/// default_channels), but four methods still carry a sink/source match whose
-/// arms differ only in the libpulse method name (get_sink_info_by_name vs
-/// get_source_info_by_name, etc.). Left as-is: libpulse exposes those as
-/// distinct non-generic methods over distinct payload types, so collapsing them
-/// needs a macro or bridging trait — more indirection than two shallow arms are
-/// worth for a fixed 2-variant set. The drift-prone bits are centralized here.
+/// default_channels), but four methods keep a sink/source match differing only
+/// in the libpulse method name — those are distinct non-generic methods over
+/// distinct payload types, so collapsing needs a macro or bridging trait, not
+/// worth it for a fixed 2-variant set.
 #[derive(Clone, Copy)]
 enum Target {
     DefaultSink,
@@ -71,13 +67,10 @@ impl Target {
     }
 }
 
-/// Info collected from a sink input for matching and display. The lower-
-/// cased forms of `name` and `binary` are computed once during
-/// `collect_sink_inputs` so the cheap leg of a match is a pure
-/// `&str::contains` — sliders fire ~10 Hz × multiple configured apps and
-/// the per-call `to_lowercase()` was real work. The `/proc/<pid>/comm`
-/// fallback is resolved lazily in `AudioController::entry_matches` rather
-/// than eagerly here, so it isn't read for every stream on every tick.
+/// Info collected from a sink input for matching and display. Lower-cased
+/// `name`/`binary` are precomputed in `collect_sink_inputs` so a match is a
+/// pure `&str::contains` on the ~10 Hz hot path. The `/proc/<pid>/comm`
+/// fallback is resolved lazily in `entry_matches`, not eagerly here.
 #[derive(Clone)]
 struct SinkInputEntry {
     index: u32,
@@ -94,10 +87,9 @@ struct SinkInputEntry {
 pub struct AudioController {
     mainloop: Rc<RefCell<Mainloop>>,
     context: Rc<RefCell<context::Context>>,
-    /// Per-app deferred stream-restore writes. `set_app_volumes` updates
-    /// the entry on every tick; `flush_persist_writes` (called from the
-    /// main loop) actually writes to PA once the entry has been idle for
-    /// `PERSIST_IDLE`.
+    /// Per-app deferred stream-restore writes. `set_app_volumes` updates the
+    /// entry each tick; `flush_persist_writes` writes to PA once it's been
+    /// idle for `PERSIST_IDLE`.
     pending_persist: HashMap<String, PendingPersist>,
 }
 
@@ -135,19 +127,16 @@ impl AudioController {
             .connect(None, FlagSet::NOFLAGS, None)
             .context("failed to connect to PulseAudio")?;
 
-        // Wait for the context to reach Ready, bounded by a wall-clock deadline
-        // covering the full handshake (connect → auth → negotiate → Ready) —
-        // slower than the per-op `wait_until`, which runs against an
-        // already-Ready context (hence its tighter 250ms). Kept under
-        // AudioReconnector's MAX_BACKOFF so a wedged server can't freeze the
-        // reconnect path longer than a backoff gap.
+        // Wait for Ready, bounded by a wall-clock deadline covering the full
+        // handshake (connect → auth → negotiate → Ready) — longer than the
+        // per-op `wait_until` (250ms, run on an already-Ready context). Kept
+        // under AudioReconnector's MAX_BACKOFF so a wedged server can't freeze
+        // the reconnect path past a backoff gap.
         //
-        // We poll non-blocking (`iterate(false)`) plus a short sleep rather
-        // than `iterate(true)`, because a blocking iterate can park in poll()
-        // forever if the peer accepts the socket but never sends or closes —
-        // the wedged-handshake case this deadline defends against. The sleep
-        // caps the spin at ~100 wakeups/sec while keeping the deadline check
-        // live each pass.
+        // Poll non-blocking (`iterate(false)`) plus a short sleep, not
+        // `iterate(true)`: a blocking iterate can park in poll() forever if the
+        // peer accepts the socket but never replies — the wedged handshake this
+        // deadline defends against. The sleep caps the spin at ~100 wakeups/sec.
         const CONNECT_DEADLINE: Duration = Duration::from_secs(3);
         let started = Instant::now();
         loop {
@@ -177,21 +166,17 @@ impl AudioController {
 
     /// True while the PA context is `Ready`. Reads the state cached from the
     /// last mainloop iteration (no I/O), so it reflects a server death only
-    /// after some op has iterated the loop and observed it — which any failed
-    /// op already does via `wait_until`. The main loop polls this to decide
-    /// whether to attempt a reconnect.
+    /// after some op has iterated the loop — which any failed op already does
+    /// via `wait_until`. The main loop polls this to decide whether to reconnect.
     pub fn is_connected(&self) -> bool {
         matches!(self.context.borrow().get_state(), context::State::Ready)
     }
 
     /// Rebuild the connection after the server dropped (PA/PipeWire restart,
-    /// suspend/resume). Builds a fresh controller first; only on success is
-    /// the old one replaced — so a still-down server leaves `self` (and its
-    /// dead-but-intact context) untouched and the caller can retry later.
-    /// Replacing `self` runs the old controller's `Drop` to disconnect the
-    /// stale context and discards `pending_persist` (those deferred writes
-    /// targeted the old session and may name apps that didn't survive the
-    /// outage).
+    /// suspend/resume). Builds a fresh controller first, replacing the old one
+    /// only on success — a still-down server leaves `self` intact to retry.
+    /// Replacing runs the old `Drop` (disconnects the stale context) and
+    /// discards `pending_persist` (deferred writes for a session that's gone).
     pub fn reconnect(&mut self) -> Result<()> {
         *self = Self::connect()?;
         Ok(())
@@ -201,13 +186,12 @@ impl AudioController {
         self.wait_until(|| *done.borrow())
     }
 
-    /// Drive the PulseAudio mainloop until `is_done` returns true, or fail
-    /// with an error if the PA context disconnects, the mainloop quits, or
-    /// the operation exceeds the wall-clock deadline.
+    /// Drive the PulseAudio mainloop until `is_done`, or error if the context
+    /// disconnects, the mainloop quits, or the wall-clock deadline trips.
     ///
-    /// Surfacing a real error rather than silently breaking out means callers
-    /// see the failure and propagate it, so the user gets a visible error in the
-    /// journal instead of stale defaults from an apparently-successful call.
+    /// Erroring rather than silently breaking out means callers propagate the
+    /// failure — a visible journal error instead of stale defaults from an
+    /// apparently-successful call.
     fn wait_until<F: Fn() -> bool>(&self, is_done: F) -> Result<()> {
         const DEADLINE: Duration = Duration::from_millis(250);
         let started = Instant::now();
@@ -215,9 +199,8 @@ impl AudioController {
             if is_done() {
                 return Ok(());
             }
-            // Budget left before the hard deadline; bail once it's gone. This
-            // ceiling is what stops a server that holds the socket open but
-            // never replies from hanging the main thread indefinitely.
+            // Budget before the hard deadline; bail once gone. This ceiling stops
+            // a server that holds the socket but never replies from hanging us.
             let Some(remaining) = DEADLINE
                 .checked_sub(started.elapsed())
                 .filter(|r| !r.is_zero())
@@ -225,45 +208,38 @@ impl AudioController {
                 bail!("PulseAudio call exceeded {DEADLINE:?} deadline");
             };
 
-            // Block inside poll() for up to `remaining` rather than spinning on
-            // a fixed sleep: we wake the instant PA has data (no added latency
-            // on the volume hot path), yet prepare()'s timeout means poll can
-            // never park past the deadline. This is the canonical pa_mainloop
-            // prepare/poll/dispatch triple — equivalent to iterate(), but with
-            // a bounded poll timeout that iterate(block) doesn't expose.
+            // Block inside poll() for up to `remaining` rather than spinning a
+            // fixed sleep: we wake the instant PA has data (no latency on the
+            // volume hot path), yet prepare()'s timeout keeps poll from parking
+            // past the deadline. The canonical prepare/poll/dispatch triple —
+            // like iterate(), but with a bounded poll timeout it doesn't expose.
             //
             // Holding the mainloop borrow across the blocking poll is safe: the
-            // controller is single-threaded and the introspect callbacks run
-            // inside dispatch() and only touch the per-op result/done cells,
-            // never the mainloop — so there's no reentrant borrow.
+            // controller is single-threaded and the introspect callbacks run in
+            // dispatch(), touching only the per-op cells, never the mainloop.
             let timeout = MicroSeconds(remaining.as_micros().min(i32::MAX as u128) as u64);
             {
                 let mut ml = self.mainloop.borrow_mut();
                 ml.prepare(Some(timeout))
                     .map_err(|e| anyhow::anyhow!("PulseAudio mainloop prepare failed: {e:?}"))?;
                 // EINTR: libpulse's pa_mainloop_poll remaps a signal-interrupted
-                // poll to a zero return, so an interrupted wait surfaces here as
-                // Ok(0) — same as a plain timeout. Either way we fall through to
-                // dispatch (a no-op when nothing fired) and loop, which re-polls
-                // for the time remaining. That re-poll IS the EINTR retry, and
-                // the top-of-loop deadline check bounds the total wait.
+                // poll to Ok(0), same as a plain timeout — we fall through to
+                // dispatch (no-op) and loop, re-polling the remaining time. That
+                // re-poll IS the EINTR retry; the top-of-loop deadline bounds it.
                 //
                 // Review-accepted: do NOT add an explicit EINTR retry on the Err
                 // arm. EINTR never reaches it (remapped to Ok(0) above), and a
-                // genuine poll Err leaves the mainloop in a failed state where
-                // pa_mainloop_prepare aborts via pa_assert — so looping back to
-                // retry would risk crashing the daemon. Bailing on Err (one
-                // failed op, logged; the next tick retries) is the safe choice.
+                // genuine poll Err leaves the mainloop failed where prepare aborts
+                // via pa_assert — retrying could crash the daemon; bailing is safe.
                 ml.poll()
                     .map_err(|e| anyhow::anyhow!("PulseAudio mainloop poll failed: {e:?}"))?;
                 ml.dispatch()
                     .map_err(|e| anyhow::anyhow!("PulseAudio mainloop dispatch failed: {e:?}"))?;
             }
 
-            // PA context can transition out of Ready (server restart, etc.)
-            // mid-operation; the iteration succeeds while the context becomes
-            // unusable. Check explicitly so subsequent calls don't silently use
-            // stale data.
+            // PA context can transition out of Ready (server restart) mid-op;
+            // the iteration succeeds while the context becomes unusable. Check
+            // explicitly so subsequent calls don't silently use stale data.
             match self.context.borrow().get_state() {
                 context::State::Ready => {}
                 other => bail!("PulseAudio context not ready: {other:?}"),
@@ -313,24 +289,19 @@ impl AudioController {
         Ok(std::mem::take(&mut *items.borrow_mut()))
     }
 
-    /// Run a PA write that reports success/failure via a bool callback
-    /// (e.g., `sr.write`). The `register` closure must return the
-    /// `Operation` handle so we can call `cancel()` on it if the wait
-    /// deadline trips. Returns the reported success state or an error
-    /// if the operation didn't complete in time.
+    /// Run a PA write that reports success/failure via a bool callback (e.g.
+    /// `sr.write`). The `register` closure must return the `Operation` handle
+    /// so we can `cancel()` it if the wait deadline trips. Returns the reported
+    /// success state, or an error if the op didn't complete in time.
     ///
-    /// Note on cancel(): `pa_operation_cancel` tells PA to abort the
-    /// operation, which is what prevents a UAF — without it, PA could
-    /// invoke the boxed callback into the `Rc<RefCell<Option<bool>>>` we
-    /// just dropped. It does NOT, however, actually free the boxed
-    /// callback in libpulse-binding 2.30.1: `Operation::from_raw` has
-    /// an inverted `saved_cb` storage condition that ends up storing
-    /// `None` for any non-null callback pointer, so `cancel()`'s drop
-    /// branch never runs for our use cases. The boxed FnMut therefore
-    /// leaks on each wait-deadline trip — bounded by how often PA
-    /// actually fails, so small in practice. Our fork patch
-    /// (`fix-ext-stream-restore-write`) does not fix this inversion, so
-    /// the leak is still present.
+    /// Note on cancel(): `pa_operation_cancel` tells PA to abort the op, which
+    /// is what prevents a UAF — without it PA could invoke the boxed callback
+    /// into the `Rc<RefCell<Option<bool>>>` we just dropped. It does NOT free
+    /// the boxed callback in libpulse-binding 2.30.1: `Operation::from_raw` has
+    /// an inverted `saved_cb` condition that stores `None` for any non-null
+    /// callback pointer, so cancel()'s drop branch never runs — the boxed FnMut
+    /// leaks on each deadline trip (bounded by how often PA fails, so small).
+    /// Our fork patch (`fix-ext-stream-restore-write`) doesn't fix this.
     fn pa_write_with_result<R>(&self, register: R) -> Result<bool>
     where
         R: FnOnce(Rc<RefCell<Option<bool>>>) -> Option<Operation<dyn FnMut(bool) + 'static>>,
@@ -341,9 +312,8 @@ impl AudioController {
         if wait_result.is_err()
             && let Some(op) = op.as_mut()
         {
-            // Tell PA to abort the operation so it doesn't fire the
-            // callback into the about-to-be-dropped result Rc. See the
-            // doc comment above re: the box-leak caveat.
+            // Tell PA to abort so it doesn't fire the callback into the
+            // about-to-be-dropped result Rc. See the doc comment's leak caveat.
             op.cancel();
         }
         wait_result?;
@@ -379,17 +349,13 @@ impl AudioController {
     }
 
     /// Current mute state of the named default sink/source. Errors with a
-    /// label-distinguished message depending on whether PA finished
-    /// enumeration without ever yielding an Item (genuinely not present)
-    /// vs. reported an enumeration Error (server-side failure).
+    /// label-distinguished message for "enumeration ended without an Item"
+    /// (not present) vs. an enumeration Error (server-side failure).
     ///
-    /// The pa_query value is `(Option<bool>, bool)`: `(mute, errored)`.
-    /// Initial `(None, false)` represents both "no callback fired yet" and
-    /// "callback ran to End without Item" (genuinely not present) — End
-    /// is a no-op because the initial state is already correct for that
-    /// case, and Item-then-End leaves the populated value alone. Error
-    /// flips the second element; we never roll back to "not errored" so
-    /// the order of arrivals doesn't matter.
+    /// The pa_query value is `(Option<bool>, bool)` = `(mute, errored)`. Initial
+    /// `(None, false)` covers both "no callback yet" and "End without Item" (not
+    /// present), so End is a no-op; Item-then-End leaves the value alone. Error
+    /// only sets the flag and never rolls back, so arrival order doesn't matter.
     fn query_default_mute(&self, target: Target) -> Result<bool> {
         let name = target.pa_name();
         let (mute, errored): (Option<bool>, bool) =
@@ -438,9 +404,8 @@ impl AudioController {
         // so a default-device switch picks up the new channel count.
         let channels = self.query_default_channels(target)?;
         let mut cv = ChannelVolumes::default();
-        // Review-accepted: cv.set writes one level to all channels, so a slider
-        // move flattens L/R balance to center (vs. pavucontrol's proportional
-        // scale). Intended — a hardware fader sets an absolute per-channel level.
+        // Review-accepted: cv.set writes one level to all channels, flattening
+        // L/R balance — intended; a hardware fader sets an absolute level.
         cv.set(channels, volume);
 
         let mut introspect = self.context.borrow().introspect();
@@ -459,17 +424,14 @@ impl AudioController {
 
     fn toggle_default_mute(&self, target: Target) -> Result<bool> {
         let new_mute = !self.query_default_mute(target)?;
-        // Wait for PA to actually apply the mute before returning, so the
-        // caller can synchronously cache the new state without racing the
-        // next mic-mute poll (which would otherwise read the pre-toggle
-        // value and momentarily revert the cached state).
+        // Wait for PA to apply the mute before returning, so the caller can
+        // cache the new state without racing the next mic-mute poll (which
+        // would read the pre-toggle value and momentarily revert the cache).
         //
-        // If PA reports !success or the wait deadline trips, treat the
-        // attempt optimistically: re-query the current state and return
-        // that. The set-mute call may still have taken effect on the
-        // device even when the ack didn't come back in time; re-querying
-        // gives the caller (and the OSD) the truth instead of erroring
-        // out and leaving the UI silent on transient PA hiccups.
+        // If PA reports !success or the wait deadline trips, re-query and
+        // return the actual state: the set-mute may have taken effect even when
+        // the ack didn't arrive in time, so re-querying gives the truth instead
+        // of erroring out and leaving the UI silent on transient PA hiccups.
         let write = self.pa_write_with_result(|done| {
             let mut introspect = self.context.borrow().introspect();
             let cb: Box<dyn FnMut(bool) + 'static> = Box::new(move |ok| {
@@ -502,11 +464,9 @@ impl AudioController {
     }
 
     /// Enumerate all sink inputs with the fields PA gives us directly.
-    /// Deliberately does NOT resolve PIDs via the client (a PA round-trip)
-    /// or read `/proc/<pid>/comm`: those are deferred to `entry_matches`
-    /// (lazy, only for non-name/binary matches) and `list_apps` (cold
-    /// path), so the ~10 Hz volume hot path doesn't pay for them on every
-    /// stream every tick.
+    /// Deliberately does NOT resolve PIDs via the client (a PA round-trip) or
+    /// read `/proc/<pid>/comm` — deferred to `entry_matches` (lazy) and
+    /// `list_apps` (cold path) so the ~10 Hz hot path skips them per tick.
     fn collect_sink_inputs(&self) -> Result<Vec<SinkInputEntry>> {
         self.pa_collect(|entries, done| {
             let introspect = self.context.borrow().introspect();
@@ -543,13 +503,10 @@ impl AudioController {
         })
     }
 
-    /// Whether a sink input matches `target` (already lower-cased by the
-    /// caller). Checks the cheap `name`/`binary` fields first — both are
-    /// available straight from the enumeration — and only falls back to the
-    /// PA client-PID query + `/proc/comm` read for streams that didn't
-    /// already match. This keeps the volume hot path from resolving a PID
-    /// and reading /proc for every stream on every slider tick; the comm
-    /// read is additionally memoized by `comm_for_pid`.
+    /// Whether a sink input matches `target` (already lower-cased). Checks the
+    /// cheap `name`/`binary` fields first and only falls back to the PA
+    /// client-PID query + `/proc/comm` read on a miss, so the hot path rarely
+    /// resolves a PID; the comm read is further memoized by `comm_for_pid`.
     fn entry_matches(&self, entry: &SinkInputEntry, target: &str) -> Result<bool> {
         // Cheap legs first (name/binary), so a hit avoids resolving the PID.
         if entry_matches_target(entry, target, None) {
@@ -559,11 +516,10 @@ impl AudioController {
         Ok(entry_matches_target(entry, target, self.resolve_comm(entry)?.as_deref()))
     }
 
-    /// Resolve the lower-cased `/proc/<pid>/comm` for a sink input, if
-    /// available — possibly via a PA client-PID query. `Ok(None)` when the
-    /// stream has no usable numeric PID or its comm can't be read. Factored
-    /// out so the per-stream comm can be resolved once and reused across
-    /// multiple match targets (see `set_app_volumes`).
+    /// Resolve the lower-cased `/proc/<pid>/comm` for a sink input (possibly
+    /// via a PA client-PID query). `Ok(None)` when there's no usable numeric
+    /// PID or the comm can't be read. Factored out so the comm is resolved once
+    /// and reused across match targets (see `set_app_volumes`).
     fn resolve_comm(&self, entry: &SinkInputEntry) -> Result<Option<String>> {
         let Some(pid) = self.resolve_pid(entry)? else {
             return Ok(None);
@@ -608,9 +564,8 @@ impl AudioController {
 
     pub fn list_apps(&self) -> Result<Vec<AppInfo>> {
         let mut entries = self.collect_sink_inputs()?;
-        // Resolve PIDs via the client for streams whose sink-input proplist
-        // didn't carry one. Only done here, on the cold `--list-apps` path —
-        // never on the volume hot path.
+        // Resolve PIDs via the client for streams whose proplist lacked one.
+        // Only on the cold `--list-apps` path, never on the volume hot path.
         for entry in &mut entries {
             if entry.pid.is_none() && entry.client_index != u32::MAX {
                 entry.pid = self.get_client_pid(entry.client_index)?;
@@ -636,10 +591,9 @@ impl AudioController {
     }
 
     /// Set volume for several named apps in ONE sink-input enumeration.
-    /// Returns, per input name (same order), whether at least one stream
-    /// matched. Each stream's `/proc/comm` is resolved at most once and tested
-    /// against every target, so a control mapped to multiple apps no longer
-    /// re-enumerates (and re-resolves PIDs) once per target on every tick.
+    /// Returns, per input name (same order), whether any stream matched. Each
+    /// stream's `/proc/comm` is resolved at most once and tested against every
+    /// target, so a multi-app control doesn't re-enumerate per target per tick.
     pub fn set_app_volumes(&mut self, app_names: &[&str], value: u8) -> Result<Vec<bool>> {
         if app_names.is_empty() {
             return Ok(Vec::new());
@@ -648,10 +602,9 @@ impl AudioController {
         let targets: Vec<String> = app_names.iter().map(|n| n.to_lowercase()).collect();
         let entries = self.collect_sink_inputs()?;
 
-        // Match every stream against every target. The name/binary legs are
-        // free; a stream only incurs a PA client-PID query + /proc/comm read
-        // if some target misses those — and then the comm is resolved once and
-        // reused for the remaining targets.
+        // Match every stream against every target. Name/binary legs are free; a
+        // stream only pays a PA client-PID query + /proc/comm read if a target
+        // misses those, and then the comm is resolved once and reused.
         let mut matched = vec![false; targets.len()];
         let mut to_set: Vec<(u32, u8)> = Vec::new(); // streams to write, one per matched stream
         for entry in &entries {
@@ -661,9 +614,8 @@ impl AudioController {
                 let hit = if entry_matches_target(entry, target, None) {
                     true
                 } else {
-                    // Resolve (once) and reuse this stream's comm. A failed
-                    // client-PID query is logged and treated as "no comm" so
-                    // it doesn't drop apps matched cheaply by name/binary.
+                    // Resolve (once) and reuse this stream's comm. A failed query
+                    // is logged as "no comm", so it can't drop name/binary matches.
                     let comm = comm.get_or_insert_with(|| match self.resolve_comm(entry) {
                         Ok(c) => c,
                         Err(e) => {
@@ -697,17 +649,15 @@ impl AudioController {
         // persistence (a slider burst coalesces to one DB write per app once
         // idle for PERSIST_IDLE). The playback volume above is set every tick.
         //
-        // Only *matched* (currently-running) targets are persisted, deliberately.
-        // Review-accepted: do NOT "fix" this to persist unmatched/offline targets
-        // so a fader move on a closed app pre-sets its next-launch volume — it's
-        // a verified no-op on PipeWire/WirePlumber. WirePlumber restores from its
-        // own `stream-properties` store, which it updates only by observing a
-        // *live* stream's volume change; it never consults our pulse-side
-        // `module-stream-restore` writes (confirmed: the write succeeds,
-        // WirePlumber's store is untouched, the app restores its prior volume).
-        // So persistence here rides on WirePlumber seeing the live `set` above —
-        // with no live stream there's nothing to observe. (On a real PulseAudio
-        // server these writes WOULD govern restoration, so we keep them.)
+        // Only *matched* (running) targets are persisted, deliberately.
+        // Review-accepted: do NOT "fix" this to persist offline targets so a
+        // fader move on a closed app pre-sets its next launch — verified a no-op
+        // on PipeWire/WirePlumber, which restores from its own `stream-properties`
+        // store (updated only by observing a *live* stream) and never consults
+        // our pulse-side `module-stream-restore` writes (confirmed: the write
+        // succeeds, WP's store untouched). Persistence rides on WP seeing the live
+        // `set` above; no live stream, nothing to observe. (A real PulseAudio
+        // server WOULD honor these, so we keep them.)
         for (i, target) in targets.iter().enumerate() {
             if matched[i] {
                 self.pending_persist.insert(
@@ -753,10 +703,9 @@ impl AudioController {
         }
     }
 
-    /// Updates module-stream-restore database entries whose name contains
-    /// `target` (case-insensitive). The `updater` closure receives each
-    /// matching existing entry and returns the new entry that should
-    /// replace it. Use it to bump volume, mute state, or both.
+    /// Updates module-stream-restore entries whose name contains `target`
+    /// (case-insensitive). The `updater` closure receives each matching entry
+    /// and returns its replacement — use it to bump volume, mute, or both.
     fn update_stream_restore<F>(&self, target: &str, mut updater: F) -> Result<()>
     where
         F: FnMut(&SrInfo<'static>) -> SrInfo<'static>,
@@ -824,11 +773,9 @@ impl AudioController {
 
     /// Current mute state of the default microphone (true = muted).
     pub fn is_mic_muted(&self) -> Result<bool> {
-        // Debug-only test hook: when PCPANEL_FORCE_MIC_ERROR is set in the
-        // environment, always fail. Lets you visually verify the mic
-        // indicator's stale-state ("unknown") blink without having to
-        // bring down PulseAudio. Stripped from release builds by the
-        // cfg!(debug_assertions) check.
+        // Debug-only test hook: with PCPANEL_FORCE_MIC_ERROR set, always fail —
+        // lets you verify the mic indicator's stale ("unknown") blink without
+        // bringing down PulseAudio. Stripped from release by cfg!(debug_assertions).
         if cfg!(debug_assertions) && std::env::var_os("PCPANEL_FORCE_MIC_ERROR").is_some() {
             bail!("forced failure (PCPANEL_FORCE_MIC_ERROR set)");
         }
@@ -869,9 +816,8 @@ impl AudioController {
         }
         self.drain();
 
-        // Persist the mute state to the stream-restore database so that new
-        // streams for this app pick it up automatically — mirrors the
-        // volume-persist behavior in set_app_volumes.
+        // Persist the mute state so new streams for this app pick it up —
+        // mirrors the volume-persist behavior in set_app_volumes.
         let result = self.update_stream_restore(&target, |entry| SrInfo {
             name: entry.name.clone(),
             channel_map: entry.channel_map,
@@ -894,13 +840,11 @@ impl Drop for AudioController {
     }
 }
 
-/// Whether a sink-input entry matches `target`. Pure: operates only on the
-/// entry's already-resolved fields plus an optional pre-resolved `comm` (the
-/// lower-cased `/proc/<pid>/comm`), which the caller fetches separately
-/// because it can require a PA round-trip. `target` must already be
-/// lower-cased; `name_lower`, `binary_lower`, and `comm` are all lower-case,
-/// so this is a case-insensitive substring test with name → binary → comm
-/// precedence. Passing `comm = None` checks only the cheap name/binary legs.
+/// Whether a sink-input entry matches `target`. Pure: uses only the entry's
+/// resolved fields plus an optional pre-resolved `comm` (lower-cased
+/// `/proc/<pid>/comm`, fetched separately as it can need a PA round-trip).
+/// All inputs are lower-cased, so this is a case-insensitive substring test
+/// with name → binary → comm precedence; `comm = None` checks only name/binary.
 fn entry_matches_target(entry: &SinkInputEntry, target: &str, comm: Option<&str>) -> bool {
     entry.name_lower.contains(target)
         || entry.binary_lower.as_deref().is_some_and(|b| b.contains(target))
@@ -912,21 +856,17 @@ fn entry_matches_target(entry: &SinkInputEntry, target: &str, comm: Option<&str>
 /// filesystem reads on the ~10 Hz slider hot path into one read per PID.
 ///
 /// Review-accepted: `main.rs` `list_apps` reads `/proc/<pid>/comm` too, but
-/// that cold display path keeps original case and skips this cache on
-/// purpose, so the small read+trim overlap is left un-factored.
-/// `None` (no such process / unreadable) is cached too, so a stream that
-/// never matches by comm isn't re-read every tick.
+/// that cold path keeps original case and skips this cache on purpose, so the
+/// small overlap is left un-factored. `None` (no such process / unreadable) is
+/// cached too, so a never-matching stream isn't re-read every tick.
 ///
-/// PID reuse after the original process exits could in principle return a
-/// stale comm, but the only consequence is an app-name *match* decision for
-/// a volume/mute change — low-stakes and self-correcting once that stream
-/// goes away. Mirrors the process-lifetime icon-resolution cache.
+/// PID reuse after a process exits could return a stale comm, but the only
+/// consequence is an app-name match decision for a volume/mute change —
+/// low-stakes and self-correcting once the stream goes away.
 ///
-/// Unbounded-growth note (reviewed, accepted): keyed by PID and never evicts,
-/// so a long-lived daemon accrues one entry per distinct PID ever seen on a
-/// non-name/binary-matched stream — in practice dozens to low hundreds of
-/// ~70-byte entries, single-digit MB even under pathological PID churn. Not
-/// worth an eviction scheme for that ceiling.
+/// Review-accepted: keyed by PID and never evicts, so a long-lived daemon
+/// accrues one entry per distinct PID seen on a non-name/binary match — in
+/// practice single-digit MB even under pathological churn; no eviction needed.
 fn comm_for_pid(pid: &str) -> Option<String> {
     static CACHE: LazyLock<Mutex<HashMap<String, Option<String>>>> =
         LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -951,10 +891,9 @@ fn volume_from_u8(value: u8) -> Volume {
 }
 
 /// Map a raw slider/knob value (0-255) to a display percentage (0-100),
-/// rounded to nearest. Mirrors `volume_from_u8`'s rounding so the OSD, the
-/// `--verbose` number, and the debug log all agree with the volume actually
-/// applied to PA — a plain `as u8` truncation reads up to 1% low at some
-/// positions. Endpoints are exact (0 → 0, 255 → 100).
+/// rounded to nearest. Mirrors `volume_from_u8`'s rounding so the OSD,
+/// `--verbose`, and the debug log agree with the volume applied to PA — a
+/// plain `as u8` truncation reads up to 1% low. Endpoints are exact.
 pub fn value_to_percent(value: u8) -> u8 {
     (value as f32 / 255.0 * 100.0).round() as u8
 }
@@ -1018,9 +957,8 @@ mod tests {
         assert!(volume_from_u8(254).0 < Volume::NORMAL.0);
     }
 
-    /// Build a SinkInputEntry with the fields `entry_matches_target` reads;
-    /// the rest are filler. `name`/`binary` are lower-cased here the same way
-    /// `collect_sink_inputs` does.
+    /// Build a SinkInputEntry with the fields `entry_matches_target` reads
+    /// (rest are filler); `name`/`binary` lower-cased as `collect_sink_inputs`.
     fn entry(name: &str, binary: Option<&str>) -> SinkInputEntry {
         SinkInputEntry {
             index: 0,

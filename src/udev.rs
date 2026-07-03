@@ -6,14 +6,12 @@ use anyhow::{bail, Result};
 use crate::prompt::confirm_overwrite;
 
 // Numbered 70-* (below 71-seat.rules / 73-seat-late.rules) so its `uaccess`
-// tag is set before systemd's seat rules look for it; a 99-* file would tag
-// the device too late and the ACL would never be applied. See the header
-// comment in udev/70-pcpanel.rules for the full ordering rationale.
+// tag is set before the seat rules read it; a 99-* file would tag too late and
+// the ACL would never apply. Full rationale in udev/70-pcpanel.rules's header.
 const RULES_PATH: &str = "/etc/udev/rules.d/70-pcpanel.rules";
 
-// Single source of truth: the same file shipped at `udev/70-pcpanel.rules`
-// is embedded at compile time so the installed rule and the repo copy can't
-// drift apart.
+// Single source of truth: the file shipped at `udev/70-pcpanel.rules` is
+// embedded at compile time so the installed rule and repo copy can't drift.
 const RULES_CONTENT: &str = include_str!("../udev/70-pcpanel.rules");
 
 pub fn create_udev_rules() -> Result<()> {
@@ -40,8 +38,7 @@ pub fn create_udev_rules() -> Result<()> {
 }
 
 fn running_as_root() -> bool {
-    // SAFETY: geteuid() has no preconditions and no side effects — it just
-    // reads the effective UID. The libc binding is marked unsafe purely
-    // because all FFI calls are; this one is always safe to invoke.
+    // SAFETY: geteuid() has no preconditions or side effects — it just reads
+    // the effective UID; the binding is `unsafe` only because all FFI is.
     unsafe { libc::geteuid() == 0 }
 }

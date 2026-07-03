@@ -2,10 +2,9 @@ use std::io::{self, Write};
 
 use anyhow::Result;
 
-/// Prompt on stderr asking whether to overwrite an existing `label` (a path
-/// or filename). Reads a line from stdin and returns `Ok(true)` if the user
-/// answered "y"/"Y". For any other answer it prints "Aborted." and returns
-/// `Ok(false)`, so callers can early-return without re-printing.
+/// Prompt on stderr whether to overwrite an existing `label` (path/filename).
+/// Returns `Ok(true)` on "y"/"Y"; any other answer prints "Aborted." and
+/// returns `Ok(false)`, so callers can early-return without re-printing.
 pub fn confirm_overwrite(label: &str) -> Result<bool> {
     eprint!("{label} already exists. Overwrite? [y/N] ");
     io::stderr().flush()?;

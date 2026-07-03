@@ -8,9 +8,8 @@ use log::warn;
 const SYSTEM_APP: &str = "system";
 const MIC_APP: &str = "mic";
 
-/// What an audio control targets. Parsed once from the config string so
-/// downstream code can dispatch by enum variant instead of repeated
-/// case-insensitive string comparisons at every call site.
+/// What an audio control targets. Parsed once so downstream dispatches by
+/// variant instead of case-insensitive string compares at every call site.
 #[derive(Debug, Clone)]
 pub enum AppTarget {
     /// Default audio output (sink).
@@ -130,23 +129,19 @@ pub enum LogoIndicator {
     Replay,
 }
 
-/// Logo configuration: which indicator (if any) drives the logo, plus the
-/// color for each possible state. Unused colors are simply ignored.
-/// Sensible defaults mean users can just pick an indicator and get
-/// reasonable behavior without touching the colors.
+/// Logo configuration: which indicator (if any) drives the logo, plus a
+/// color per state. Unset colors fall back to sensible defaults.
 ///
-/// Only effective in states where the logo is independently writable
-/// (i.e. not global animations like rainbow/wave/breath, nor the global
-/// breath used by `paused_use_breath`).
+/// Only effective where the logo is independently writable (not global
+/// animations like rainbow/wave/breath, nor the `paused_use_breath` breath).
 #[derive(Debug, Clone, Copy)]
 pub struct LogoConfig {
     pub indicator: LogoIndicator,
     pub mic_muted: RgbColor,
     pub mic_unmuted: RgbColor,
-    /// Color shown (blinking) when the mic indicator is configured but PA
-    /// hasn't been able to confirm the mic's actual state recently. The
-    /// blink + non-standard color signal "do not trust the cached state"
-    /// — the user should treat the mic as possibly unmuted until the
+    /// Color shown (blinking) when the mic indicator is on but PA hasn't
+    /// confirmed the mic's state recently. Blink + off-palette color signal
+    /// "don't trust the cache" — treat the mic as possibly unmuted until the
     /// logo returns to red/green.
     pub mic_unknown: RgbColor,
     pub replay_active: RgbColor,
@@ -173,28 +168,23 @@ pub struct ObsConfig {
     pub host: String,
     pub port: u16,
     pub password: Option<String>,
-    /// If true, pcp_rust will start OBS's replay buffer on every successful
-    /// connection (skipping if it's already running). Off by default — the
-    /// user normally manages replay buffer state in OBS directly.
+    /// Start OBS's replay buffer on every successful connection (skipping if
+    /// already running). Off by default — the user normally manages it in OBS.
     pub start_replay_buffer: bool,
-    /// If true, the panel shows a global breath effect when recording is
-    /// paused — every LED including the logo joins the breath, so any
-    /// configured `[logo]` indicator is unavailable while paused. If false
-    /// (default), paused renders as a solid color and the logo continues
-    /// to show whatever the indicator says.
+    /// If true, paused shows a global breath — every LED including the logo
+    /// joins, so the `[logo]` indicator is unavailable while paused. If false
+    /// (default), paused is a solid color and the logo indicator still shows.
     pub paused_use_breath: bool,
-    /// If true, pcp_rust matches OBS's canvas (base + output resolution) to
-    /// the current monitor resolution right before starting a recording (via
-    /// the `obs-toggle-recording` start path). Off by default — opt-in. See
-    /// `[obs] match_canvas_to_display` in the README.
+    /// Match OBS's canvas (base + output resolution) to the current monitor
+    /// resolution right before starting a recording (the `obs-toggle-recording`
+    /// start path). Off by default — opt-in. See the README.
     pub match_canvas_to_display: bool,
-    /// Which display's resolution to match when `match_canvas_to_display` is
-    /// on. The connector name as reported by `kscreen-doctor` (e.g. "DP-1").
-    /// `None` → use the primary display (or the sole enabled one).
+    /// Which display to match when `match_canvas_to_display` is on — the
+    /// connector name from `kscreen-doctor` (e.g. "DP-1"). `None` → primary
+    /// display (or the sole enabled one).
     pub capture_display: Option<String>,
-    /// If true, poll OBS's capture liveness and paint the `idle_not_capturing`
-    /// color while connected but capturing nothing. Off by default — opt-in,
-    /// since it adds a periodic OBS query (see the README).
+    /// Poll OBS's capture liveness and paint `idle_not_capturing` while
+    /// connected but capturing nothing. Off by default — adds a periodic query.
     pub show_capture_status: bool,
     pub colors: ObsColors,
 }
@@ -210,17 +200,15 @@ pub struct ObsColors {
     /// is disconnected, `[rgb]` is used instead.
     pub idle: RgbColor,
     /// Idle panel color while OBS is connected but capturing no video (its
-    /// screen/window capture reads 0x0). Only used when `[obs]
-    /// show_capture_status` is on.
+    /// capture reads 0x0). Only used when `show_capture_status` is on.
     pub idle_not_capturing: RgbColor,
 }
 
 impl Default for ObsColors {
     fn default() -> Self {
         Self {
-            // PCPanel Pro red is gamma-compressed at the high end — values
-            // from 0x80 to 0xFF all read as roughly "full red". 0x50 is
-            // visibly dimmer while still clearly red.
+            // PCPanel Pro red is gamma-compressed at the high end — 0x80..0xFF
+            // all read as roughly full red. 0x50 is dimmer but still clearly red.
             recording: RgbColor { r: 0x50, g: 0x00, b: 0x00 },
             paused: RgbColor { r: 0xFF, g: 0xC0, b: 0x00 },
             success_flash: RgbColor { r: 0x00, g: 0xFF, b: 0x00 },
@@ -245,10 +233,9 @@ pub fn load_config(path: &Path) -> Result<Config> {
 }
 
 /// True if the config text carries a non-empty `[obs].password`. Keyed off
-/// the file contents (not the resolved password) so a secret supplied only
-/// via `$PCPANEL_OBS_PASSWORD` — with nothing in the file — doesn't trip the
-/// permissions warning. Mirrors the `!s.is_empty()` filter in
-/// `parse_obs_section`. Pure so it can be unit-tested.
+/// file contents (not the resolved password) so a secret supplied only via
+/// `$PCPANEL_OBS_PASSWORD` doesn't trip the permissions warning. Mirrors the
+/// `!s.is_empty()` filter in `parse_obs_section`. Pure so it can be tested.
 fn file_has_obs_password(content: &str) -> bool {
     toml::from_str::<toml::value::Table>(content)
         .ok()
@@ -257,22 +244,19 @@ fn file_has_obs_password(content: &str) -> bool {
         .is_some_and(|s| !s.is_empty())
 }
 
-/// obs-websocket passwords are stored in cleartext (see README). If the
-/// config holds one and is readable by group/other, every local user can
-/// read it. Warn (don't fail) — the user may have loosened perms on
-/// purpose, and the warning leaks nothing (just the path + octal mode).
-/// Best-effort: a stat failure is silently ignored.
+/// obs-websocket passwords are stored in cleartext (see README), so a config
+/// holding one that's readable by group/other leaks it to every local user.
+/// Warn (don't fail) — the user may have loosened perms on purpose, and the
+/// warning leaks nothing (path + octal mode). A stat failure is ignored.
 ///
 /// Review-accepted: two deliberate non-issues.
 ///   1. `file_has_obs_password` re-parses the already-parsed TOML. Kept
-///      separate to stay a pure, unit-testable `&str -> bool` that keys off
-///      *file* contents, so a secret from `$PCPANEL_OBS_PASSWORD` with nothing
-///      in the file doesn't trip the warning. Both parses share the one
-///      in-memory `content`, so there's no race.
-///   2. Benign read-vs-stat TOCTOU: `content` is read in `load_config` and
-///      re-stat'd here, so a swap between could pair one file's contents with
-///      another's mode. Harmless — a one-shot startup advisory whose worst
-///      case is a single spurious/missed warning; not worth an fstat rework.
+///      separate to stay a pure, unit-testable `&str -> bool`; both parses
+///      share the one in-memory `content`, so there's no race.
+///   2. Benign read-vs-stat TOCTOU: a swap between `load_config`'s read and
+///      this stat could pair one file's contents with another's mode.
+///      Harmless for a one-shot advisory — worst case a single
+///      spurious/missed warning; not worth an fstat rework.
 fn warn_if_obs_password_world_readable(path: &Path, content: &str) {
     use std::os::unix::fs::PermissionsExt;
 
@@ -304,12 +288,11 @@ fn unknown_keys(table: &toml::value::Table, known: &[&str]) -> Vec<String> {
         .collect()
 }
 
-/// Warn (don't fail) on keys the parser doesn't recognize. The TOML parser
-/// silently ignores unknown keys, so a typo like `brigthness` would
-/// otherwise leave the user with a default value and no feedback. We warn
-/// rather than bail so a config written for a newer pcp_rust doesn't
-/// hard-fail an older binary — an unknown key and a future key are
-/// indistinguishable here.
+/// Warn (don't fail) on unrecognized keys. The TOML parser silently ignores
+/// them, so a typo like `brigthness` would otherwise leave the user with a
+/// default and no feedback. Warn rather than bail so a config written for a
+/// newer pcp_rust doesn't hard-fail an older binary — an unknown key and a
+/// future key are indistinguishable here.
 fn warn_unknown_keys(table: &toml::value::Table, section: &str, known: &[&str]) {
     for key in unknown_keys(table, known) {
         warn!("[{section}] unknown key \"{key}\" — ignored (possible typo?)");
@@ -513,13 +496,12 @@ fn parse_app_strings(key: &str, table: &toml::value::Table) -> Result<Vec<String
 /// nothing remains.
 ///
 /// Trimming matters because matching is a substring test that never trims
-/// (`set_app_volumes` / `entry_matches_target`): a stray leading/trailing
-/// space (`app = "firefox "`) would otherwise silently match no stream, and
-/// `" system "` would miss the `System` special target and fall through to a
-/// never-matching `Named`. Rejecting the empty result matters because a blank
-/// name becomes `Named("")` and matches every stream (`contains("")` is always
-/// true), so the control would silently drive/mute every app — including
-/// persisting mute across the whole stream-restore DB.
+/// (`set_app_volumes` / `entry_matches_target`): a trailing space
+/// (`"firefox "`) would match no stream, and `" system "` would miss the
+/// `System` special target and fall to a never-matching `Named`. Rejecting
+/// empty matters because a blank name becomes `Named("")`, matching every
+/// stream (`contains("")` is always true) — silently driving/muting every
+/// app, including persisting mute across the whole stream-restore DB.
 fn clean_app_name(key: &str, s: &str) -> Result<String> {
     let trimmed = s.trim();
     if trimmed.is_empty() {
@@ -577,9 +559,8 @@ fn parse_obs_section(table: &toml::value::Table) -> Result<ObsConfig> {
             n as u16
         }
     };
-    // Env var takes precedence over the config file value so secrets can be
-    // injected without leaving them in dotfile backups. Falls back to the
-    // file value when the env var is unset or empty.
+    // Env var takes precedence over the file value so secrets can be injected
+    // without landing in dotfile backups. Falls back to the file when unset/empty.
     let password = std::env::var("PCPANEL_OBS_PASSWORD")
         .ok()
         .filter(|s| !s.is_empty())
@@ -596,9 +577,8 @@ fn parse_obs_section(table: &toml::value::Table) -> Result<ObsConfig> {
     let match_canvas_to_display =
         parse_bool_with_default("obs", table, "match_canvas_to_display", false)?;
 
-    // A blank/whitespace-only display name can never match a real connector,
-    // so reject it the same way `clean_app_name` rejects blank app names —
-    // otherwise the user gets a silent "display not found" at record time.
+    // A blank display name can never match a real connector, so reject it (as
+    // `clean_app_name` does) — else the user gets a silent "display not found".
     let capture_display = match table.get("capture_display") {
         None => None,
         Some(v) => {
@@ -635,9 +615,8 @@ fn parse_obs_section(table: &toml::value::Table) -> Result<ObsConfig> {
 }
 
 fn parse_obs_colors(table: &toml::value::Table) -> Result<ObsColors> {
-    // Warn on keys that used to live under [obs.colors] before being moved
-    // to [logo] — old configs would otherwise lose those customizations
-    // silently since the TOML parser doesn't reject unknown fields.
+    // Warn on keys moved from [obs.colors] to [logo] — old configs would
+    // otherwise lose those customizations silently (unknown fields are ignored).
     for moved_key in ["replay_active", "replay_inactive"] {
         if table.contains_key(moved_key) {
             warn!(
@@ -680,9 +659,8 @@ fn parse_obs_color(
     parse_section_color(table, "obs.colors", field, default)
 }
 
-/// Read an optional `field = "#RRGGBB"` entry from a TOML table, or return
-/// `default` if absent. `section` is the bracketed table name used in error
-/// messages (e.g. `"obs.colors"`, `"logo"`).
+/// Read an optional `field = "#RRGGBB"` from a TOML table, or `default` if
+/// absent. `section` is the bracketed table name for error messages.
 fn parse_section_color(
     table: &toml::value::Table,
     section: &str,
@@ -701,12 +679,10 @@ fn parse_section_color(
     }
 }
 
-/// Upper bound on flash_duration_ms. The flash is brief command feedback
-/// that briefly takes over the LED display; 30s is far longer than any
-/// real "make the error linger" intent, so anything past it is a typo.
-/// Bounding here also keeps `Instant::now() + Duration::from_millis(_)` in
-/// Flash::new_* (runtime.rs) from overflowing and panicking the daemon on
-/// the first flash.
+/// Upper bound on flash_duration_ms. The flash briefly takes over the LEDs;
+/// 30s is far longer than any real "make it linger" intent, so past it is a
+/// typo. Bounding here also keeps `Instant::now() + Duration::from_millis(_)`
+/// in Flash::new_* (runtime.rs) from overflowing and panicking on first flash.
 const MAX_FLASH_DURATION_MS: i64 = 30_000;
 
 fn parse_flash_duration(table: &toml::value::Table, default: u64) -> Result<u64> {
@@ -759,11 +735,10 @@ fn parse_config(content: &str) -> Result<Config> {
             .as_table()
             .with_context(|| format!("[{key}] expected a table"))?;
         warn_unknown_keys(table, key, &["action", "app", "icon"]);
-        // Resolve the control name first so a mistyped section (e.g.
-        // `[slder1]`) reports "unknown control" rather than a downstream
-        // "missing action field". Unknown sections hard-fail here — unlike
-        // unknown keys above, which only warn — because the section namespace
-        // is closed and tiny, so an unrecognized one is almost always a typo.
+        // Resolve the control name first so a mistyped section (`[slder1]`)
+        // reports "unknown control" rather than a downstream "missing action
+        // field". Unknown sections hard-fail here — unlike unknown keys, which
+        // only warn — because the section namespace is closed and tiny.
         let control = parse_control_id(key)?;
         let action = parse_action(key, table)?;
 
@@ -1600,9 +1575,9 @@ mod tests {
 
     #[test]
     fn test_flash_duration_out_of_range_rejected() {
-        // An absurd value must be rejected at parse time, not flow through to
-        // `Instant::now() + Duration::from_millis(_)` and panic on the first
-        // flash. The message names the field so the user can find it.
+        // An absurd value must be rejected at parse, not flow through to
+        // `Instant::now() + Duration::from_millis(_)` and panic on first flash.
+        // The message names the field so the user can find it.
         let result = parse_config(
             "[obs]\n\n[obs.colors]\nflash_duration_ms = 99999999999\n",
         );

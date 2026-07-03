@@ -10,10 +10,9 @@ use crate::device::PcPanelPro;
 use crate::led::{self, LedMode, Rgb};
 use crate::runtime::{ObsRuntime, ObsState};
 
-/// Log a human-readable description of the configured RGB mode. Called
-/// once at startup — kept separate from `apply_rgb` because apply_rgb runs
-/// on every disconnected-idle repaint and would otherwise spam the log on
-/// every mic-mute toggle.
+/// Log a human-readable description of the configured RGB mode. Kept separate
+/// from `apply_rgb` (which runs on every disconnected-idle repaint) so the
+/// mode is logged once at startup, not on every mic-mute toggle.
 pub fn log_rgb_mode(mode: RgbMode) {
     match mode {
         RgbMode::Solid { r, g, b } => {
@@ -39,15 +38,12 @@ pub fn log_rgb_mode(mode: RgbMode) {
     }
 }
 
-/// Apply an `[rgb]` mode to the panel. If `logo_override` is `Some`, that
-/// color is used for the logo instead of the mode's natural logo color —
-/// callers that intend to overlay an indicator should pass it here so the
-/// logo is written exactly once with the right color (rather than written
-/// twice with two separate calls).
+/// Apply an `[rgb]` mode to the panel. If `logo_override` is `Some`, the logo
+/// uses that color instead of the mode's natural one — pass it here (rather
+/// than a second logo write) so an overlaid indicator writes the logo once.
 ///
-/// `logo_override` is ignored for global animation modes (rainbow / wave /
-/// breath) because they drive every LED in one packet — there is no
-/// separate logo write to redirect.
+/// Ignored for global animation modes (rainbow / wave / breath): they drive
+/// every LED in one packet, with no separate logo write to redirect.
 pub fn apply_rgb(panel: &PcPanelPro, mode: RgbMode, logo_override: Option<RgbColor>) -> Result<()> {
     match mode {
         RgbMode::Solid { r, g, b } => {
@@ -93,27 +89,25 @@ pub fn apply_rgb(panel: &PcPanelPro, mode: RgbMode, logo_override: Option<RgbCol
 
 /// Repaint the LEDs based on the current OBS state and any active flash.
 ///
-/// Priority on the logo:
-///   1. Flash color (when a flash is active — command feedback wins over
-///      the steady-state indicator for the brief flash duration).
-///   2. Configured `[logo]` indicator (`LogoIndicator::Mic` or `Replay`),
-///      when the active mode leaves the logo independently writable.
-///   3. Panel color (so an unconfigured logo blends in).
+/// Logo priority:
+///   1. Flash color, while a flash is active — command feedback wins over the
+///      steady-state indicator for the brief flash duration.
+///   2. Configured `[logo]` indicator (`Mic` or `Replay`), when the active
+///      mode leaves the logo independently writable.
+///   3. Panel color, so an unconfigured logo blends in.
 ///
-/// The panel (knobs/sliders/labels) follows OBS state: `idle` when
-/// connected-idle, `recording` while recording, `paused` while paused, the
-/// `[rgb]` mode when OBS is disconnected.
+/// The panel (knobs/sliders/labels) follows OBS state: `idle` connected-idle,
+/// `recording`, `paused`, or the `[rgb]` mode when OBS is disconnected.
 ///
-/// Indicators do not apply during global animation modes (rainbow, wave,
-/// breath, and the paused breath effect from `paused_use_breath = true`),
-/// which drive every LED in lockstep and don't expose the logo separately.
+/// Indicators don't apply during global animation modes (rainbow, wave,
+/// breath, and the paused-breath effect), which drive every LED in lockstep
+/// and don't expose the logo separately.
 pub fn paint_leds(panel: &PcPanelPro, obs: &ObsRuntime, idle_rgb: Option<RgbMode>) -> Result<()> {
     let colors = obs.colors();
     if let Some(f) = obs.flash() {
         // Flash takes the whole panel including the logo — command feedback
-        // (especially success on SaveReplay / SplitRecording, whose only ack
-        // is the flash) wins over the steady-state indicator for the brief
-        // flash duration. The indicator resumes as soon as the flash expires.
+        // (especially SaveReplay / SplitRecording success, whose only ack is
+        // the flash) wins over the indicator until the flash expires.
         let flash_color = f.current_color();
         paint_panel_solid(panel, flash_color)?;
         paint_logo_solid(panel, flash_color)?;
@@ -131,10 +125,9 @@ pub fn paint_leds(panel: &PcPanelPro, obs: &ObsRuntime, idle_rgb: Option<RgbMode
             paint_logo_with_indicator(panel, obs, idle)?;
         }
         ObsState::Idle => {
-            // Only pass the indicator color through when the active mode
-            // leaves the logo independently writable. Global animations
-            // (rainbow / wave / breath) drive the logo as part of one
-            // packet and would fight any override.
+            // Pass the indicator color through only when the active mode
+            // leaves the logo independently writable; global animations drive
+            // it as part of one packet and would fight any override.
             let logo_override = obs
                 .logo_indicator_color()
                 .filter(|_| logo_is_independent(idle_rgb));
@@ -153,9 +146,8 @@ pub fn paint_leds(panel: &PcPanelPro, obs: &ObsRuntime, idle_rgb: Option<RgbMode
         }
         ObsState::RecordingPaused => {
             if obs.paused_use_breath() {
-                // Global breath animation — drives every LED including the
-                // logo, so the replay-buffer indicator (and mic-mute
-                // override) is unavailable during paused.
+                // Global breath animation drives every LED including the logo,
+                // so the replay-buffer / mic-mute indicators are unavailable.
                 let hue = led::rgb_to_hue(Rgb::new(
                     colors.paused.r,
                     colors.paused.g,
@@ -172,8 +164,7 @@ pub fn paint_leds(panel: &PcPanelPro, obs: &ObsRuntime, idle_rgb: Option<RgbMode
 }
 
 /// Whether the active `[rgb]` mode writes the logo separately. Static modes
-/// (solid, gradient, volume-gradient) do; the global animation modes don't
-/// — they drive every LED in lockstep.
+/// (solid, gradient, volume-gradient) do; global animations don't.
 fn logo_is_independent(idle_rgb: Option<RgbMode>) -> bool {
     matches!(
         idle_rgb,
@@ -183,17 +174,14 @@ fn logo_is_independent(idle_rgb: Option<RgbMode>) -> bool {
     )
 }
 
-/// Whether the configured logo indicator is actually rendered on the logo
-/// in the current runtime state — i.e. whether a repaint right now would
-/// show it. Mirrors the logo routing in `paint_leds`.
+/// Whether the configured logo indicator is actually rendered right now.
+/// Mirrors the logo routing in `paint_leds`.
 ///
-/// The main loop uses this to decide whether to force continuous repaints
-/// for a blinking (stale-mic) indicator. When the indicator can't be shown
-/// — a flash owns the whole panel, or a global animation (rainbow / wave /
-/// breath, including the paused-breath effect) owns the logo — forcing a
-/// repaint every iteration would only restart the animation from phase 0
-/// without ever displaying the blink, making the animation visibly stutter
-/// for the duration of the outage.
+/// The main loop uses this to decide whether to force continuous repaints for
+/// a blinking (stale-mic) indicator. When the indicator can't be shown — a
+/// flash or a global animation owns the logo — forcing a repaint every
+/// iteration would restart the animation from phase 0 without showing the
+/// blink, making it visibly stutter for the outage.
 pub fn logo_indicator_visible(obs: &ObsRuntime, idle_rgb: Option<RgbMode>) -> bool {
     if obs.flash().is_some() {
         // A flash takes the whole panel including the logo.
@@ -207,10 +195,9 @@ pub fn logo_indicator_visible(obs: &ObsRuntime, idle_rgb: Option<RgbMode>) -> bo
     }
 }
 
-/// Paint the logo with the selected indicator's color, falling back to the
-/// panel `fallback` color when no indicator is configured (or the selected
-/// one has nothing meaningful to show — e.g. replay with OBS disconnected).
-/// The fallback is the panel color so an unconfigured logo blends in.
+/// Paint the logo with the selected indicator's color, or the panel `fallback`
+/// when no indicator is configured (or it has nothing to show — e.g. replay
+/// with OBS disconnected), so an unconfigured logo blends into the panel.
 fn paint_logo_with_indicator(
     panel: &PcPanelPro,
     obs: &ObsRuntime,
@@ -222,15 +209,13 @@ fn paint_logo_with_indicator(
 
 /// Paint knobs/sliders/labels to one solid color. Leaves the logo alone.
 ///
-/// The slider strips have no firmware mode that lights all LEDs uniformly.
-/// Two options exist and we picked the second:
-///   - `Static(c)` lights every LED but applies a bottom-bright/top-dim
-///     brightness ramp — washed-out appearance.
-///   - `Gradient(c, c)` renders the strip as a level meter: only LEDs
-///     below the physical slider position are lit, with uniform color.
+/// The slider strips have no firmware mode that lights all LEDs uniformly:
+///   - `Static(c)` lights every LED but with a bottom-bright/top-dim ramp —
+///     washed-out.
+///   - `Gradient(c, c)` renders the strip as a level meter: only LEDs below
+///     the slider position lit, uniform color.
 ///
-/// Gradient looks more deliberate (it reads as "your slider is at X")
-/// than Static's brightness ramp, so we use it.
+/// We use Gradient — it reads as "your slider is at X" rather than washed-out.
 fn paint_panel_solid(panel: &PcPanelPro, c: RgbColor) -> Result<()> {
     let rgb = Rgb::new(c.r, c.g, c.b);
     let static_mode = LedMode::Static(rgb);

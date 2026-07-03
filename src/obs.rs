@@ -470,10 +470,8 @@ async fn match_canvas_to_display(client: &obws::Client, config: &ObsConfig) -> R
     Ok(())
 }
 
-/// Input kinds we treat as a screen/window video capture: the Linux PipeWire
-/// portal captures, whose kinds end in `-capture-source`. Matching that
-/// substring deliberately excludes audio captures (which have no video surface
-/// and would otherwise read 0x0 and wrongly trip the guard).
+/// Screen/window video captures — the Linux PipeWire portal sources, whose
+/// kinds contain `capture-source`. Excludes audio captures (they'd read 0x0).
 fn is_capture_kind(kind: &str) -> bool {
     kind.contains("capture-source")
 }
@@ -483,10 +481,8 @@ fn is_capture_kind(kind: &str) -> bool {
 /// Share-screen picker, so OBS records nothing" case. See `scan_captures` for
 /// scope and fail-open behavior.
 async fn ensure_capture_live(client: &obws::Client) -> Result<()> {
-    // Review-accepted: a capture can read 0x0 for a moment while its PipeWire
-    // portal stream (re)negotiates, so record in that instant could refuse a
-    // start that would've been fine a beat later. Not worth a retry/settle loop
-    // — recording is a deliberate press, and the error flash prompts a retry.
+    // Review-accepted: a capture can briefly read 0x0 while its portal stream
+    // (re)negotiates; not worth a settle loop — the error flash prompts a retry.
     let (found, live) = scan_captures(client).await?;
     if found && !live {
         bail!(
@@ -573,9 +569,8 @@ async fn capture_liveness(
     if !is_capture_kind(kind) {
         return Ok(None);
     }
-    // A disabled (hidden) item isn't composited into the recording, so it must
-    // not count in either direction: it can't block, and can't mask a dead
-    // visible capture. Skip it before reading dimensions.
+    // A disabled item isn't composited, so it must not count either way (can't
+    // block, can't mask a dead visible capture). Skip before reading dimensions.
     if !client
         .scene_items()
         .enabled(scene, item_id)
@@ -589,9 +584,8 @@ async fn capture_liveness(
         .transform(scene, item_id)
         .await
         .context("reading OBS scene item transform")?;
-    // A live capture reports the captured surface's pixel size; a stream-less
-    // one collapses to 0x0. Compare with `>= 1.0` rather than `!= 0.0` to stay
-    // clear of float-equality pitfalls on the f32 the API returns.
+    // Live captures report the surface's pixel size; a stream-less one is 0x0.
+    // `>= 1.0` avoids float-equality pitfalls on the f32 the API returns.
     Ok(Some(t.source_width >= 1.0 && t.source_height >= 1.0))
 }
 

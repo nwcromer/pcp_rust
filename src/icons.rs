@@ -8,15 +8,13 @@ use std::sync::{LazyLock, Mutex};
 // the standard speaker icon would imply the system volume is changing.
 const DEFAULT_ICON: &str = "";
 
-/// Try to find an icon for the given apps.
-/// Priority: config icon > .desktop file lookup > lowercased app name
-/// (only if it exists in an installed icon theme) > None.
+/// Priority: config icon > `.desktop` file lookup > lowercased app name
+/// (only if it resolves in an installed icon theme) > None.
 ///
-/// The last fallback uses `freedesktop-icons` to verify the candidate
-/// actually resolves under the XDG icon spec (themes, inheritance, all
-/// sizes/categories). If KDE wouldn't find an icon for the name either,
-/// we return None — the OSD then renders no icon, which is what we want
-/// instead of KDE's unknown-file (paper-fold) default.
+/// The last fallback verifies via `freedesktop-icons` that the name actually
+/// resolves under the XDG icon spec (themes, inheritance, all sizes). If KDE
+/// wouldn't find it either, we return None so the OSD renders no icon rather
+/// than KDE's unknown-file (paper-fold) default.
 fn find_app_icon(config_icon: Option<&str>, app_names: &[String]) -> Option<String> {
     if let Some(icon) = config_icon {
         return Some(icon.to_string());
@@ -49,19 +47,15 @@ fn resolve_app_icon(app_names: &[String]) -> Option<String> {
     freedesktop_icon_resolves(&candidate).then_some(candidate)
 }
 
-/// `freedesktop_icons::lookup(name).find()` exhaustively scans every
-/// installed theme/size/category when the name doesn't resolve — hundreds
-/// of stat() calls. That's fine once, but slider events fire ~10 Hz and
-/// each tick was hitting this for apps with no icon, backing up the HID
-/// event loop. Cache the answer so each name is resolved at most once
-/// per process lifetime.
+/// `freedesktop_icons::lookup(name).find()` exhaustively scans every installed
+/// theme/size/category when the name doesn't resolve — hundreds of stat() calls.
+/// Fine once, but slider events fire ~10 Hz and each tick hit this for icon-less
+/// apps, backing up the HID event loop. Cache so each name resolves at most once.
 fn freedesktop_icon_resolves(name: &str) -> bool {
     static CACHE: LazyLock<Mutex<HashMap<String, bool>>> =
         LazyLock::new(|| Mutex::new(HashMap::new()));
-    // `unwrap_or_else(... e.into_inner())` recovers from lock poisoning —
-    // the cache's invariants are simple enough that even if a prior
-    // panic-while-locked left it in an "inconsistent" state, treating the
-    // current contents as authoritative is fine.
+    // Recover from lock poisoning: the cache is a plain memo, so treating a
+    // poisoned lock's contents as authoritative is fine.
     if let Some(&cached) = CACHE
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -93,11 +87,10 @@ pub fn resolve_mute(config_icon: Option<&str>, app_names: &[String], muted: bool
     })
 }
 
-/// `.desktop` search dirs in precedence order, per the XDG Base Directory
-/// spec: `$XDG_DATA_HOME` (or `~/.local/share`) first, then `$XDG_DATA_DIRS`
-/// (or the spec default `/usr/local/share:/usr/share`), each with
-/// `applications` appended. The user data dir is what surfaces integrated
-/// AppImages and other user-installed apps; the system dirs cover packaged apps.
+/// `.desktop` search dirs in XDG Base Directory precedence order:
+/// `$XDG_DATA_HOME` (or `~/.local/share`), then `$XDG_DATA_DIRS` (or the spec
+/// default `/usr/local/share:/usr/share`), each with `applications` appended.
+/// The user dir surfaces integrated AppImages/user apps; system dirs cover packaged ones.
 ///
 /// Intentionally untested: this reads process env (`XDG_DATA_*`), and a
 /// deterministic test would have to mutate global env vars — `unsafe` in
@@ -171,10 +164,9 @@ where
     None
 }
 
-/// Parse the `Icon=` value from a `.desktop` file's `[Desktop Entry]`
-/// section. Other sections (`[Desktop Action ...]`, `[X-Foo]`) can carry
-/// their own `Icon=` for context-menu items, which are not the primary
-/// app icon — so we deliberately ignore them.
+/// Parse the `Icon=` value from a `.desktop` file's `[Desktop Entry]` section.
+/// Other sections (`[Desktop Action ...]`, `[X-Foo]`) can carry their own
+/// `Icon=` for context-menu items, not the app icon — so we ignore them.
 fn parse_desktop_entry_icon(content: &str) -> Option<String> {
     let mut in_desktop_entry = false;
     for raw in content.lines() {

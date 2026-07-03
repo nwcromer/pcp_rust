@@ -24,10 +24,9 @@ const MSG_BUTTON: u8 = 0x02;
 
 pub struct PcPanelPro {
     device: hidapi::HidDevice,
-    /// Frames captured during init() that are NOT calibration-burst analog
-    /// readings — e.g., a button press the user made while pcp_rust was
-    /// starting up. Drained FIFO by `read_event` before falling back to
-    /// the HID device.
+    /// Frames captured during init() that aren't calibration-burst analog
+    /// readings — e.g. a button pressed during startup. Drained FIFO by
+    /// `read_event` before it reads the HID device.
     pending: VecDeque<[u8; PACKET_SIZE]>,
 }
 
@@ -71,11 +70,9 @@ impl PcPanelPro {
             .context("failed to send init command")?;
         info!("sent init command");
 
-        // Calibration reads — the device burst-emits the current analog
-        // position for every knob/slider after init. We discard those
-        // (we'll see them again on the next real change anyway) but
-        // forward any button frames into a pending queue so a user press
-        // during startup isn't silently dropped.
+        // The device burst-emits every knob/slider's current analog position
+        // after init. Discard those (they'll re-arrive on the next real change)
+        // but forward button frames to `pending` so a startup press isn't dropped.
         let mut read_buf = [0u8; PACKET_SIZE];
         let mut got_frame = false;
         for i in 0..CALIBRATION_READS {
@@ -138,10 +135,9 @@ impl PcPanelPro {
     }
 }
 
-/// Parse a 64-byte HID report into an Event. Pure function (no I/O) so it
-/// can be unit-tested. Returns `None` for messages we don't recognize —
-/// the daemon logs at warn/debug and continues rather than bailing, since
-/// firmware versions may emit message types we don't care about.
+/// Parse a 64-byte HID report into an Event. Pure (no I/O) so it's unit-testable.
+/// Returns `None` for unrecognized messages — the daemon logs and continues
+/// rather than bailing, since firmware may emit message types we ignore.
 fn parse_event(buf: &[u8; PACKET_SIZE]) -> Option<Event> {
     let msg_type = buf[0];
     let index = buf[1];

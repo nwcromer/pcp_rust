@@ -15,10 +15,9 @@ use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use tokio::process::Command;
 
-/// Hard cap on how long we wait for `kscreen-doctor`. It normally returns in
-/// tens of ms; if it ever wedges we must not hang the OBS thread (which would
-/// freeze event handling and the reconnect loop with no recovery), so we kill
-/// it and fail the record-start instead.
+/// Hard cap on `kscreen-doctor`. It normally returns in tens of ms; if it
+/// wedges we must not hang the OBS thread (which would freeze event handling
+/// and the reconnect loop with no recovery), so we kill it and fail instead.
 const KSCREEN_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// The slice of `kscreen-doctor --json` we care about. Unlisted fields are
@@ -66,8 +65,7 @@ pub async fn current_display_resolution(target: Option<&str>) -> Result<(u32, u3
 }
 
 /// Run `kscreen-doctor --json` with a timeout, returning its stdout. A hung
-/// subprocess is killed (`kill_on_drop`) rather than left to freeze the OBS
-/// thread.
+/// subprocess is killed (`kill_on_drop`) rather than left to freeze the OBS thread.
 async fn run_kscreen() -> Result<String> {
     let output = tokio::time::timeout(
         KSCREEN_TIMEOUT,
@@ -90,11 +88,10 @@ async fn run_kscreen() -> Result<String> {
     String::from_utf8(output.stdout).context("kscreen-doctor output was not valid UTF-8")
 }
 
-/// Parse the first JSON value out of kscreen-doctor's output. We use a
-/// streaming deserializer rather than `from_str` so a trailing newline — or
-/// the human-readable dump that `-o --json` appends after the object (we run
-/// `--json` alone, but stay robust) — doesn't trip a strict whole-string
-/// parse that rejects trailing bytes.
+/// Parse the first JSON value out of kscreen-doctor's output. A streaming
+/// deserializer (not `from_str`) tolerates trailing bytes — a trailing newline,
+/// or the human-readable dump `-o --json` appends — that a strict whole-string
+/// parse would reject. We run `--json` alone, but stay robust.
 fn parse_kscreen(json: &str) -> Result<KscreenConfig> {
     let mut stream = serde_json::Deserializer::from_str(json).into_iter::<KscreenConfig>();
     match stream.next() {
@@ -268,9 +265,8 @@ mod tests {
 
     #[test]
     fn parse_tolerates_trailing_bytes() {
-        // `-o --json` appends a human-readable dump after the JSON object.
-        // We run `--json` alone, but the parser must not choke if trailing
-        // bytes ever appear.
+        // `-o --json` appends a human-readable dump after the JSON object; we run
+        // `--json` alone, but the parser must not choke if trailing bytes appear.
         let with_trailer = format!("{TWO_OUTPUTS}\nOutput: 1 DP-1 some-uuid\n\tenabled\n");
         let cfg = parse_kscreen(&with_trailer).unwrap();
         assert_eq!(cfg.outputs.len(), 2);

@@ -29,8 +29,7 @@ impl Rgb {
 }
 
 /// Convert an RGB color to a hue byte (0-255) for the device's breath/wave
-/// effects, which take only a hue value. Saturation and value information
-/// is discarded — only the dominant color wheel position is preserved.
+/// effects, which take only a hue. Saturation and value are discarded.
 pub fn rgb_to_hue(c: Rgb) -> u8 {
     let r = c.r as f32 / 255.0;
     let g = c.g as f32 / 255.0;
@@ -68,11 +67,10 @@ impl LedMode {
     }
 }
 
-/// Write a per-LED color packet for one panel region: `[PRO_PREFIX, cmd]`
-/// followed by 7 bytes per `LedMode`. The knob/slider/label setters differ
-/// only in the command byte and the LED count, so they share this. Takes a
-/// slice; the public wrappers keep fixed-size array params so callers retain
-/// the compile-time count guarantee (5 knobs, 4 sliders/labels).
+/// Write a per-LED color packet for one panel region: `[PRO_PREFIX, cmd]` then
+/// 7 bytes per `LedMode`. The knob/slider/label setters differ only in command
+/// byte and LED count, so they share this via a slice; the public wrappers keep
+/// fixed-size array params so callers retain the count guarantee (5 knobs, 4 sliders/labels).
 fn set_region_colors(device: &PcPanelPro, cmd: u8, modes: &[LedMode]) -> Result<()> {
     let mut packet = vec![PRO_PREFIX, cmd];
     for mode in modes {
@@ -95,9 +93,9 @@ pub fn set_slider_label_colors(device: &PcPanelPro, labels: &[LedMode; 4]) -> Re
 
 /// Set the logo LED to a solid color.
 ///
-/// The logo also supports two firmware effects that pcp_rust intentionally
-/// does not expose — it keeps the logo as a per-color indicator rather than an
-/// independent animation. Recorded here for anyone driving the device directly:
+/// The logo also supports two firmware effects pcp_rust doesn't expose (it keeps
+/// the logo as a static indicator, not an independent animation). Recorded here
+/// for anyone driving the device directly:
 ///   - rainbow: `[PRO_PREFIX, CMD_LOGO, 0x02, 0xFF, brightness, speed]`
 ///   - breath:  `[PRO_PREFIX, CMD_LOGO, 0x03, hue, brightness, speed]`
 pub fn set_logo(device: &PcPanelPro, color: Rgb) -> Result<()> {

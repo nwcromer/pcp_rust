@@ -1,11 +1,9 @@
 //! KDE Plasma OSD popups via the org.kde.osdService D-Bus interface.
 //!
-//! Holds a cached session-bus connection — the previous implementation
-//! forked `gdbus` per call, which cost ~5-10ms per knob/slider tick. The
-//! cache is reset on call failure so we automatically recover if the
-//! session bus daemon restarts or drops our connection. Failures are
-//! intentionally swallowed: the OSD is a nice-to-have and shouldn't
-//! block volume/mute operations.
+//! Holds a cached session-bus connection — forking `gdbus` per call (the
+//! old approach) cost ~5-10ms per knob/slider tick. The cache is dropped on
+//! failure so we recover if the bus daemon restarts. Failures are swallowed:
+//! the OSD is a nice-to-have and mustn't block volume/mute operations.
 
 use std::sync::{LazyLock, Mutex};
 
@@ -23,9 +21,8 @@ fn call<T>(method: &str, body: &T)
 where
     T: serde::Serialize + DynamicType,
 {
-    // Lock poisoning recovery: if a previous holder panicked, the cached
-    // connection is still usable (or `None`), so treat the inner value as
-    // authoritative rather than propagating a panic.
+    // Lock-poison recovery: a prior panic can't corrupt the cached connection
+    // (still usable or `None`), so take the inner value instead of panicking.
     let mut session = SESSION.lock().unwrap_or_else(|e| e.into_inner());
 
     // Connect lazily on first call, or after a previous failure invalidated
@@ -70,10 +67,8 @@ pub fn show_text(icon: &str, text: &str) {
 }
 
 /// Show a `"<label>: Muted/Unmuted"` OSD with a muted/unmuted icon pair.
-/// Shared by the system and mic mute popups, which differ only in the label
-/// and which icon set fits the device. Named-app mute does NOT use this — it
-/// resolves a per-app icon (see `icons::resolve_mute`) rather than a fixed
-/// pair.
+/// Shared by system and mic mute popups. Named-app mute does NOT use this —
+/// it resolves a per-app icon (`icons::resolve_mute`), not a fixed pair.
 fn show_mute_status(label: &str, muted: bool, muted_icon: &str, unmuted_icon: &str) {
     let icon = if muted { muted_icon } else { unmuted_icon };
     let status = if muted { "Muted" } else { "Unmuted" };
