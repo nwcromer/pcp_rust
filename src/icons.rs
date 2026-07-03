@@ -22,18 +22,31 @@ fn find_app_icon(config_icon: Option<&str>, app_names: &[String]) -> Option<Stri
         return Some(icon.to_string());
     }
 
+    // Cache per app-name set — the slider hot path re-resolves the same names
+    // every tick. Process-lifetime, like the sibling caches.
+    static CACHE: LazyLock<Mutex<HashMap<Vec<String>, Option<String>>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+    if let Some(cached) = CACHE.lock().unwrap_or_else(|e| e.into_inner()).get(app_names) {
+        return cached.clone();
+    }
+    let resolved = resolve_app_icon(app_names);
+    CACHE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(app_names.to_vec(), resolved.clone());
+    resolved
+}
+
+/// Uncached icon resolution for a set of app names: `.desktop` lookup, then
+/// the lowercased app name if it resolves in an installed icon theme.
+fn resolve_app_icon(app_names: &[String]) -> Option<String> {
     for app in app_names {
         if let Some(icon) = find_icon_in_desktop_files(app) {
             return Some(icon);
         }
     }
-
     let candidate = app_names.first()?.to_lowercase();
-    if freedesktop_icon_resolves(&candidate) {
-        Some(candidate)
-    } else {
-        None
-    }
+    freedesktop_icon_resolves(&candidate).then_some(candidate)
 }
 
 /// `freedesktop_icons::lookup(name).find()` exhaustively scans every
