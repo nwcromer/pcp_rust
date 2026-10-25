@@ -62,12 +62,14 @@ fn generate_service_file(bin_path: &str) -> String {
     // - System D-Bus for logind's PrepareForSleep signal
     // - Session D-Bus for KDE's org.kde.osdService
     // No writes to disk at runtime, so ProtectHome=read-only is safe.
+    // Never Wants= graphical-session.target: starting it ourselves, before the
+    // compositor, breaks Plasma 6.8 XDG autostart (KDE bug 527660).
     format!(
         "\
 [Unit]
 Description=PCPanel Pro Controller
 After=graphical-session.target
-Wants=graphical-session.target
+PartOf=graphical-session.target
 
 [Service]
 ExecStart=\"{bin_path}\"
@@ -94,7 +96,7 @@ SystemCallFilter=@system-service
 SystemCallArchitectures=native
 
 [Install]
-WantedBy=default.target
+WantedBy=graphical-session.target
 "
     )
 }
@@ -142,7 +144,8 @@ pub fn install() -> Result<()> {
 
     // Reload, enable, and start
     systemctl(&["daemon-reload"])?;
-    systemctl(&["enable", SERVICE_NAME])?;
+    // reenable drops stale links, e.g. default.target.wants from older units.
+    systemctl(&["reenable", SERVICE_NAME])?;
     systemctl(&["start", SERVICE_NAME])?;
 
     println!("Service enabled and started.");
@@ -196,6 +199,14 @@ mod tests {
         for p in ["/tmp/a\"b", "/tmp/a\\b", "/tmp/a$b", "/tmp/a%b"] {
             assert!(check_path_for_unit_file(p).is_err(), "{p:?} should be rejected");
         }
+    }
+
+    #[test]
+    fn unit_attaches_to_graphical_session_without_starting_it() {
+        let unit = generate_service_file("/usr/bin/pcp_rust");
+        assert!(unit.contains("PartOf=graphical-session.target"));
+        assert!(unit.contains("WantedBy=graphical-session.target"));
+        assert!(!unit.contains("Wants=graphical-session.target"));
     }
 
     #[test]
